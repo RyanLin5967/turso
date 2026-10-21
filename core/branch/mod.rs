@@ -439,6 +439,14 @@ pub struct ForkHolds {
     pub locked_trunk_forks: u64,
 }
 
+/// Test builds: the syncs a test reads for `db`'s work (the per-store counter class, lead ruling
+/// d9cf2b609b): its branch files', its catalog's and its trunk database's, on any thread
+/// (`store::StoreCounts`), never another database's.
+#[cfg(test)]
+pub(crate) fn sync_counts_of(db: &crate::Database) -> SyncCounts {
+    db.branches.sync_counts()
+}
+
 #[doc(hidden)]
 pub fn sync_counts() -> SyncCounts {
     use crate::sync::atomic::Ordering::Relaxed;
@@ -510,6 +518,10 @@ pub enum BranchFailpoint {
     /// The next held-free upgrade's sync (`BranchStore::sync_upgrade`) fails as an I/O error would
     /// (engine review 21 MED 4: nothing could fail it before).
     UpgradeSyncFails,
+    /// The next flight a trunk commit's durability barrier leads fails as an I/O error would
+    /// (engine review 21 MED 14: `GroupFlightFails` is consumed only where records are buffered,
+    /// which a childless trunk commit's barrier never reaches).
+    BarrierFlightFails,
 }
 
 /// A live branch: an isolated, writable view of the database as it was when the branch was forked.
@@ -954,6 +966,11 @@ impl Drop for Branch {
 pub(crate) struct BranchBinding {
     pub(crate) store: Arc<BranchStore>,
     pub(crate) id: BranchId,
+    /// This connection's reservations in its open write transaction, page -> where its commit
+    /// writes it (`BranchStore::first_write_branch`), so the commit writes its slots before it
+    /// takes the store mutex (L2 slice, budget first_write_issues_no_syscall_under_the_store_mutex).
+    /// One writer per branch: only this connection's thread touches it.
+    pub(crate) reserved: std::sync::Mutex<std::collections::HashMap<u32, store::Reserved>>,
 }
 
 impl Drop for BranchBinding {
@@ -1402,17 +1419,30 @@ impl Database {
         self.branches.pause_connect_looked_up();
         // A drop that lands between the lookup and the open leaves the open an untyped error (the
         // branch gone, or reaped): the name no longer names an unreleased branch, which is
-        // NoSuchBranch, as the lookup would now answer (engine review 14 MED 9). Error path only:
-        // the success path is unchanged. Mutant `connect_race_untyped` (test builds only): the
-        // open's own error, as before.
+        // NoSuchBranch (engine review 14 MED 9). Error path only, the success path unchanged: the
+        // lookup is asked again, and it decides (engine review 20 item 4), since it waits for this
+        // name's Release to be durable and keeps finding a branch a fail-stopped store's Release
+        // did not make durable. No branch by that name: NoSuchBranch. The same branch, another one
+        // (a drop and re-create in between), or a failed lookup: the open's own error. Mutants
+        // (test builds only) `connect_race_untyped`: the open's own error always, as before
+        // review 14 MED 9; `connect_race_maps_released`: NoSuchBranch whenever the branch reads
+        // released in memory, as before this.
         self.connect_branch(id).map_err(|e| {
-            if crate::branch::store::fe_mutant("connect_race_untyped")
-                || matches!(e, LimboError::NoSuchBranch(_))
-                || !self.branches.is_gone_or_released(id)
-            {
-                e
-            } else {
+            if crate::branch::store::fe_mutant("connect_race_untyped") || matches!(e, LimboError::NoSuchBranch(_)) {
+                return e;
+            }
+            #[cfg(test)]
+            if crate::branch::store::fe_mutant("connect_race_maps_released") {
+                return if self.branches.is_gone_or_released(id) {
+                    store::untyped_branch_error(LimboError::NoSuchBranch(name.to_string()))
+                } else {
+                    e
+                };
+            }
+            if matches!(self.branches.branch_named(name), Ok(None)) {
                 store::untyped_branch_error(LimboError::NoSuchBranch(name.to_string()))
+            } else {
+                e
             }
         })
     }
@@ -1514,6 +1544,25 @@ impl Database {
         self.branches.checkpoint_counters()
     }
 
+    /// The counted exceptions to "no create, connect, first write, delete or trunk commit waits on
+    /// background work" (DECISIONS c9c821dd8d; the C15 ruling): `[held-free upgrades led by a
+    /// freeing operation past the hard cap, held-free upgrades that took the flight slot to raise
+    /// the header's class, compactions that synced inline on an operation, operations that waited
+    /// behind a background compaction]`, since the database opened. Every run prints them, and a
+    /// window in which one moved is labelled and not credited.
+    #[doc(hidden)]
+    pub fn branch_exception_counters(&self) -> [u64; 4] {
+        self.branches.exception_counters()
+    }
+
+    /// Fuzzy branch catalog checkpoints that failed Busy waiting for an ordered flight's WAL flush
+    /// past the settle bound (engine review 18 MED 4; observing only): each lost its install for a
+    /// threshold of log. A create-plus-first-write run expects 0.
+    #[doc(hidden)]
+    pub fn branch_checkpoint_settle_timeouts(&self) -> u64 {
+        self.branches.settle_timeouts()
+    }
+
     /// Fuzzy branch catalog checkpoint starts that failed and backed off (engine review 8 #3;
     /// observing only).
     #[doc(hidden)]
@@ -1570,6 +1619,7 @@ impl Database {
         let binding = BranchBinding {
             store: self.branches.clone(),
             id,
+            reserved: std::sync::Mutex::new(std::collections::HashMap::new()),
         };
         let pager = self._init(None, None)?;
         // `_init` read page 1 as the TRUNK sees it. Nothing the trunk put in this pager may
@@ -1729,6 +1779,11 @@ pub(crate) mod budget_probe;
 #[cfg(all(test, feature = "fs"))]
 mod budget_tests;
 
+// The per-store counter class (lead ruling d9cf2b609b): a counter a budget or test reads is this
+// store's, never the process's or any thread's.
+#[cfg(all(test, feature = "fs"))]
+mod counter_scope_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1759,5 +1814,48 @@ mod tests {
         assert!(BranchId::TRUNK.is_trunk());
         assert!(!BranchId(1).is_trunk());
         assert_ne!(BranchId::TRUNK, BranchId(1));
+    }
+}
+
+/// Whether this build has the default-off `measure-word-hold` feature (`measure_word_hold`): a
+/// measuring harness refuses a run whose binaries lack it. Always present, so it can be asked.
+pub fn measure_word_hold_compiled() -> bool {
+    cfg!(feature = "measure-word-hold")
+}
+
+/// MEASUREMENT ONLY (feature `measure-word-hold`, off by default, never in a shipped build): hold
+/// back every durable branch store's confirmation word in this process, as the budget tests'
+/// `hold_word(true)` does (woken once by the first landing, then asleep with the word pending, so
+/// no background thread runs in a later measured window), or let it be written after the shipped
+/// quiet period again. `TURSO_MEASURE_WORD_HOLD=1` in the environment holds it from the start.
+#[cfg(feature = "measure-word-hold")]
+pub fn measure_word_hold(held: bool) {
+    store::CONFIRM_QUIET_MS.store(if held { store::CONFIRM_HELD_MS } else { 0 }, std::sync::atomic::Ordering::Release);
+}
+
+#[cfg(test)]
+mod word_hold_tests {
+    /// The default build has no word hold (lead order: it can never be on by accident): the
+    /// feature is not compiled in, and `TURSO_MEASURE_WORD_HOLD=1` leaves the shipped quiet period.
+    /// (`cargo test --features measure-word-hold` runs the other arm.)
+    #[test]
+    fn the_word_hold_is_compiled_only_with_its_feature() {
+        let held = super::measure_word_hold_compiled();
+        assert_eq!(held, cfg!(feature = "measure-word-hold"));
+        #[cfg(not(feature = "measure-word-hold"))]
+        {
+            // SAFETY of set_var: this test reads no other environment and sets only this name.
+            unsafe { std::env::set_var("TURSO_MEASURE_WORD_HOLD", "1") };
+            let quiet = super::store::confirm_quiet_for_test();
+            unsafe { std::env::remove_var("TURSO_MEASURE_WORD_HOLD") };
+            assert_eq!(quiet, std::time::Duration::from_millis(5), "CLAIM: a default build read the word-hold environment");
+        }
+        #[cfg(feature = "measure-word-hold")]
+        {
+            super::measure_word_hold(true);
+            let quiet = super::store::confirm_quiet_for_test();
+            super::measure_word_hold(false);
+            assert!(quiet >= std::time::Duration::from_secs(1 << 30), "CLAIM: measure_word_hold(true) did not hold the word: {quiet:?}");
+        }
     }
 }

@@ -161,6 +161,14 @@ pub fn translate_inner(
     connection: &Arc<Connection>,
     input: &str,
 ) -> Result<()> {
+    // Stack-guard class (fastest-engine): the statement's outermost step, so that every step below
+    // it (a DML statement's first subquery included: lead, ultrareview instance (ii)) is nested and
+    // checked. Mutant `nest_statement_unguarded` (test builds only): no guard here.
+    let _nest = if crate::branch::store::fe_mutant("nest_statement_unguarded") {
+        None
+    } else {
+        Some(crate::stack::NestGuard::enter("a statement")?)
+    };
     let is_write = matches!(
         stmt,
         ast::Stmt::AlterTable { .. }

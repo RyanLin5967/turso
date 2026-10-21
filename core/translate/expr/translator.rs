@@ -98,6 +98,8 @@ pub fn translate_expr(
     target_register: usize,
     resolver: &Resolver,
 ) -> Result<usize> {
+    // Stack-guard class (fastest-engine): a recursive entry is a nested step (`stack::NestGuard`).
+    let _nest = crate::stack::NestGuard::enter("a recursive step")?;
     let constant_span = if expr.is_constant(resolver) {
         if !program.constant_span_is_open() {
             Some(program.constant_span_start())
@@ -616,6 +618,14 @@ pub fn translate_expr(
                                 type_def,
                                 resolver,
                             )?;
+                        } else {
+                            // A BASE-only type (no ENCODE, e.g. float4/float8) casts as its
+                            // primitive base does (C32 MED: nothing was emitted, so the value kept
+                            // its own type).
+                            program.emit_insn(Insn::Cast {
+                                reg: target_register,
+                                affinity: Affinity::affinity(&resolved.primitive),
+                            });
                         }
                         return Ok(target_register);
                     }
@@ -2197,7 +2207,7 @@ pub fn translate_expr(
         }
         ast::Expr::Id(id) => {
             // Check for custom type expression overrides (e.g. `value` placeholder)
-            if let Some(&reg) = program.id_register_overrides.get(id.as_str()) {
+            if let Some(reg) = program.id_register_overrides.get(id.as_str()) {
                 program.emit_insn(Insn::Copy {
                     src_reg: reg,
                     dst_reg: target_register,

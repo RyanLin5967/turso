@@ -228,6 +228,41 @@ impl BuilderQueryMode {
     }
 }
 
+/// Identifiers bound to registers while a custom type's or domain's expression is translated
+/// (`value`, the type's parameters): keyed by the identifier as the engine compares identifiers
+/// (`normalize_ident`, ASCII case-insensitive), on insert, lookup and removal alike, so no match
+/// can be case-sensitive (the identifier-case class: a domain CHECK written `VALUE` was silently not
+/// enforced, and a parameter declared `Scale` and used as `scale` was unbound).
+#[derive(Default, Debug)]
+pub struct IdOverrides(HashMap<String, usize>);
+
+impl IdOverrides {
+    /// The key: the identifier as the engine compares identifiers. Mutant `id_overrides_exact_case`
+    /// (test builds only): the identifier as written, as before.
+    fn key(name: &str) -> String {
+        if crate::branch::store::fe_mutant("id_overrides_exact_case") {
+            return name.to_string();
+        }
+        crate::util::normalize_ident(name)
+    }
+
+    pub fn insert(&mut self, name: &str, reg: usize) -> Option<usize> {
+        self.0.insert(Self::key(name), reg)
+    }
+
+    pub fn get(&self, name: &str) -> Option<usize> {
+        self.0.get(&Self::key(name)).copied()
+    }
+
+    pub fn remove(&mut self, name: &str) -> Option<usize> {
+        self.0.remove(&Self::key(name))
+    }
+
+    pub fn clear(&mut self) {
+        self.0.clear()
+    }
+}
+
 pub struct ProgramBuilder {
     /// A span of instructions from (offset_start_inclusive, offset_end_exclusive),
     /// that are deemed to be compile-time constant and can be hoisted out of loops
@@ -280,7 +315,7 @@ pub struct ProgramBuilder {
     /// Maps identifier names to registers for custom type encode/decode expressions.
     /// When set, `Expr::Id("value")` resolves to the register holding the input value,
     /// and type parameter names resolve to registers holding their concrete values.
-    pub id_register_overrides: HashMap<String, usize>,
+    pub id_register_overrides: IdOverrides,
     /// While an expression is translated inside a catch region ([Insn::CatchBegin]), the region's
     /// target: a RAISE(ABORT|FAIL|ROLLBACK) jumps there instead of halting, so the refusal it
     /// stands for leaves the statement running, as a function's refused value does.
@@ -733,7 +768,7 @@ impl ProgramBuilder {
             resolve_type: ResolveType::Abort,
             trigger_conflict_override: None,
             cursor_overrides: HashMap::default(),
-            id_register_overrides: HashMap::default(),
+            id_register_overrides: IdOverrides::default(),
             catch_raise_target: None,
             hash_build_signatures: HashMap::default(),
             hash_tables_to_keep_open: BitSet::default(),

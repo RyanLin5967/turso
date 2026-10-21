@@ -51,12 +51,17 @@ const GROWTH: u64 = 23_040;
 /// The checkpoint arm's threshold (the default is 1 MiB) and its rounds: about 130 log bytes a
 /// round, so a checkpoint every ~60 rounds.
 const CKPT_THRESHOLD: u64 = 8 << 10;
-const CKPT_ROUNDS: u64 = 240;
+/// FLAGGED FIXTURE CHANGE, lead-ruled (class (b) acceptance, DECISIONS 2026-10-15): 240 rounds made
+/// about 3 checkpoints, and with attribution by thread fewer than 3 of them were attributable, so
+/// the checkpoint cells refused. 960 rounds make about 12. The claims and thresholds are unchanged;
+/// `checkpoint_excess` still refuses below 3 attributable installs and reports both counts, and
+/// `a_checkpoint_flushes_at_most_three_times_over_every_round` bounds the unselected total.
+const CKPT_ROUNDS: u64 = 960;
 /// The shared-flight arm's client counts (lead, 2026-10-06: "creates per F_FULLFSYNC rising with C
 /// at C = 1, 8, 64, 256, 1024").
 const SHARED_CS: [u64; 5] = [1, 8, 64, 256, 1024];
-/// "Hold the confirmation word back": a quiet period no run reaches (2^40 ms, about 34.8 years).
-const CONFIRM_HELD_MS: u64 = 1 << 40;
+// "Hold the confirmation word back": a quiet period no run reaches (2^40 ms, about 34.8 years).
+use super::store::CONFIRM_HELD_MS;
 /// The memory cells' live branches: 10^4 (`N_LARGE`) and this.
 const N_HUGE: u64 = 100_000;
 /// Every measured branch name is this long (`m-0000`), so every create logs the same bytes.
@@ -85,9 +90,12 @@ fn opts() -> DatabaseOpts {
     } else {
         BranchDurability::Catalog { sync }
     };
+    // The plant `exc_sharp` (DECISIONS bd0d845f97): a sharp catalog store, whose compactions sync
+    // inline on the operation and are counted as an exception.
+    let checkpoint = if spec == "exc_sharp" { BranchCheckpoint::Sharp } else { BranchCheckpoint::Fuzzy };
     DatabaseOpts::new()
         .with_branch_durability(durability)
-        .with_branch_checkpoint(BranchCheckpoint::Fuzzy)
+        .with_branch_checkpoint(checkpoint)
 }
 
 fn open_at(path: &Path) -> Arc<Database> {
@@ -219,6 +227,8 @@ struct Outside {
     cat: (u64, u64, u64, u64),
     ckpt: [u64; 9],
     reads: (u64, u64),
+    /// The counted exceptions (`exceptions`); `None` where no database is read (the instruments).
+    exc: Option<[u64; 4]>,
 }
 
 impl Outside {
@@ -228,23 +238,53 @@ impl Outside {
             cat: db.branch_catalog_counters(),
             ckpt: db.branch_checkpoint_counters(),
             reads: db.branch_read_counters(),
+            exc: Some(exceptions(db)),
         }
     }
 
+    /// A database's counters at its open, all 0 (they count since the open).
     fn zero(log: Option<u64>) -> Self {
         Self {
             log,
             cat: (0, 0, 0, 0),
             ckpt: [0; 9],
             reads: (0, 0),
+            exc: Some([0; 4]),
         }
+    }
+
+    /// No database: the instruments' windows, which record no counted exception.
+    fn none() -> Self {
+        Self {
+            exc: None,
+            ..Self::zero(None)
+        }
+    }
+}
+
+/// The counted exceptions (DECISIONS bd0d845f97; `Database::branch_exception_counters`, keys
+/// `EXC_KEYS`): read outside a window, as it takes the group's lock.
+fn exceptions(db: &Arc<Database>) -> [u64; 4] {
+    db.branch_exception_counters()
+}
+
+/// Record the counted exceptions' deltas from `a` to `b` in `s` (every key, a zero included).
+fn put_exceptions(s: &mut Sample, a: [u64; 4], b: [u64; 4]) {
+    for (key, (x, y)) in EXC_KEYS.into_iter().zip(a.into_iter().zip(b)) {
+        s.insert(key, delta(x, y));
     }
 }
 
 fn sample_of(s0: &probe::Snapshot, s1: &probe::Snapshot, o0: &Outside, o1: &Outside) -> Sample {
     let mut s = Sample::new();
-    if let Some(d) = kernel_delta(s0.syscalls, s1.syscalls) {
+    // Class (b): the window's OWN syscalls (`probe::end_owning`'s attribution: the kernel's count
+    // with no other thread running, or the per-thread counter's where it covered the window), or
+    // no count at all; the task's raw delta is kept apart for the fire-checks.
+    if let Some(d) = s1.attributed_syscalls {
         s.insert("syscalls", d);
+    }
+    if let Some(d) = kernel_delta(s0.syscalls, s1.syscalls) {
+        s.insert("syscalls_task", d);
     }
     if let (Some(a), Some(b)) = (s0.instructions, s1.instructions) {
         s.insert("instructions", delta(a, b));
@@ -252,6 +292,13 @@ fn sample_of(s0: &probe::Snapshot, s1: &probe::Snapshot, o0: &Outside, o1: &Outs
     s.insert("fsync", delta(s0.fsync, s1.fsync));
     s.insert("full_fsync", delta(s0.full_fsync, s1.full_fsync));
     s.insert("barrier", delta(s0.barrier, s1.barrier));
+    // Counters review MED-5: the process's syncs in the same window, for the parity check.
+    s.insert("fsync_process", delta(s0.p_fsync, s1.p_fsync));
+    s.insert("full_fsync_process", delta(s0.p_full_fsync, s1.p_full_fsync));
+    s.insert("barrier_process", delta(s0.p_barrier, s1.p_barrier));
+    s.insert("fsync_own", delta(s0.o_fsync, s1.o_fsync));
+    s.insert("full_fsync_own", delta(s0.o_full_fsync, s1.o_full_fsync));
+    s.insert("barrier_own", delta(s0.o_barrier, s1.o_barrier));
     s.insert("allocs", delta(s0.t_allocs, s1.t_allocs));
     s.insert("alloc_bytes", delta(s0.t_alloc_bytes, s1.t_alloc_bytes));
     s.insert("allocs_process", delta(s0.allocs, s1.allocs));
@@ -264,6 +311,16 @@ fn sample_of(s0: &probe::Snapshot, s1: &probe::Snapshot, o0: &Outside, o1: &Outs
     s.insert("locks", delta(s0.t_locks, s1.t_locks));
     s.insert("locks_process", delta(s0.locks, s1.locks));
     s.insert("held_syscalls", delta(s0.held_syscalls, s1.held_syscalls));
+    // Class (b): the threads that made the window unattributable, and the holds inside it that
+    // could not be attributed to their holder (`probe::end_owning`, `store_unlocked`).
+    s.insert("foreign_threads", s1.foreign);
+    s.insert("threads_quiet", u64::from(s1.threads_quiet));
+    // Probe-adversary item 1: every sample records the probe's mode and the shim's lost count.
+    s.insert("shim_loaded", u64::from(s1.shim_loaded));
+    // probe-adversary-2 L4: why a count was refused (`probe::Refusal`, 0 when it was not).
+    s.insert("refusal", s1.refusal as u64);
+    s.insert("shim_lost", s1.shim_lost);
+    s.insert("held_unattributed", delta(s0.held_unattributed, s1.held_unattributed));
     s.insert("held_syncs", delta(s0.held_syncs, s1.held_syncs));
     s.insert("catalog_loads", delta(o0.cat.0, o1.cat.0));
     s.insert("catalog_queries", delta(o0.cat.2, o1.cat.2));
@@ -283,6 +340,9 @@ fn sample_of(s0: &probe::Snapshot, s1: &probe::Snapshot, o0: &Outside, o1: &Outs
             s.insert("log_bytes", b - a);
         }
     }
+    if let (Some(a), Some(b)) = (o0.exc, o1.exc) {
+        put_exceptions(&mut s, a, b);
+    }
     s
 }
 
@@ -300,6 +360,11 @@ fn settled(base: Option<u64>) -> bool {
 
 /// Spin, with no syscall, until `settled(base)` or the deadline; whether it settled.
 fn spin_settled(base: Option<u64>, deadline: std::time::Duration) -> bool {
+    // Mutant `harness_box_in_spin_settled` (test builds only; counters review 4 MED-1): the harness's
+    // own wait allocates inside the window it waits in.
+    if probe::mutant_on("harness_box_in_spin_settled") {
+        std::hint::black_box(Box::new(0u8)); // lint-allow: mutant harness_box_in_spin_settled
+    }
     let t = std::time::Instant::now();
     while !settled(base) {
         if t.elapsed() > deadline {
@@ -317,7 +382,9 @@ fn quiesce(db: &Arc<Database>, base: Option<u64>) -> bool {
     db.branch_checkpoint_wait();
     let t = std::time::Instant::now();
     loop {
-        if settled(base) && writer_settled(db, std::time::Duration::ZERO) {
+        // The writer first, then the thread state (`writer_settled`'s order: the thread state is what
+        // sees the writer's final step into its kernel wait).
+        if writer_settled(db, std::time::Duration::ZERO) && settled(base) {
             return true;
         }
         if t.elapsed() > std::time::Duration::from_secs(5) {
@@ -333,17 +400,30 @@ fn quiesce(db: &Arc<Database>, base: Option<u64>) -> bool {
 /// whether it left one; `quiet`, that nothing else ran in the window, so the process-wide counts
 /// are its own.
 fn measure<R>(db: &Arc<Database>, base: Option<u64>, f: impl FnOnce() -> R) -> (R, Sample) {
+    measure_owning(db, base, &[], f)
+}
+
+/// `measure`, charging the window with the work of the store threads named in `owned` (a
+/// persistent worker the operation dispatches, or the confirmation writer whose own cost a cell
+/// measures). Class (b), DECISIONS 994f7d41e0: the window's syscalls are the measuring thread's,
+/// its spawns' and its owned threads' only if no other thread ran inside it
+/// (`probe::end_owning`); a window where one did is not quiet, and `quiet` refuses a cell where
+/// fewer than half its samples are. The harness's own waits inside the window are declared
+/// syscall-free (`probe::spinning`), as `fc_writer_settled_cost` and `fc_threads_1000` check.
+fn measure_owning<R>(db: &Arc<Database>, base: Option<u64>, owned: &[&str], f: impl FnOnce() -> R) -> (R, Sample) {
     let settled = quiesce(db, base);
     let o0 = Outside::read(db);
     let c0 = db.branch_confirm_counts();
     let s0 = probe::begin();
     let r = f();
     let left = probe::threads() != base;
-    let (synced, parked) = absorb_confirm(db, &s0);
-    let back = spin_settled(base, std::time::Duration::from_secs(30));
+    let ((synced, parked), back) = probe::spinning(|| {
+        let absorbed = absorb_confirm(db, &s0);
+        (absorbed, spin_settled(base, std::time::Duration::from_secs(30)))
+    });
     // Review 2 L3: the confirmation count is read inside the window, before its end snapshot.
     let c1 = db.branch_confirm_counts();
-    let s1 = probe::end();
+    let s1 = probe::end_owning(owned);
     let o1 = Outside::read(db);
     let mut s = sample_of(&s0, &s1, &o0, &o1);
     let confirms = delta(c0[0], c1[0]);
@@ -353,7 +433,12 @@ fn measure<R>(db: &Arc<Database>, base: Option<u64>, f: impl FnOnce() -> R) -> (
     // A window whose work synced a flight and started no checkpoint (which may take the word
     // itself) must have absorbed the word's write.
     let absorbed = !synced || left || confirms == 1 || WORD_HELD.load(std::sync::atomic::Ordering::Acquire);
-    let quiet = settled && back && parked && absorbed && (left || s["allocs_process"] == s["allocs"]);
+    // The Linux port (2026-10-18): the window is the caller's own by `Snapshot::own` (its attribution
+    // where a kernel count exists, the thread rule where none does).
+    let own = s1.own();
+    let attributed = own && s1.held_unattributed == s0.held_unattributed;
+    let quiet = settled && back && parked && absorbed && attributed && (left || s["allocs_process"] == s["allocs"]);
+
     s.insert("writer_parked", u64::from(parked));
     s.insert("background", u64::from(left));
     s.insert("quiet", u64::from(quiet));
@@ -386,27 +471,34 @@ fn hold_word(held: bool) {
 /// 25 ms spin, and a thread state that read "waiting" mid-pwrite. Whether the work since `s0`
 /// synced, and whether the writer settled.
 fn absorb_confirm(db: &Arc<Database>, s0: &probe::Snapshot) -> (bool, bool) {
-    let now = sync_counts();
+    let now = probe::window_syncs();
     let synced = now.full_fsync != s0.full_fsync || now.fsync != s0.fsync;
     (synced, writer_settled(db, std::time::Duration::from_secs(1)))
 }
 
-/// Review 2 L3: spin, with no syscall (the park state is read with a try-lock), until `db`'s
-/// confirmation writer is parked in one of its waits with nothing left to do, or the deadline;
-/// whether it got there. Held (`hold_word`), parked is enough: the word waits out a quiet period no
-/// run reaches. Unheld, no proved word may be pending either: the writer writes it after its quiet
-/// period. With no persistent thread live in the process (`probe::persistent_live`), there is no
-/// writer to wait for. BLIND SPOT: with another store's writer live and none of `db`'s own, this
-/// waits out its deadline and the window reads not quiet (a refusal, not a false pass).
+/// Review 2 L3, review C14: spin, never blocking (the park state is read with a try-lock), until
+/// `db`'s confirmation writer is parked with nothing left to do, or the deadline; whether it got
+/// there. Parked with nothing left to do: in its idle wait or its quiet-period wait (never its
+/// flight wait: a flight or a cut is in the air, or its landing's wake is still to be taken),
+/// entered after every notification it was sent (review C14: a held create's landing notifies a
+/// parked writer, and until it wakes its old wait still reads as parked), and, unheld, with no proved
+/// word pending (the writer writes it after its quiet period). Held (`hold_word`), a pending word is
+/// expected: it waits out a quiet period no run reaches. With no persistent thread live in the
+/// process (`probe::persistent_live`), there is no writer to wait for. The final step into the
+/// kernel wait is not seen here (the accessor's blind spot); every caller spins on the thread state
+/// afterwards (`spin_settled`, all other threads blocked), which sees it on Apple. BLIND SPOT: with
+/// another store's writer live and none of `db`'s own, this waits out its deadline and the window
+/// reads not quiet (a refusal, not a false pass).
 fn writer_settled(db: &Arc<Database>, deadline: std::time::Duration) -> bool {
+    use super::store::{CONFIRM_PARK_IDLE, CONFIRM_PARK_QUIET};
     if probe::persistent_live() <= 0 {
         return true;
     }
     let held = WORD_HELD.load(std::sync::atomic::Ordering::Acquire);
     let t = std::time::Instant::now();
     loop {
-        if let Some((parked, pending, _)) = db.branches.confirm_park_for_test() {
-            if parked && (held || !pending) {
+        if let Some((wait, seen, pending, _)) = db.branches.confirm_park_for_test() {
+            if (wait == CONFIRM_PARK_IDLE || wait == CONFIRM_PARK_QUIET) && seen && (held || !pending) {
                 return true;
             }
         }
@@ -479,21 +571,69 @@ fn recover(cell: &str, built: &mut Built, opens: u64, out: &mut String) -> (Arc<
         built.incarnation = opened.incarnation;
         // The background threads are waited out by spinning (no syscall), not by joining them: a
         // join that blocks issues syscalls of its own, as many as the timing makes.
-        let (_, parked) = absorb_confirm(&opened, &s0);
-        let settled = parked && spin_settled(base, std::time::Duration::from_secs(30));
+        let settled = probe::spinning(|| {
+            let (_, parked) = absorb_confirm(&opened, &s0);
+            parked && spin_settled(base, std::time::Duration::from_secs(30))
+        });
         let s_all = probe::end();
         opened.branch_wait_name_filter();
         let settled = settled && quiesce(&opened, base);
         let o1 = Outside::read(&opened);
         let mut a = sample_of(&s0, &s_open, &Outside::zero(log0), &o1);
-        a.insert("quiet", u64::from(t0 == base && t_open == base));
+        // Class (b): a recovery window is the opening thread's and the threads the open spawned;
+        // another thread that ran inside it makes it unattributable (`probe::end`).
+        a.insert("quiet", u64::from(t0 == base && t_open == base && s_open.own()));
         line(out, cell, "recovery_open", r, &a);
         let mut b = sample_of(&s0, &s_all, &Outside::zero(log0), &o1);
-        b.insert("quiet", u64::from(t0 == base && settled));
+        b.insert("quiet", u64::from(t0 == base && settled && s_all.own()));
         line(out, cell, "recovery", r, &b);
         db = Some(opened);
     }
     (db.unwrap(), base)
+}
+
+/// Lead order (2026-10-15, attribution item 1): `create_allocates_at_most_once_under_the_store_mutex`
+/// and `create_is_independent_of_live_branches` flip between runs (n1e4_small's steady create
+/// allocates 2 when red, 1 when green). The allocation counters are this thread's own
+/// (`t_allocs`), so the extra allocation is the creating thread's. This diagnostic builds the
+/// n1e4_small cell four times in one process (each build its own hash keys), reopens it as the
+/// budget does, and runs the budget's rounds' create and delete, recording each create's
+/// allocations on this thread with a backtrace of every one past the first
+/// (`budget_probe::record_allocs`). Printed only: the per-build counts, and each distinct
+/// backtrace of an extra allocation with how often it was seen.
+#[test]
+#[ignore = "diagnostic (lead attribution order): run by name with --ignored --nocapture"]
+fn diag_n1e4_create_allocations_by_site() {
+    for build_no in 0..4 {
+        let mut built = build("diag_n1e4_small", 10_000, false, true);
+        let mut out = String::new();
+        let (db, _base) = recover("diag_n1e4_small", &mut built, 1, &mut out);
+        let trunk = db.connect().unwrap();
+        let mut counts: std::collections::BTreeMap<usize, u32> = Default::default();
+        let mut sites: std::collections::BTreeMap<String, u32> = Default::default();
+        for i in 0..40u64 {
+            let name = format!("m-{i:04}");
+            probe::record_allocs(true, 1);
+            trunk.create_branch(&name).unwrap();
+            let (n, sizes, traces) = probe::recorded_allocs();
+            probe::record_allocs(false, usize::MAX);
+            *counts.entry(n).or_default() += 1;
+            for t in traces {
+                // The frames inside this crate, the allocator's own left out: the site.
+                let frames: Vec<&str> = t
+                    .lines()
+                    .filter(|l| l.contains("turso_core::") && !l.contains("budget_probe"))
+                    .take(6)
+                    .collect();
+                *sites.entry(format!("{} sizes={sizes:?}\n    {}", t.lines().next().unwrap_or(""), frames.join("\n    "))).or_default() += 1;
+            }
+            db.drop_branch(&name).unwrap();
+        }
+        println!("build {build_no}: allocations per create (count: creates) {counts:?}");
+        for (site, n) in &sites {
+            println!("  x{n} {site}");
+        }
+    }
 }
 
 /// `k` rounds, each on a fresh named branch: create, connect by name, first write, disconnect,
@@ -533,7 +673,7 @@ fn rounds(cell: &str, db: &Arc<Database>, base: Option<u64>, k: u64, out: &mut S
 /// and the checkpoints started meanwhile (by any thread).
 fn growth(cell: &str, db: &Arc<Database>, out: &mut String) {
     const THREADS: u64 = 16;
-    let ck0 = db.branch_checkpoint_counters();
+    let (ck0, e0) = (db.branch_checkpoint_counters(), exceptions(db));
     let lines: Vec<Sample> = std::thread::scope(|s| {
         let handles: Vec<_> = (0..THREADS)
             .map(|t| {
@@ -564,14 +704,17 @@ fn growth(cell: &str, db: &Arc<Database>, out: &mut String) {
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
     db.branch_checkpoint_wait();
-    let ck1 = db.branch_checkpoint_counters();
+    let (ck1, e1) = (db.branch_checkpoint_counters(), exceptions(db));
+    // The arm is one window: every line carries its counted exceptions.
     for (t, mut s) in lines.into_iter().enumerate() {
         s.insert("ckpt_started", ck1[1] - ck0[1]);
+        put_exceptions(&mut s, e0, e1);
         line(out, cell, "growth_thread", t as u64, &s);
     }
     let live = db.branch_ids().unwrap().len() as u64;
     let mut s = Sample::new();
     s.insert("live", live);
+    put_exceptions(&mut s, e0, e1);
     line(out, cell, "growth_live", 0, &s);
 }
 
@@ -584,9 +727,10 @@ fn checkpoints(cell: &str, db: &Arc<Database>, base: Option<u64>, out: &mut Stri
     for i in 0..CKPT_ROUNDS {
         let name = format!("c-{i:04}");
         let sql = format!("UPDATE t SET v = 'c{i:04}' WHERE id = {}", 1 + i % 50);
-        let (_, s_create) = measure(db, base, || trunk.create_branch(&name).unwrap());
+        // The checkpoint each starts runs on the persistent checkpoint worker: owned.
+        let (_, s_create) = measure_owning(db, base, &["branch-checkpoint"], || trunk.create_branch(&name).unwrap());
         let c = db.connect_named(&name).unwrap();
-        let (_, s_write) = measure(db, base, || c.execute(&sql).unwrap());
+        let (_, s_write) = measure_owning(db, base, &["branch-checkpoint"], || c.execute(&sql).unwrap());
         drop(c);
         line(out, cell, "ckpt_create", i, &s_create);
         line(out, cell, "ckpt_first_write", i, &s_write);
@@ -594,17 +738,41 @@ fn checkpoints(cell: &str, db: &Arc<Database>, base: Option<u64>, out: &mut Stri
     super::journal::set_compact_threshold(0);
 }
 
+/// Stops a shared arm's trunk writer (`creating` false) and releases its clients (`go` true) when
+/// dropped, on every exit of the arm's scope, a panic included: a client spawn refused after the
+/// writer started had left it looping, and the scope joining it, until the child's timeout (review
+/// C08 #3; plant `budget_spawn_fails`).
+struct ReleaseArm<'a> {
+    creating: &'a std::sync::atomic::AtomicBool,
+    go: &'a std::sync::atomic::AtomicBool,
+}
+
+impl Drop for ReleaseArm<'_> {
+    fn drop(&mut self) {
+        self.go.store(true, std::sync::atomic::Ordering::Release);
+        self.creating.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
 /// The shared-flight arm (LEAP L3): `c` threads, released together, each making `shared_rounds(c)`
 /// named creates (arm `shared_create`), then, at C <= 64, as many create-then-first-write cycles
 /// (arm `shared_cfw`), closed loop. One line per arm: the durable acknowledgements (creates, plus
 /// first writes in the cfw arm) and the flushes issued meanwhile, process-wide. Threads get 8 MiB
-/// stacks (RUST_MIN_STACK's 64 MiB times 1024 threads is 64 GiB of reservation).
+/// stacks (RUST_MIN_STACK's 64 MiB times 1024 threads is 64 GiB of reservation). At C = 8 also a
+/// serialised-schedule control (arm `shared_serial`, DECISIONS 6d491917d2 proposal 2): the clients
+/// take turns on a test-side mutex around each create, so no flight is shared and no waiter need
+/// wait; the contention budgets must judge it without a false refusal.
 fn shared(cell: &str, db: &Arc<Database>, c: u64, out: &mut String) {
     let rounds = shared_rounds(c);
-    for (arm, cfw) in [("shared_create", false), ("shared_cfw", true), ("shared_commits", false)] {
+    for (arm, cfw) in [("shared_create", false), ("shared_cfw", true), ("shared_commits", false), ("shared_serial", false)] {
         if cfw && c > 64 {
             continue;
         }
+        let serial = arm == "shared_serial";
+        if serial && c != 8 {
+            continue;
+        }
+        let one_at_a_time = std::sync::Mutex::new(());
         // Review 2 M5: creates beside a trunk writer (one DDL, then UPDATEs until the creates end),
         // at C = 8 and 64 only.
         let commits = arm == "shared_commits";
@@ -615,7 +783,10 @@ fn shared(cell: &str, db: &Arc<Database>, c: u64, out: &mut String) {
         // A start flag, not a Barrier: a thread that fails to start, or panics before the start,
         // cannot leave the others parked for ever.
         let go = std::sync::atomic::AtomicBool::new(false);
-        let s0 = sync_counts();
+        let e0 = exceptions(db);
+        let s0 = probe::window_syncs();
+        let p0 = super::sync_counts();
+        let o0 = super::store::own_sync_counts();
         // Per client, from its start to its last acknowledgement: the store's condition-variable
         // waits (`store::thread_waits`, one per wait call, so a futile wake-up that waits again
         // counts again), and the most any one acknowledgement waited (review 2 H5: a sum is a mean,
@@ -626,6 +797,9 @@ fn shared(cell: &str, db: &Arc<Database>, c: u64, out: &mut String) {
         let per: Vec<(u64, u64, u64, u64, u64, u64)> = std::thread::scope(|s| {
             let mut clients = Vec::new();
             let creating = &creating;
+            // On every exit of this scope, a panic included, the writer stops and the clients are
+            // released before the scope joins them (review C08 #3).
+            let _release = ReleaseArm { creating, go: &go };
             let writer = commits.then(|| {
                 s.spawn(move || {
                     let trunk = db.connect().unwrap();
@@ -650,8 +824,8 @@ fn shared(cell: &str, db: &Arc<Database>, c: u64, out: &mut String) {
                 })
             });
             for t in 0..c {
-                let go = &go;
-                let spawned = std::thread::Builder::new().stack_size(8 << 20).spawn_scoped(s, move || {
+                let (go, one_at_a_time) = (&go, &one_at_a_time);
+                let client = move || {
                     let trunk = db.connect();
                     while !go.load(std::sync::atomic::Ordering::Acquire) {
                         std::thread::yield_now();
@@ -662,7 +836,9 @@ fn shared(cell: &str, db: &Arc<Database>, c: u64, out: &mut String) {
                     for i in 0..rounds {
                         let name = format!("{arm}-{t}-{i:04}");
                         let a0 = super::store::thread_waits();
+                        let turn = serial.then(|| one_at_a_time.lock().unwrap_or_else(|e| e.into_inner()));
                         retries += fork_one(&trunk, Some(&name));
+                        drop(turn);
                         max_ack = max_ack.max(delta(a0, super::store::thread_waits()));
                         if cfw {
                             let b = db.connect_named(&name).unwrap();
@@ -679,14 +855,20 @@ fn shared(cell: &str, db: &Arc<Database>, c: u64, out: &mut String) {
                         delta(f0, probe::futile_leads()),
                         delta(g0, probe::fork_registrations()),
                     )
-                });
+                };
+                // A setup-failure plant (review C08 #3, `FE_MUTANT=budget_spawn_fails`, test builds
+                // only): the second client's spawn is refused, as resource exhaustion would refuse
+                // it, after the trunk writer started. Its outcome is a prompt crash naming the
+                // spawn, never a budget's kill.
+                let spawned = if commits && t == 1 && super::store::fe_mutant("budget_spawn_fails") {
+                    Err(std::io::Error::other("planted spawn failure (FE_MUTANT=budget_spawn_fails)"))
+                } else {
+                    std::thread::Builder::new().stack_size(8 << 20).spawn_scoped(s, client)
+                };
                 match spawned {
                     Ok(h) => clients.push(h),
-                    Err(e) => {
-                        // The clients already started must not be left parked for ever.
-                        go.store(true, std::sync::atomic::Ordering::Release);
-                        panic!("{cell}: a thread of {c} did not start: {e}");
-                    }
+                    // `_release` stops the writer and releases the started clients as this unwinds.
+                    Err(e) => panic!("{cell}: {arm}: a thread of {c} did not start: {e}"),
                 }
             }
             go.store(true, std::sync::atomic::Ordering::Release);
@@ -701,13 +883,23 @@ fn shared(cell: &str, db: &Arc<Database>, c: u64, out: &mut String) {
             }
             per
         });
-        let s1 = sync_counts();
+        let s1 = probe::window_syncs();
+        let p1 = super::sync_counts();
+        let o1 = super::store::own_sync_counts();
+        let e1 = exceptions(db);
         let mut m = Sample::new();
+        put_exceptions(&mut m, e0, e1);
         m.insert("threads", c);
         m.insert("acks", c * rounds * if cfw { 2 } else { 1 });
         m.insert("full_fsync", s1.full_fsync - s0.full_fsync);
         m.insert("fsync", s1.fsync - s0.fsync);
         m.insert("barrier", s1.barrier - s0.barrier);
+        m.insert("fsync_process", p1.fsync - p0.fsync);
+        m.insert("full_fsync_process", p1.full_fsync - p0.full_fsync);
+        m.insert("barrier_process", p1.barrier - p0.barrier);
+        m.insert("fsync_own", o1.fsync - o0.fsync);
+        m.insert("full_fsync_own", o1.full_fsync - o0.full_fsync);
+        m.insert("barrier_own", o1.barrier - o0.barrier);
         m.insert("store_waits", per.iter().map(|p| p.0).sum());
         m.insert("store_waits_max_client", per.iter().map(|p| p.0).max().unwrap_or(0));
         m.insert("store_waits_max_ack", per.iter().map(|p| p.3).max().unwrap_or(0));
@@ -747,6 +939,9 @@ fn memory(cell: &str, built: &mut Built, out: &mut String) {
     let ((hold_bytes, hold_rows), (bg_bytes, bg_rows)) = (maxima.all, maxima.background);
     probe::mark_foreground(false);
     let foot1 = probe::phys_footprint();
+    // Counted since this open (`Outside::zero`), read once its background work settled and every
+    // count above was taken.
+    let exc = exceptions(&db);
     let mut s = Sample::new();
     // A negative delta (the open freed more than it kept) is recorded as such, never clamped: the
     // test refuses it.
@@ -764,10 +959,39 @@ fn memory(cell: &str, built: &mut Built, out: &mut String) {
     s.insert("max_bg_hold_catalog_rows", bg_rows);
     s.insert("max_fg_hold_alloc_bytes", maxima.foreground.0);
     s.insert("max_fg_hold_catalog_rows", maxima.foreground.1);
+    // Linux finding (b): held work that allocates nothing (filter inserts), per hold.
+    s.insert("max_hold_work", maxima.work.0);
+    s.insert("max_bg_hold_work", maxima.work.1);
+    s.insert("max_fg_hold_work", maxima.work.2);
+    // budgets-rev-242345 LOW-4 and LOW-5: each per-name site apart (`probe::WorkSite`).
+    s.insert("max_seed_hold_work", maxima.site_work[0]);
+    s.insert("max_install_hold_work", maxima.site_work[1]);
+    s.insert("max_growth_hold_work", maxima.site_work[2]);
+    s.insert("max_recovery_work", maxima.site_work[3]);
     // Review 2 M7: the opening thread's held bytes summed over every hold of the open.
     s.insert("fg_held_alloc_bytes_sum", delta(held0, held1));
+    put_exceptions(&mut s, [0; 4], exc);
     s.insert("quiet", u64::from(settled));
     line(out, cell, "memory", 0, &s);
+    // budgets-rev-242345 MED-7: a growth of the filter the open built, its two holds (swap, drain) measured
+    // apart. The build sizes the table under half full, so the next create is made to owe one
+    // (`FILTER_GROW_NEXT`); the growth then copies every name, as any growth does. `growth_runs` is the
+    // premise: the growth site ran.
+    let base = probe::threads();
+    let _ = probe::take_hold_maxima();
+    let e0 = exceptions(&db);
+    super::store::FILTER_GROW_NEXT.store(true, std::sync::atomic::Ordering::Release);
+    db.connect().unwrap().create_branch(&format!("{cell}-grow")).unwrap();
+    db.branch_wait_name_filter();
+    let settled = quiesce(&db, base);
+    super::store::FILTER_GROW_NEXT.store(false, std::sync::atomic::Ordering::Release);
+    let m = probe::take_hold_maxima();
+    let mut g = Sample::new();
+    g.insert("max_growth_hold_work", m.site_work[2]);
+    g.insert("growth_runs", m.site_runs[2]);
+    put_exceptions(&mut g, e0, exceptions(&db));
+    g.insert("quiet", u64::from(settled));
+    line(out, cell, "growth", 0, &g);
 }
 
 /// The confirmation arm (review 6 #1's fix: the word leaves the create path for a background
@@ -786,13 +1010,14 @@ fn confirm(cell: &str, db: &Arc<Database>, base: Option<u64>, k: u64, out: &mut 
         db.branch_compact_now().unwrap();
         db.branch_checkpoint_wait();
         let (_, _) = measure(db, base, || trunk.create_branch(&format!("u-{i:04}")).unwrap());
-        let (_, s_written) = measure(db, base, || trunk.create_branch(&format!("w-{i:04}")).unwrap());
+        // These cells measure the confirmation writer's own cost (its word, its wake): owned.
+        let (_, s_written) = measure_owning(db, base, &["branch-confirm"], || trunk.create_branch(&format!("w-{i:04}")).unwrap());
         hold_word(true);
-        let (_, s_held) = measure(db, base, || trunk.create_branch(&format!("h-{i:04}")).unwrap());
+        let (_, s_held) = measure_owning(db, base, &["branch-confirm"], || trunk.create_branch(&format!("h-{i:04}")).unwrap());
         // Review 2 H2: the reference. `h` landed with no proved word pending (w's was written), so its
         // landing woke the parked writer (`confirm_cv.notify_one`, on the acknowledging thread); this
         // second held create lands on h's pending word and wakes no one.
-        let (_, s_reference) = measure(db, base, || trunk.create_branch(&format!("r-{i:04}")).unwrap());
+        let (_, s_reference) = measure_owning(db, base, &["branch-confirm"], || trunk.create_branch(&format!("r-{i:04}")).unwrap());
         if i >= WARMUP {
             line(out, cell, "confirm_written", i - WARMUP, &s_written);
             line(out, cell, "confirm_held", i - WARMUP, &s_held);
@@ -802,73 +1027,193 @@ fn confirm(cell: &str, db: &Arc<Database>, base: Option<u64>, k: u64, out: &mut 
     hold_word(false);
 }
 
-/// The clients per burst of the confirmation writer's load arm (`confirm_load`).
-const CONFIRM_LOAD_CS: [u64; 3] = [1, 8, 64];
+/// The confirmation writer's load arms (`confirm_load`): `(C clients per burst, the parent's delay in ms after the burst before it
+/// reads the burst's counts)`. The delayed arm (review C08 #1) is a scheduling control: a parent
+/// descheduled past the 5 ms quiet period after the last create must not turn the idle tail's
+/// honest word into a word "while flights overlapped".
+const CONFIRM_LOAD_ARMS: [(u64, u64); 4] = [(1, 0), (8, 0), (64, 0), (8, 20)];
+
+/// The load cell's idle-hole control (DECISIONS 6d491917d2): 8 clients that all pause 20 ms
+/// together half-way through their creates.
+const LOAD_GAPPED: &str = "load_c8_gapped";
+
+/// The load cell's reachability arm (lead, DECISIONS 2026-10-15: the writer's poll and its slot hold
+/// were unreachable at the shipped schedule, and are not equivalent): 8 clients whose every syncing
+/// flight stays in the air `SLOW_FLIGHT_US` past its sync (`journal::FLIGHT_SYNC_DELAY_US`, a test
+/// hook), longer than the 5 ms quiet period.
+const LOAD_SLOW: &str = "load_c8_slow_flights";
+
+/// The slow arm's added time in the air per flight: 8 ms, past the 5 ms quiet period.
+const SLOW_FLIGHT_US: u64 = 8_000;
+
+/// Sets the engine's flight-sync delay; restores 0 when dropped, on every exit of the arm.
+struct FlightDelay;
+
+impl FlightDelay {
+    fn set(us: u64) -> Self {
+        super::journal::FLIGHT_SYNC_DELAY_US.store(us, std::sync::atomic::Ordering::Release);
+        Self
+    }
+}
+
+impl Drop for FlightDelay {
+    fn drop(&mut self) {
+        super::journal::FLIGHT_SYNC_DELAY_US.store(0, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// The line name of a load arm.
+fn load_arm(c: u64, delay_ms: u64) -> String {
+    if delay_ms == 0 {
+        format!("load_c{c}")
+    } else {
+        format!("load_c{c}_delayed")
+    }
+}
 
 /// Review 2 H1: the confirmation writer under load, with the shipped quiet period (the word NOT
-/// held). For each C in `CONFIRM_LOAD_CS`, C clients make back-to-back creates (`shared_rounds(C)`
-/// each, started together), then the cell waits out the idle tail: at most 1 s for the word the tail
-/// owes, and 20 ms more for a second one that must not come (wall time only to settle; nothing timed
-/// is measured). One line per C (`load_c{C}`): acknowledgements, flights (`group_counters()[0]`),
-/// words written during the burst (`confirms_burst`) and by the end of the tail
-/// (`confirms_total`), and the writer's wake-ups with a word pending
-/// (`confirm_wakeups_for_test`) during the burst.
+/// held). For each arm of `CONFIRM_LOAD_ARMS`, C clients make back-to-back creates
+/// (`shared_rounds(C)` each, started together), then the cell waits out the idle tail: at most 1 s
+/// for the writer to settle with the tail's word written (`writer_settled`), and 20 ms more for a
+/// second one that must not come (wall time only to settle; nothing timed is measured). One line
+/// per arm (`load_c{C}`, `load_c{C}_delayed`): acknowledgements, flights (`group_counters()[0]`),
+/// the words by the flight they confirm (the burst's, `confirms_burst`; the idle tail's,
+/// `confirms_tail`; review C08 #1) and in all (`confirms_total`), the old reading by the time the
+/// parent read them (`confirms_by_read`, reported only), whether the tail settled, the burst's idle
+/// holes (`idle_holes`), and the writer's wake-ups with a word pending (`confirm_wakeups_for_test`)
+/// by the time the parent read them (the delayed arm's include the first of its tail's).
 fn confirm_load(cell: &str, db: &Arc<Database>, out: &mut String) {
     hold_word(false);
     let words = || db.branch_confirm_counts()[0];
-    let settle = |since: u64| {
-        let t = std::time::Instant::now();
-        while words() == since && t.elapsed() < std::time::Duration::from_secs(1) {
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
+    // The idle tail: the writer parked with nothing pending (its word written, `writer_settled`),
+    // then 20 ms more for a second word that must not come. Whether the writer settled.
+    let settle = || {
+        let settled = writer_settled(db, std::time::Duration::from_secs(1));
         std::thread::sleep(std::time::Duration::from_millis(20));
+        settled
     };
     // The population's own tail word is written before the first burst starts.
-    settle(words());
-    for c in CONFIRM_LOAD_CS {
+    settle();
+    let gapped = (8, 0, true, false);
+    let slow = (8, 0, false, true);
+    for (c, delay_ms, gap, slow) in CONFIRM_LOAD_ARMS.iter().map(|&(c, d)| (c, d, false, false)).chain([gapped, slow]) {
         let rounds = shared_rounds(c);
+        // The arm's line, and its creates' name prefix: three arms run at C = 8 on one database, so a
+        // prefix by C alone made the second arm's first create NameTaken (base16 at fb31e6153).
+        let arm = if slow {
+            LOAD_SLOW.to_string()
+        } else if gap {
+            LOAD_GAPPED.to_string()
+        } else {
+            load_arm(c, delay_ms)
+        };
+        let arm = arm.as_str();
+        let e0 = exceptions(db);
         let (w0, k0, f0) = (words(), db.branches.confirm_wakeups_for_test(), db.branches.group_counters()[0]);
         let go = std::sync::atomic::AtomicBool::new(false);
-        std::thread::scope(|s| {
+        // The gapped control's pause: every client meets half-way, the last to arrive sleeps 20 ms and
+        // releases them all, so no create is in progress for those 20 ms (an idle hole on purpose).
+        // Atomics, not a Barrier: a client that failed to start must not leave the others waiting.
+        let (arrived, released) = (std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicBool::new(false));
+        // The slow arm's flights stay in the air past the quiet period (the engine's test hook).
+        let _slow = slow.then(|| FlightDelay::set(SLOW_FLIGHT_US));
+        let spans: Vec<Vec<(std::time::Instant, std::time::Instant)>> = std::thread::scope(|s| {
             let mut clients = Vec::new();
             for t in 0..c {
-                let go = &go;
+                let (go, arrived, released) = (&go, &arrived, &released);
                 let spawned = std::thread::Builder::new().stack_size(8 << 20).spawn_scoped(s, move || {
                     let trunk = db.connect();
                     while !go.load(std::sync::atomic::Ordering::Acquire) {
                         std::thread::yield_now();
                     }
                     let trunk = trunk.unwrap();
+                    let mut spans = Vec::with_capacity(rounds as usize);
                     for i in 0..rounds {
-                        trunk.create_branch(&format!("load{c}-{t}-{i:04}")).unwrap();
+                        if gap && i == rounds / 2 {
+                            use std::sync::atomic::Ordering::{AcqRel, Acquire, Release};
+                            if arrived.fetch_add(1, AcqRel) + 1 == c {
+                                std::thread::sleep(std::time::Duration::from_millis(20));
+                                released.store(true, Release);
+                            }
+                            while !released.load(Acquire) {
+                                std::thread::yield_now();
+                            }
+                        }
+                        let started = std::time::Instant::now();
+                        trunk.create_branch(&format!("{arm}-{t}-{i:04}")).unwrap();
+                        spans.push((started, std::time::Instant::now()));
                     }
+                    spans
                 });
                 match spawned {
                     Ok(h) => clients.push(h),
                     Err(e) => {
                         go.store(true, std::sync::atomic::Ordering::Release);
+                        released.store(true, std::sync::atomic::Ordering::Release);
                         panic!("{cell}: a thread of {c} did not start: {e}");
                     }
                 }
             }
             go.store(true, std::sync::atomic::Ordering::Release);
-            for h in clients {
-                h.join().unwrap();
-            }
+            clients.into_iter().map(|h| h.join().unwrap()).collect()
         });
+        drop(_slow);
+        // The delayed arm's parent, descheduled on purpose (review C08 #1's schedule).
+        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
         let (w1, k1, f1) = (words(), db.branches.confirm_wakeups_for_test(), db.branches.group_counters()[0]);
-        settle(w1);
-        let w2 = words();
+        let settled = settle();
+        // Review C08 #1: the words are attributed by the flight they confirm, not by when the parent
+        // read them. The tail's are the last landed flight's own (`confirm_tail_words_for_test`,
+        // counted by the writer as it writes them); every other word written was a burst's.
+        let (w2, tail) = (words(), db.branches.confirm_tail_words_for_test());
+        let e1 = exceptions(db);
+        let total = delta(w0, w2);
         let mut m = Sample::new();
+        put_exceptions(&mut m, e0, e1);
         m.insert("threads", c);
         m.insert("acks", c * rounds);
         m.insert("flights", delta(f0, f1));
-        m.insert("confirms_burst", delta(w0, w1));
-        m.insert("confirms_total", delta(w0, w2));
+        m.insert("confirms_burst", total.saturating_sub(tail));
+        m.insert("confirms_tail", tail);
+        m.insert("confirms_total", total);
+        // The old reading, words by the time the parent read them (reported only).
+        m.insert("confirms_by_read", delta(w0, w1));
+        m.insert("tail_settled", u64::from(settled));
+        m.insert("idle_holes", idle_holes(&spans, std::time::Duration::from_millis(CONFIRM_QUIET_MS_SHIPPED)));
         m.insert("wakeups_burst", delta(k0, k1));
-        line(out, cell, &format!("load_c{c}"), 0, &m);
+        // The burst's wall time, from the first create's call to the last one's return (wall time only
+        // for the slow arm's premise; no budget reads a time).
+        let first = spans.iter().flatten().map(|s| s.0).min();
+        let last = spans.iter().flatten().map(|s| s.1).max();
+        if let (Some(a), Some(b)) = (first, last) {
+            m.insert("burst_us", (b - a).as_micros() as u64);
+        }
+        line(out, cell, arm, 0, &m);
     }
     hold_word(true);
+}
+
+/// The shipped quiet period of the confirmation writer, in ms (`CONFIRM_QUIET`, store.rs).
+const CONFIRM_QUIET_MS_SHIPPED: u64 = 5;
+
+/// Review C08 #1: the gaps of at least `quiet` in the union of the creates' spans, each client's
+/// create from its call to its return. Such a gap is an idle period the writer may honestly fill
+/// with a word while the burst still has creates to make; reported, not budgeted (a create stalled
+/// for that long before it joins a flight is one too, and is not seen here).
+fn idle_holes(spans: &[Vec<(std::time::Instant, std::time::Instant)>], quiet: std::time::Duration) -> u64 {
+    let mut all: Vec<(std::time::Instant, std::time::Instant)> = spans.iter().flatten().copied().collect();
+    all.sort_by_key(|s| s.0);
+    let Some(&(_, mut end)) = all.first() else {
+        return 0;
+    };
+    let mut holes = 0;
+    for &(start, stop) in &all[1..] {
+        if start > end && start - end >= quiet {
+            holes += 1;
+        }
+        end = end.max(stop);
+    }
+    holes
 }
 
 /// The open-flush cells (lead order, DECISIONS 1334833a4d; review 16 LOW 11's a9ba5adb8): a store's
@@ -879,8 +1224,10 @@ fn confirm_load(cell: &str, db: &Arc<Database>, out: &mut String) {
 ///   writer grandchild (`open_writer_d2`) builds it and is SIGKILLed before it closes, so no close
 ///   writes the word; one reopen measured per sample, 3 samples;
 /// * `open_d2_confirmed`, `open_cat_d2`, `open_d1`: built in this process and closed cleanly (the
-///   close writes the word where the class proves stable storage: D2 on Apple, never D1), then
-///   reopened 5 times, each reopen closed cleanly again.
+///   close writes the word: at once where the class proves stable storage, D2 on Apple, and at D1
+///   after a full flush of the log of its own, `Confirm::write_at_close`, a81058160), then reopened 5
+///   times, each reopen closed cleanly again.
+///
 /// Per open: the process's device flushes and fsyncs (`io::SYNC_COUNTS`), the opening thread's syncs
 /// by the class asked (`journal::CLASS_SYNCS`) and directory syncs (`journal::DIR_SYNCS`), and the
 /// premises: the log's inode and length unchanged across the open (it was kept: no rewrite, no
@@ -955,22 +1302,36 @@ fn open_once(path: &Path, log: &Path) -> Sample {
     let (m0, confirmed) = (std::fs::metadata(log).unwrap(), log_confirmed(log));
     let classes = || super::journal::CLASS_SYNCS.with(|c| [c[0].get(), c[1].get()]);
     let dirs = || super::journal::DIR_SYNCS.with(|c| c.get());
-    let (s0, c0, d0) = (sync_counts(), classes(), dirs());
+    let (s0, c0, d0) = (probe::window_syncs(), classes(), dirs());
+    let p0 = super::sync_counts();
+    let o0 = super::store::own_sync_counts();
     let db = open_at(path);
-    let (s1, c1, d1) = (sync_counts(), classes(), dirs());
+    let (s1, c1, d1) = (probe::window_syncs(), classes(), dirs());
+    let p1 = super::sync_counts();
+    let o1 = super::store::own_sync_counts();
     let m1 = std::fs::metadata(log).unwrap();
+    // Counted since this open (`Outside::zero`).
+    let exc = exceptions(&db);
     drop(db);
-    Sample::from([
+    let mut s = Sample::from([
         ("full_fsync", s1.full_fsync - s0.full_fsync),
         ("fsync", s1.fsync - s0.fsync),
         ("barrier", s1.barrier - s0.barrier),
+        ("fsync_process", p1.fsync - p0.fsync),
+        ("full_fsync_process", p1.full_fsync - p0.full_fsync),
+        ("barrier_process", p1.barrier - p0.barrier),
+        ("fsync_own", o1.fsync - o0.fsync),
+        ("full_fsync_own", o1.full_fsync - o0.full_fsync),
+        ("barrier_own", o1.barrier - o0.barrier),
         ("thread_plain", c1[0] - c0[0]),
         ("thread_full", c1[1] - c0[1]),
         ("dir_syncs", d1 - d0),
         ("same_inode", u64::from(m0.ino() == m1.ino())),
         ("same_len", u64::from(m0.len() == m1.len())),
         ("confirmed", confirmed),
-    ])
+    ]);
+    put_exceptions(&mut s, [0; 4], exc);
+    s
 }
 
 /// Kills a writer grandchild when dropped, so no test failure leaves it running.
@@ -1070,8 +1431,10 @@ impl Drop for SchemaHoldDisarm {
 /// schema, parked there by its store's own hold (`HOLD_SCHEMA_PUBLISH` on `trunk_commit_hold`) —
 /// registers the child with no schema, and the child parses its own at its first connection
 /// (`connect_branch`, `force_reparse_schema_without_publish`). This arm counts, with the SQL-layer
-/// counters (`probe::sql_counts`), the create on a thread of its own and the child's first
-/// `connect_named` on the cell's thread.
+/// counters (`probe::sql_counts`), the create on a thread of its own and then the child's first
+/// `connect_named` on another, started while the DDL is still parked (review C08 #2) and released
+/// after 30 s if it waits (`connect_waited_for_ddl`), with its store waits and sleeps
+/// (`connect_store_waits`, `connect_sleeps`).
 ///
 /// Every sample is a fresh database of `tables` tables (`t` with one row, then fillers, in one
 /// transaction; the WAL checkpointed), bootstrapped before anything is counted: one throwaway branch
@@ -1133,6 +1496,8 @@ fn schema_window(cell: &str, tables: u64, out: &mut String) {
                     forker.create_branch("anchor").unwrap();
                 }
                 let alter = "ALTER TABLE t ADD COLUMN c INTEGER DEFAULT 7";
+                // The sample's window for the counted exceptions: from here to the joins below.
+                let e0 = exceptions(&db);
                 let hold = db.branches.trunk_commit_hold.clone();
                 let _disarm = SchemaHoldDisarm(hold.clone());
                 let parked = if window {
@@ -1167,27 +1532,43 @@ fn schema_window(cell: &str, tables: u64, out: &mut String) {
                         (made, s)
                     })
                 };
-                let t = std::time::Instant::now();
-                while !fork.is_finished() && t.elapsed() < std::time::Duration::from_secs(30) {
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                }
-                let waited = !fork.is_finished();
+                let waited = !finished_within(&fork, std::time::Duration::from_secs(30));
+                // The child's first connection, on a thread of its own and while the DDL is still
+                // parked (review C08 #2: connected after the release, a connect that waits for the
+                // publication found it already done): under MED 8 a window child parses its schema
+                // here, and must not wait for the trunk's. (A fork that itself waited out the bound
+                // is connected after the release: that sample fails on the fork's wait.)
+                let spawn_connect = || {
+                    let db = db.clone();
+                    std::thread::spawn(move || {
+                        let (k0, b0, w0, z0) = (probe::sql_counts(), probe::thread_allocs(), super::store::thread_waits(), probe::sleeps());
+                        let branch = db.connect_named("m-0000").map_err(|e| e.to_string());
+                        let (k1, b1, w1, z1) = (probe::sql_counts(), probe::thread_allocs(), super::store::thread_waits(), probe::sleeps());
+                        let mut c = Sample::new();
+                        for (key, v) in sql_sample(&k0, &k1) {
+                            if let Some(k) = CONNECT_KEYS.iter().find(|k| k.strip_prefix("connect_") == Some(key)) {
+                                c.insert(*k, v);
+                            }
+                        }
+                        c.insert("connect_alloc_bytes", delta(b0.1, b1.1));
+                        c.insert("connect_store_waits", delta(w0, w1));
+                        c.insert("connect_sleeps", delta(z0, z1));
+                        (branch, c)
+                    })
+                };
+                let connect = (!waited).then(spawn_connect);
+                let connect_waited = connect.as_ref().is_some_and(|h| !finished_within(h, std::time::Duration::from_secs(30)));
                 hold.store(0, O::Release);
                 let (made, mut s) = fork.join().unwrap();
                 if let Some(commit) = parked {
                     commit.join().unwrap().unwrap_or_else(|e| panic!("{cell}: {op}: the parked ALTER failed: {e}"));
                 }
-                made.unwrap_or_else(|e| panic!("{cell}: {op}: the fork failed: {e}"));
-                // The child's first connection: under MED 8 a window child parses its schema here.
-                let (k0, b0) = (probe::sql_counts(), probe::thread_allocs());
-                let branch = db.connect_named("m-0000").unwrap();
-                let (k1, b1) = (probe::sql_counts(), probe::thread_allocs());
-                for (key, v) in sql_sample(&k0, &k1) {
-                    if let Some(k) = CONNECT_KEYS.iter().find(|k| k.strip_prefix("connect_") == Some(key)) {
-                        s.insert(*k, v);
-                    }
-                }
-                s.insert("connect_alloc_bytes", delta(b0.1, b1.1));
+                made.unwrap_or_else(|e| panic!("{cell}: {op}: the fork failed (waited for the DDL: {waited}): {e}"));
+                let (branch, c) = connect.unwrap_or_else(spawn_connect).join().unwrap();
+                let branch = branch.unwrap_or_else(|e| panic!("{cell}: {op}: the child's first connection failed: {e}"));
+                put_exceptions(&mut s, e0, exceptions(&db));
+                s.extend(c);
+                s.insert("connect_waited_for_ddl", u64::from(connect_waited));
                 // The branch has the schema its pages need (the engine's own test's check).
                 assert_eq!(query_int(&branch, "SELECT c FROM t WHERE id = 1"), 7, "{cell}: {op}: the branch read the new column wrong");
                 s.insert("waited_for_ddl", u64::from(waited));
@@ -1234,15 +1615,41 @@ fn first_create(cell: &str, out: &mut String) {
                 db
             };
             let trunk = db.connect().unwrap();
-            let (c0, f0) = (probe::sql_counts(), sync_counts());
+            let e0 = exceptions(&db);
+            let (c0, f0) = (probe::sql_counts(), probe::window_syncs());
+            let p0 = super::sync_counts();
+            let o0 = super::store::own_sync_counts();
+            let h0 = probe::thread_allocs();
             trunk.create_branch("m-0000").unwrap();
-            let (c1, f1) = (probe::sql_counts(), sync_counts());
+            let h1 = probe::thread_allocs();
+            let (c1, f1) = (probe::sql_counts(), probe::window_syncs());
+            let p1 = super::sync_counts();
+            let o1 = super::store::own_sync_counts();
             let mut s = sql_sample(&c0, &c1);
+            put_exceptions(&mut s, e0, exceptions(&db));
             s.insert("full_fsync", f1.full_fsync - f0.full_fsync);
             s.insert("fsync", f1.fsync - f0.fsync);
+            s.insert("full_fsync_process", p1.full_fsync - p0.full_fsync);
+            s.insert("fsync_process", p1.fsync - p0.fsync);
+            s.insert("full_fsync_own", o1.full_fsync - o0.full_fsync);
+            s.insert("fsync_own", o1.fsync - o0.fsync);
+            // budgets-rev-242345 addendum 4 MED-11: the calling thread's allocations under a store mutex in
+            // the window (the create runs on it), which the 8 KiB bound reads; it was never recorded.
+            s.insert("held_allocs", h1.2 - h0.2);
+            s.insert("held_alloc_bytes", h1.3 - h0.3);
             line(out, cell, op, i, &s);
         }
     }
+}
+
+/// Whether the thread behind `h` finished within `bound` (polled every 1 ms; wall time only to
+/// bound a wait, nothing timed is measured).
+fn finished_within<T>(h: &std::thread::JoinHandle<T>, bound: std::time::Duration) -> bool {
+    let t = std::time::Instant::now();
+    while !h.is_finished() && t.elapsed() < bound {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    h.is_finished()
 }
 
 /// The first-connect keys of a schema-window sample (`sql_sample`'s, prefixed).
@@ -1253,6 +1660,51 @@ fn trunk_for_fc(db: &Arc<Database>) {
     db.connect().unwrap().create_branch("fc-dirty").unwrap();
 }
 
+/// This thread's id: pthread_threadid_np on Apple; off Apple the KERNEL thread id by raw syscall(2)
+/// (SYS_gettid), never `libc::gettid`, which glibc has only from 2.30: the RHEL 8 iccad hosts run 2.28,
+/// where a build links and the call SIGSEGVs (fastest-budgets, uwrun budgets-segv-1). Off Apple
+/// `thread_table` is None, so the table checks have no data there; the id keeps them compiling and
+/// distinct per thread.
+fn this_thread_id() -> u64 {
+    #[cfg(target_vendor = "apple")]
+    {
+        let mut me = 0u64;
+        // SAFETY: this thread's own id into a local.
+        unsafe { libc::pthread_threadid_np(0, &mut me) };
+        me
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        // SAFETY: gettid(2) has no preconditions and cannot fail.
+        unsafe { libc::syscall(libc::SYS_gettid) as u64 }
+    }
+}
+
+/// `this_thread_id` names the calling thread, distinctly per thread, on every libc: on Linux it is
+/// the kernel's id, read back from /proc/thread-self (a link to `<pid>/task/<tid>`).
+#[test]
+fn this_thread_id_is_the_calling_thread_s_own() {
+    let ids: Vec<u64> = (0..4).map(|_| std::thread::spawn(this_thread_id).join().unwrap()).collect();
+    let mut distinct = ids.clone();
+    distinct.sort();
+    distinct.dedup();
+    assert_eq!(distinct.len(), ids.len(), "CLAIM: two threads got one id: {ids:?}");
+    assert!(ids.iter().all(|&i| i != 0), "CLAIM: a thread id is 0: {ids:?}");
+    #[cfg(target_os = "linux")]
+    {
+        let link = std::fs::read_link("/proc/thread-self").expect("premise: /proc/thread-self is readable");
+        let tid: u64 = link.file_name().and_then(|f| f.to_str()).and_then(|f| f.parse().ok()).expect("premise: <pid>/task/<tid>");
+        assert_eq!(this_thread_id(), tid, "CLAIM: this_thread_id is not the kernel thread id (link {link:?})");
+    }
+}
+
+/// getppid by raw syscall(2), the one call the shim cannot see: BSD/macOS number 39; on Linux the
+/// platform's own SYS_getppid (39 there is getpid on x86_64 and umount2 on aarch64: integ-rev-1017).
+#[cfg(target_vendor = "apple")]
+const RAW_GETPPID: libc::c_int = 39;
+#[cfg(not(target_vendor = "apple"))]
+const RAW_GETPPID: libc::c_long = libc::SYS_getppid;
+
 /// The instruments' fire-checks, in the child (nothing else runs there): each counter moves by
 /// exactly what was done, and by nothing when nothing was.
 fn run_instruments(cell: &str) -> String {
@@ -1262,9 +1714,377 @@ fn run_instruments(cell: &str) -> String {
         let s0 = probe::begin();
         f();
         let s1 = probe::end();
-        sample_of(&s0, &s1, &Outside::zero(None), &Outside::zero(None))
+        sample_of(&s0, &s1, &Outside::none(), &Outside::none())
     };
     put("fc_nothing", &window(&mut || {}));
+    let mut loaded = Sample::new();
+    loaded.insert("loaded", u64::from(probe::per_thread_counter_loaded()));
+    put("fc_shim_loaded", &loaded);
+    // Class (b)'s attribution by thread, forced both ways. A helper thread that exists before the
+    // window waits on an atomic, then makes 10 syscalls; the window must refuse its count.
+    let helper = |declared: bool, closes: usize| {
+        use std::sync::atomic::{AtomicBool, Ordering::{Acquire, Release}};
+        let go = Arc::new(AtomicBool::new(false));
+        let done = Arc::new(AtomicBool::new(false));
+        let ready = Arc::new(AtomicBool::new(false));
+        let (g, d, r) = (go.clone(), done.clone(), ready.clone());
+        let h = std::thread::spawn(move || {
+            // Ready (declared, when it is) before the window opens; done, then lingering until the
+            // window has closed (`go` cleared), so its declaration covers the whole window.
+            let body = || {
+                r.store(true, Release);
+                while !g.load(Acquire) {
+                    std::hint::spin_loop();
+                }
+                for _ in 0..closes {
+                    // SAFETY: closing an invalid descriptor only fails (EBADF): one syscall each.
+                    unsafe { libc::close(-1) };
+                }
+                d.store(true, Release);
+                while g.load(Acquire) {
+                    std::hint::spin_loop();
+                }
+            };
+            if declared {
+                probe::spinning(body)
+            } else {
+                body()
+            }
+        });
+        while !ready.load(Acquire) {
+            std::hint::spin_loop();
+        }
+        (go, done, h)
+    };
+    let wait = |done: &std::sync::atomic::AtomicBool| {
+        while !done.load(std::sync::atomic::Ordering::Acquire) {
+            std::hint::spin_loop();
+        }
+    };
+    {
+        let (go, done, h) = helper(false, 10);
+        put(
+            "fc_foreign_window",
+            &window(&mut || {
+                go.store(true, std::sync::atomic::Ordering::Release);
+                wait(&done);
+            }),
+        );
+        go.store(false, std::sync::atomic::Ordering::Release);
+        h.join().unwrap();
+    }
+    {
+        // A declared spinner making no syscall does not make the window foreign.
+        let (go, done, h) = helper(true, 0);
+        put(
+            "fc_spinner_window",
+            &window(&mut || {
+                for _ in 0..7 {
+                    // SAFETY: as above.
+                    unsafe { libc::close(-1) };
+                }
+                go.store(true, std::sync::atomic::Ordering::Release);
+                wait(&done);
+            }),
+        );
+        go.store(false, std::sync::atomic::Ordering::Release);
+        h.join().unwrap();
+    }
+    put(
+        "fc_spawned_window",
+        &window(&mut || {
+            // A thread the window spawns is the window's own: its 5 syscalls are counted.
+            std::thread::spawn(|| {
+                for _ in 0..5 {
+                    // SAFETY: as above.
+                    unsafe { libc::close(-1) };
+                }
+            })
+            .join()
+            .unwrap();
+        }),
+    );
+    {
+        let (go, done, h) = helper(false, 10);
+        put(
+            "fc_foreign_hold",
+            &window(&mut || {
+                probe::arm(true);
+                probe::store_locked();
+                go.store(true, std::sync::atomic::Ordering::Release);
+                wait(&done);
+                probe::store_unlocked();
+                probe::arm(false);
+            }),
+        );
+        go.store(false, std::sync::atomic::Ordering::Release);
+        h.join().unwrap();
+    }
+    // Probe-adversary items 2-4 (artie reviews/ADV-claude-budget-probe-04385d32e.md), forced both
+    // ways. (a) A foreign thread that runs (an undeclared spin) and makes NO syscall while the
+    // window makes 7: the shim path may accept it, at exactly 7; without the shim it is refused.
+    {
+        let (go, done, h) = helper(false, 0);
+        put(
+            "fc_shim_quiet_foreign",
+            &window(&mut || {
+                for _ in 0..7 {
+                    // SAFETY: as above.
+                    unsafe { libc::close(-1) };
+                }
+                go.store(true, std::sync::atomic::Ordering::Release);
+                wait(&done);
+                // Let the helper's spin run inside the window for a while: 30 ms, past a scheduler
+                // quantum (at 2 ms the helper's CPU time read unmoved in 1 of 4 runs: a running
+                // thread's time is not always current in thread_info, the blind spot `attribute`
+                // states).
+                let t = std::time::Instant::now();
+                while t.elapsed() < std::time::Duration::from_millis(30) {
+                    std::hint::spin_loop();
+                }
+            }),
+        );
+        go.store(false, std::sync::atomic::Ordering::Release);
+        h.join().unwrap();
+    }
+    // (b) Row 6, the compensation: the window makes one call the shim cannot see (a raw syscall(2))
+    // and 5 it can, while a foreign thread makes 10. The shim's total can then equal the kernel's;
+    // a foreign thread with calls must refuse it in every mode.
+    {
+        let (go, done, h) = helper(false, 10);
+        put(
+            "fc_shim_compensation",
+            &window(&mut || {
+                // SAFETY: getppid (RAW_GETPPID) through syscall(2), which the shim does not
+                // interpose (gen.py's SKIP): one syscall the shim cannot see.
+                #[allow(deprecated)]
+                unsafe {
+                    libc::syscall(RAW_GETPPID)
+                };
+                for _ in 0..5 {
+                    // SAFETY: as above.
+                    unsafe { libc::close(-1) };
+                }
+                go.store(true, std::sync::atomic::Ordering::Release);
+                wait(&done);
+            }),
+        );
+        go.store(false, std::sync::atomic::Ordering::Release);
+        h.join().unwrap();
+    }
+    // (c) A thread present at the window's start that is gone at its end: refused in every mode.
+    {
+        let (go, done, h) = helper(false, 3);
+        let mut h = Some(h);
+        put(
+            "fc_gone_thread",
+            &window(&mut || {
+                go.store(true, std::sync::atomic::Ordering::Release);
+                wait(&done);
+                go.store(false, std::sync::atomic::Ordering::Release);
+                // Joined inside the window: present at the start, gone at the end.
+                if let Some(h) = h.take() {
+                    h.join().unwrap();
+                }
+            }),
+        );
+    }
+    // (d) More threads than the 48 the table has room for: refused in every mode. The threads the
+    // table has no room for make calls inside the window (probe-adversary-2 M2: with none, the
+    // mutant `probe_full_table_trusted` kept the window's own 3, the truth, and died only of the
+    // refusal rule; with them it keeps a wrong count).
+    {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::{Acquire, Release}};
+        let stop = Arc::new(AtomicBool::new(false));
+        let ids: Arc<std::sync::Mutex<Vec<u64>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let unlisted: Arc<std::sync::Mutex<std::collections::HashSet<u64>>> = Arc::default();
+        let roles = Arc::new(AtomicBool::new(false));
+        let go = Arc::new(AtomicBool::new(false));
+        let done = Arc::new(AtomicU64::new(0));
+        // Listed workers park (no CPU time in the window); the unlisted ones spin on `go` with no
+        // call, then make 10 each: invisible to a table read as complete.
+        let parked: Vec<_> = (0..50)
+            .map(|_| {
+                let (stop, ids, unlisted, roles, go, done) = (stop.clone(), ids.clone(), unlisted.clone(), roles.clone(), go.clone(), done.clone());
+                std::thread::spawn(move || {
+                    let me = this_thread_id();
+                    ids.lock().unwrap().push(me);
+                    while !roles.load(Acquire) {
+                        std::thread::park_timeout(std::time::Duration::from_millis(1));
+                    }
+                    if unlisted.lock().unwrap().contains(&me) {
+                        while !go.load(Acquire) {
+                            std::hint::spin_loop();
+                        }
+                        for _ in 0..10 {
+                            // SAFETY: as above.
+                            unsafe { libc::close(-1) };
+                        }
+                        done.fetch_add(1, Release);
+                    }
+                    while !stop.load(Acquire) {
+                        std::thread::park();
+                    }
+                })
+            })
+            .collect();
+        while ids.lock().unwrap().len() < 50 {
+            std::thread::yield_now();
+        }
+        // The workers the thread table lists past its 48 slots.
+        let mut table = [probe::ThreadCpu::EMPTY; 128];
+        let n = probe::thread_table(&mut table).unwrap_or(0);
+        let mine: std::collections::HashSet<u64> = ids.lock().unwrap().iter().copied().collect();
+        let past: std::collections::HashSet<u64> = table[48.min(n)..n.min(128)].iter().map(|t| t.id).filter(|id| mine.contains(id)).collect();
+        let n_past = past.len() as u64;
+        *unlisted.lock().unwrap() = past;
+        roles.store(true, Release);
+        // The listed workers back in `park()` before the window opens.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let mut r = window(&mut || {
+            for _ in 0..3 {
+                // SAFETY: as above.
+                unsafe { libc::close(-1) };
+            }
+            go.store(true, Release);
+            while done.load(Acquire) < n_past {
+                std::hint::spin_loop();
+            }
+        });
+        r.insert("unlisted_callers", n_past);
+        put("fc_too_many_threads", &r);
+        stop.store(true, Release);
+        for t in parked {
+            t.thread().unpark();
+            t.join().unwrap();
+        }
+    }
+    // (e) probe-adversary-2 M1: a thread the window spawns that is still running at its end makes
+    // more calls after it; the window is refused (it was Some(own + the thread's calls so far)).
+    {
+        use std::sync::atomic::{AtomicBool, Ordering::{Acquire, Release}};
+        let release = Arc::new(AtomicBool::new(false));
+        let r2 = release.clone();
+        let mut handle = None;
+        put(
+            "fc_spawned_outlives",
+            &window(&mut || {
+                let r2 = r2.clone();
+                handle = Some(std::thread::spawn(move || {
+                    for _ in 0..5 {
+                        // SAFETY: as above.
+                        unsafe { libc::close(-1) };
+                    }
+                    // Still RUNNING at the window's end (a spin, no call): a spawned thread blocked
+                    // at the end is the window's (`probe::attribute`).
+                    while !r2.load(Acquire) {
+                        std::hint::spin_loop();
+                    }
+                    for _ in 0..10 {
+                        // SAFETY: as above.
+                        unsafe { libc::close(-1) };
+                    }
+                }));
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }),
+        );
+        release.store(true, Release);
+        if let Some(h) = handle {
+            h.join().unwrap();
+        }
+    }
+    // Counters review 4 MED-1: a window refused as ThreadNew whose own thread does nothing (a helper
+    // that existed before it spawns a thread still running at its end), so its allocation counts are
+    // asserted and a ThreadNew diagnostic (FE_BUDGET_NEW_NAMES) inside the counts is seen.
+    {
+        use std::sync::atomic::{AtomicBool, Ordering::{Acquire, Release}};
+        let (go, spawned, release, ready) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+        let (g, sp, rl, r) = (go.clone(), spawned.clone(), release.clone(), ready.clone());
+        let helper = std::thread::spawn(move || {
+            r.store(true, Release);
+            while !g.load(Acquire) {
+                std::hint::spin_loop();
+            }
+            let rl2 = rl.clone();
+            // Counters review 5: the window closes only once `late` is running, not merely spawned (a
+            // thread not yet scheduled may read as waiting, and the window would be refused as foreign).
+            let running = Arc::new(AtomicBool::new(false));
+            let run2 = running.clone();
+            let late = std::thread::spawn(move || {
+                run2.store(true, Release);
+                // Still RUNNING at the window's end: a spin, no call.
+                while !rl2.load(Acquire) {
+                    std::hint::spin_loop();
+                }
+            });
+            while !running.load(Acquire) {
+                std::hint::spin_loop();
+            }
+            sp.store(true, Release);
+            late.join().unwrap();
+        });
+        while !ready.load(Acquire) {
+            std::hint::spin_loop();
+        }
+        put(
+            "fc_thread_new_quiet",
+            &window(&mut || {
+                go.store(true, Release);
+                while !spawned.load(Acquire) {
+                    std::hint::spin_loop();
+                }
+            }),
+        );
+        release.store(true, Release);
+        helper.join().unwrap();
+    }
+    // (f) probe-adversary-2 M3: a foreign thread makes ONE call the shim cannot see (syscall(2)) and
+    // none it can, while the window makes 5 it can: every foreign shim delta is 0 and only the sum
+    // check refuses (5 against the kernel's 6). Mutant `probe_sum_unchecked`.
+    {
+        use std::sync::atomic::{AtomicBool, Ordering::{Acquire, Release}};
+        let go = Arc::new(AtomicBool::new(false));
+        let done = Arc::new(AtomicBool::new(false));
+        let ready = Arc::new(AtomicBool::new(false));
+        let (g, d, rd) = (go.clone(), done.clone(), ready.clone());
+        let h = std::thread::spawn(move || {
+            rd.store(true, Release);
+            while !g.load(Acquire) {
+                std::hint::spin_loop();
+            }
+            // SAFETY: getppid (RAW_GETPPID) through syscall(2): one call the shim cannot see.
+            #[allow(deprecated)]
+            unsafe {
+                libc::syscall(RAW_GETPPID)
+            };
+            d.store(true, Release);
+            while g.load(Acquire) {
+                std::hint::spin_loop();
+            }
+        });
+        while !ready.load(Acquire) {
+            std::hint::spin_loop();
+        }
+        put(
+            "fc_shim_unseen_foreign",
+            &window(&mut || {
+                for _ in 0..5 {
+                    // SAFETY: as above.
+                    unsafe { libc::close(-1) };
+                }
+                go.store(true, Release);
+                while !done.load(Acquire) {
+                    std::hint::spin_loop();
+                }
+                let t = std::time::Instant::now();
+                while t.elapsed() < std::time::Duration::from_millis(30) {
+                    std::hint::spin_loop();
+                }
+            }),
+        );
+        go.store(false, Release);
+        h.join().unwrap();
+    }
     put(
         "fc_close_37",
         &window(&mut || {
@@ -1597,6 +2417,89 @@ fn run_instruments(cell: &str) -> String {
             ("settled_after", u64::from(after)),
         ]),
     );
+    // Review C14 (MED): the held case, with the writer delayed between a notification and its
+    // wait's return. After the arm above the writer is parked with no word pending; it is suspended
+    // (Mach `thread_suspend`, outside any window), and a held create's landing notifies it. It
+    // cannot wake, so its parked flag still reads true from the wait it entered before the create:
+    // `writer_settled` must refuse that stale park. Resumed, it takes the word, enters the held
+    // quiet period's wait, and is settled. The create runs on a thread of its own, bounded, so a
+    // writer suspended while holding the group's lock (a spurious wake just before the suspend)
+    // cannot hang the cell: the record says whether the create had landed before the check.
+    #[cfg(target_vendor = "apple")]
+    {
+        let parked_before = writer_settled(&db, std::time::Duration::from_secs(5));
+        let suspended = probe::suspend_thread_named("branch-confirm");
+        let found = suspended.is_some();
+        let creating = {
+            let trunk = trunk.clone();
+            std::thread::spawn(move || trunk.create_branch("fc-stale-park").map(|_| ()).map_err(|e| e.to_string()))
+        };
+        let t = std::time::Instant::now();
+        while !creating.is_finished() && t.elapsed() < std::time::Duration::from_secs(5) {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let landed = creating.is_finished();
+        let stale = writer_settled(&db, std::time::Duration::from_millis(50));
+        drop(suspended);
+        creating.join().unwrap().unwrap_or_else(|e| panic!("fc_writer_stale_park: the create failed: {e}"));
+        let resumed = writer_settled(&db, std::time::Duration::from_secs(5));
+        put(
+            "fc_writer_stale_park",
+            &Sample::from([
+                ("parked_before", u64::from(parked_before)),
+                ("found", u64::from(found)),
+                ("landed_before_check", u64::from(landed)),
+                ("settled_stale", u64::from(stale)),
+                ("settled_resumed", u64::from(resumed)),
+            ]),
+        );
+    }
+    // Review C14: the settle check's own cost, uncontended: a thousand checks of a parked writer move
+    // no counter that a window charges (a try-lock the writer contends for meanwhile may: the
+    // accessor's named blind spot).
+    put(
+        "fc_writer_settled_cost",
+        &window(&mut || {
+            for _ in 0..1000 {
+                std::hint::black_box(writer_settled(&db, std::time::Duration::ZERO));
+            }
+        }),
+    );
+    // Counters review 4 MED-1: one harness window with nothing in it (`measure`, an empty `f`): the
+    // harness's own in-window work (the thread count, the declared spin, the confirmation absorb, the
+    // settle waits, the confirm counts) is inside the counts, so it must move none of them.
+    put("fc_measure_empty", &measure(&db, base, || {}).1);
+    // budgets-port-adversary HIGH-2 (its ADV4): a harness window an undeclared thread ran a 5 ms burst in,
+    // the thread blocked at both ends (so the thread count and the settle checks pass): it must not be
+    // quiet. The base is taken with that thread already parked.
+    {
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let h = std::thread::Builder::new()
+            .name("fc-foreign-burst".into())
+            .spawn(move || {
+                while go_rx.recv().is_ok() {
+                    let t = std::time::Instant::now();
+                    while t.elapsed() < std::time::Duration::from_millis(5) {
+                        std::hint::spin_loop();
+                    }
+                    let _ = done_tx.send(());
+                }
+            })
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let b = probe::threads();
+        put(
+            "fc_measure_foreign",
+            &measure(&db, b, || {
+                go_tx.send(()).unwrap();
+                let _ = done_rx.recv();
+            })
+            .1,
+        );
+        drop(go_tx);
+        h.join().unwrap();
+    }
     out
 }
 
@@ -1628,7 +2531,7 @@ fn budget_child() {
     } else {
         // `n10_*` / `n1e4_*` cells: `_small` or `_large`, then `_unnamed` (recovery only) and `_d0`.
         let (n, large, named) = match spec.as_str() {
-            "ckpt_n10" | "confirm_n10" | "confirm_load" | "shared_c1" | "shared_c8" | "shared_c64" | "shared_c256" | "shared_c1024" => {
+            "ckpt_n10" | "exc_sharp" | "confirm_n10" | "confirm_load" | "shared_c1" | "shared_c8" | "shared_c64" | "shared_c256" | "shared_c1024" => {
                 (10, false, true)
             }
             "growth_n1e4" | "ckpt_n1e4" | "mem_n1e4" => (N_LARGE, false, true),
@@ -1647,7 +2550,9 @@ fn budget_child() {
         let mut built = build(&spec, n, large, named);
         // Review 2 L7: the shared-flight cells read no held-syscall count, so they run unarmed (two
         // Mach traps per hold inside the measured mutex otherwise).
-        probe::arm(!spec.starts_with("shared_"));
+        // `FE_BUDGET_UNARMED` (diagnostic): any cell unarmed, to tell the probe's own per-hold reads
+        // from the code's cost.
+        probe::arm(!spec.starts_with("shared_") && std::env::var_os("FE_BUDGET_UNARMED").is_none());
         let opens = if spec.starts_with("n") { 5 } else { 1 };
         if spec.starts_with("mem_") {
             memory(&spec, &mut built, &mut text);
@@ -1664,7 +2569,7 @@ fn budget_child() {
             shared(&spec, &db, c.parse().unwrap(), &mut text);
         } else if spec.starts_with("growth") {
             growth(&spec, &db, &mut text);
-        } else if spec.starts_with("ckpt") {
+        } else if spec.starts_with("ckpt") || spec == "exc_sharp" {
             checkpoints(&spec, &db, base, &mut text);
         } else if named {
             rounds(&spec, &db, base, k, &mut text);
@@ -1749,12 +2654,261 @@ fn cell(spec: &str) -> Arc<CellData> {
         std::sync::OnceLock::new();
     let cells = CELLS.get_or_init(Default::default);
     // Held while the child runs: two tests needing one cell run it once.
-    let mut cells = cells.lock().unwrap_or_else(|e| e.into_inner());
-    cells.entry(spec.to_string()).or_insert_with(|| Arc::new(run_child(spec))).clone()
+    let data = {
+        let mut cells = cells.lock().unwrap_or_else(|e| e.into_inner());
+        cells.entry(spec.to_string()).or_insert_with(|| Arc::new(run_child(spec))).clone()
+    };
+    // DECISIONS bd0d845f97: a credited cell has all four counted exceptions at 0 inside every
+    // window; one that moved one, or a window that did not record them, is refused before any budget
+    // reads the cell. The instruments' cell reads no database (its fire-checks are of the probes).
+    if spec != "instruments" {
+        let bad = uncredited(&data);
+        assert!(
+            bad.is_empty(),
+            "budget cell {spec}: not credited (DECISIONS bd0d845f97: a credited cell needs {EXC_KEYS:?} at 0 inside every window):\n{bad}"
+        );
+    }
+    data
+}
+
+/// The windows of `c` that moved a counted exception (`{key} moved by {n}`) or did not record one
+/// (`no {key} recorded`: a counter not read is not a zero), one line each.
+fn uncredited(c: &CellData) -> String {
+    let mut bad = String::new();
+    for (op, samples) in &c.ops {
+        for (i, s) in samples.iter().enumerate() {
+            for key in EXC_KEYS {
+                match s.get(key) {
+                    None => {
+                        let _ = writeln!(bad, "  {op} #{i}: no {key} recorded");
+                    }
+                    Some(&0) => {}
+                    Some(n) => {
+                        let _ = writeln!(bad, "  {op} #{i}: {key} moved by {n}");
+                    }
+                }
+            }
+        }
+    }
+    bad
 }
 
 /// Whether this process is a budget child (whose parent tests must not run: they would spawn
 /// children of their own).
+/// budgets-port-adversary HIGH-1 (its ADV1): with one descriptor left, every per-task open in
+/// /proc/self/task fails with EMFILE, and a reader that takes any open failure for "the task is gone"
+/// skips every task and reports a complete, empty table (`Some(0)`; others_blocked `Some(true)` while a
+/// thread spins): a guard that cannot read its input falls through to allow. CLAIM: such a table is
+/// refused (None), and so is others_blocked. Positive control: with two descriptors left the table is
+/// read and lists the caller. In a child of its own (it lowers RLIMIT_NOFILE and fills the table).
+#[cfg(target_os = "linux")]
+#[test]
+fn a_thread_table_read_without_descriptors_is_refused() {
+    use std::sync::atomic::{AtomicBool, Ordering::{Acquire, Release}};
+    if std::env::var_os("FE_FD_TABLE_CHILD").is_none() {
+        if in_child() || std::env::var_os("FE_FLAGS_CHILD").is_some() || std::env::var_os("FE_ARM_CHILD").is_some() || std::env::var_os("FE_THREAD_STATE_CHILD").is_some() {
+            return;
+        }
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["branch::budget_tests::a_thread_table_read_without_descriptors_is_refused", "--exact", "--test-threads=1", "--nocapture"])
+            .env("FE_FD_TABLE_CHILD", "1")
+            .env_remove("FE_BUDGET_CHILD")
+            .output()
+            .unwrap();
+        let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        let at = |free: u64| {
+            // budgets-rev-39bb7fd43 HIGH-1 (FLAGGED harness repair): the tag anywhere in a line, the reading from
+            // it on. libtest prints "test <name> ... " with no newline, so the child's first reading shares that
+            // line; matching at line start never found it, and every sha failed this premise.
+            let tag = format!("FD-TABLE free={free} ");
+            text.lines()
+                .find_map(|l| l.find(&tag).map(|i| l[i..].to_string()))
+                .unwrap_or_else(|| panic!("premise: no reading with {free} free descriptors:\n{text}"))
+        };
+        let (one, two) = (at(1), at(2));
+        assert!(two.contains(" table=listed "), "premise: with 2 free descriptors the table is read and lists the caller ({two})");
+        assert!(one.contains(" table=refused ") && one.contains(" blocked=refused"), "CLAIM: with 1 free descriptor the thread table read as complete: {one}");
+        // budgets-port-adversary LOW-2: a window whose thread table could not be read at either end records
+        // that refusal (Table), not NoKernelCount.
+        let want = format!(" window_refusal={} ", probe::Refusal::Table as u64);
+        assert!(one.contains(&want), "CLAIM: a window with its thread table unreadable at both ends did not record Table ({}): {one}", probe::Refusal::Table as u64);
+        // budgets-rev-39bb7fd43 MED-1 (FLAGGED: replaces 299d9fb23/5055c67b7's churn arm, which was bimodal on
+        // iccad9, 5000 or 0 of 5000 reads refused in 5 of 6 runs, so neither its claim nor its premise could be
+        // relied on): one live task's /proc opens fail as with EMFILE (`probe::PROBE_EMFILE_TID`), the caller
+        // still listed, so only the errno check can refuse. CLAIM: the table and others_blocked refuse.
+        let inj = text.lines().find_map(|l| l.find("FD-INJECT ").map(|i| l[i..].to_string())).unwrap_or_else(|| panic!("premise: no injected reading:\n{text}"));
+        assert!(inj.contains(" tid_known=1 "), "premise: the injected thread's id was not read: {inj}");
+        assert!(inj.contains(" table=refused ") && inj.contains(" blocked=refused "), "CLAIM: a table with a live task unreadable for want of a descriptor was not refused: {inj}");
+        return;
+    }
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    let parked = std::thread::Builder::new().name("fd-adv-parked".into()).spawn(move || {
+        let _ = rx.recv();
+    });
+    let stop = Arc::new(AtomicBool::new(false));
+    let spinner_tid = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let spinner = {
+        let (stop, spinner_tid) = (stop.clone(), spinner_tid.clone());
+        std::thread::spawn(move || {
+            // SAFETY: the raw syscall (glibc before 2.30 has no gettid wrapper); it cannot fail.
+            spinner_tid.store(unsafe { libc::syscall(libc::SYS_gettid) } as u64, Release);
+            while !stop.load(Acquire) {
+                std::hint::spin_loop();
+            }
+        })
+    };
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let mut old = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    // SAFETY: a valid out-pointer.
+    assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut old) }, 0);
+    let low = libc::rlimit { rlim_cur: old.rlim_max.min(256), rlim_max: old.rlim_max };
+    // SAFETY: a soft limit at or under the hard one.
+    assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &low) }, 0);
+    for free in [1usize, 2] {
+        let mut fds = Vec::with_capacity(256);
+        loop {
+            // SAFETY: a NUL-terminated path.
+            let fd = unsafe { libc::open(b"/dev/null\0".as_ptr().cast(), libc::O_RDONLY | libc::O_CLOEXEC) };
+            if fd < 0 {
+                break;
+            }
+            fds.push(fd);
+        }
+        for _ in 0..free {
+            if let Some(fd) = fds.pop() {
+                // SAFETY: a descriptor opened above.
+                unsafe { libc::close(fd) };
+            }
+        }
+        let mut t = [probe::ThreadCpu::EMPTY; 48];
+        let n = probe::thread_table(&mut t);
+        let blocked = probe::others_blocked();
+        // budgets-port-adversary LOW-2: a window whose table is unreadable at both ends.
+        let _w0 = probe::begin();
+        let w1 = probe::end_owning(&[]);
+        for fd in fds {
+            // SAFETY: descriptors opened above.
+            unsafe { libc::close(fd) };
+        }
+        let table = match n {
+            None => "refused",
+            Some(n) if n >= 3 && t.iter().any(|x| x.me) => "listed",
+            Some(_) => "incomplete",
+        };
+        let blocked = match blocked {
+            None => "refused",
+            Some(true) => "all",
+            Some(false) => "some",
+        };
+        println!("FD-TABLE free={free} table={table} n={n:?} blocked={blocked} window_refusal={} ", w1.refusal as u64);
+    }
+    // budgets-rev-39bb7fd43 MED-1: the spinner's /proc opens fail as with EMFILE (injected), the caller listed.
+    {
+        let tid = spinner_tid.load(Acquire);
+        probe::PROBE_EMFILE_TID.store(tid, Release);
+        let mut t = [probe::ThreadCpu::EMPTY; 48];
+        let n = probe::thread_table(&mut t);
+        let blocked = probe::others_blocked();
+        probe::PROBE_EMFILE_TID.store(0, Release);
+        let table = match n {
+            None => "refused",
+            Some(n) if n >= 3 && t.iter().any(|x| x.me) && t[..n.min(48)].iter().any(|x| x.id == tid) => "listed",
+            Some(_) => "incomplete",
+        };
+        let blocked = match blocked {
+            None => "refused",
+            Some(true) => "all",
+            Some(false) => "some",
+        };
+        println!("FD-INJECT tid_known={} table={table} n={n:?} blocked={blocked} ", u64::from(tid != 0));
+    }
+    // SAFETY: the limit read above.
+    unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &old) };
+    stop.store(true, Release);
+    spinner.join().unwrap();
+    tx.send(()).unwrap();
+    parked.unwrap().join().unwrap();
+}
+
+/// budgets-port-adversary MED-1 (its ADV2): on Linux a thread name is the kernel's comm, cut at 15 bytes,
+/// and an unnamed thread inherits its creator's, so owning `branch-checkpoint` by name also owned a thread
+/// named `branch-checkpoint-foreign` and any unnamed child of a `branch-checkpoint` thread. CLAIM: a window
+/// owns a store thread by the thread's own registration (`probe::register_owned_thread`, by id), so both of
+/// those run as FOREIGN; controls: an unrelated name is foreign, a registered `branch-checkpoint` thread is
+/// owned. In a child of its own (its windows need no other test's threads).
+#[cfg(target_os = "linux")]
+#[test]
+fn a_window_owns_a_store_thread_by_its_registration_not_its_name() {
+    use std::sync::mpsc::channel;
+    if std::env::var_os("FE_OWNED_TID_CHILD").is_none() {
+        if in_child() || std::env::var_os("FE_FLAGS_CHILD").is_some() || std::env::var_os("FE_ARM_CHILD").is_some() || std::env::var_os("FE_THREAD_STATE_CHILD").is_some() || std::env::var_os("FE_FD_TABLE_CHILD").is_some() {
+            return;
+        }
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["branch::budget_tests::a_window_owns_a_store_thread_by_its_registration_not_its_name", "--exact", "--test-threads=1", "--nocapture"])
+            .env("FE_OWNED_TID_CHILD", "1")
+            .env_remove("FE_BUDGET_CHILD")
+            .output()
+            .unwrap();
+        let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        let foreign = |case: &str| -> u64 {
+            // budgets-rev-39bb7fd43 HIGH-1 (FLAGGED harness repair): the tag anywhere in a line (the first reading
+            // shares libtest's "test <name> ... " line).
+            let tag = format!("OWNED case={case} foreign=");
+            let l = text.lines().find_map(|l| l.find(&tag).map(|i| &l[i..])).unwrap_or_else(|| panic!("premise: no reading of case {case}:\n{text}"));
+            l[tag.len()..].split_whitespace().next().unwrap().parse().unwrap()
+        };
+        assert!(foreign("unrelated") >= 1, "premise: an unrelated thread's burst was not foreign");
+        assert_eq!(foreign("registered"), 0, "premise: a registered branch-checkpoint thread's burst was foreign");
+        assert!(foreign("prefix") >= 1, "CLAIM: a thread named branch-checkpoint-foreign was owned by a window owning branch-checkpoint");
+        assert!(foreign("inherited") >= 1, "CLAIM: an unnamed child of a branch-checkpoint thread was owned by a window owning branch-checkpoint");
+        return;
+    }
+    // One burst in a window owning branch-checkpoint: the thread is spawned and parked first (so the window
+    // sees no new thread), then let go for 5 ms of spinning, then parked again before the window ends.
+    let run = |case: &str, name: Option<&'static str>, register: bool, via_parent: bool| {
+        let (go_tx, go_rx) = channel::<()>();
+        let (done_tx, done_rx) = channel::<()>();
+        let body = move || {
+            let _owned = register.then(|| probe::register_owned_thread("branch-checkpoint"));
+            while go_rx.recv().is_ok() {
+                let t = std::time::Instant::now();
+                while t.elapsed() < std::time::Duration::from_millis(5) {
+                    std::hint::spin_loop();
+                }
+                let _ = done_tx.send(());
+            }
+        };
+        let spawn = move || {
+            let b = std::thread::Builder::new();
+            let b = match name {
+                Some(n) => b.name(n.into()),
+                None => b,
+            };
+            b.spawn(body).unwrap()
+        };
+        let h = if via_parent {
+            // The parent is named branch-checkpoint and spawns the burst thread unnamed; it waits in join.
+            std::thread::Builder::new().name("branch-checkpoint".into()).spawn(move || spawn().join().unwrap()).unwrap()
+        } else {
+            spawn()
+        };
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        let _s0 = probe::begin();
+        go_tx.send(()).unwrap();
+        let _ = done_rx.recv();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let s1 = probe::end_owning(&["branch-checkpoint"]);
+        println!("OWNED case={case} foreign={} quiet={}", s1.foreign, u64::from(s1.threads_quiet));
+        drop(go_tx);
+        h.join().unwrap();
+    };
+    run("unrelated", Some("unrelated-name"), false, false);
+    run("registered", Some("branch-checkpoint"), true, false);
+    run("prefix", Some("branch-checkpoint-foreign"), false, false);
+    run("inherited", None, false, true);
+}
+
 fn in_child() -> bool {
     std::env::var_os("FE_BUDGET_CHILD").is_some()
 }
@@ -1996,6 +3150,110 @@ const FLIGHT_END: u64 = 8 + 1 + 4 + 4;
 
 // ---- the instruments ----
 
+/// Class (b) (DECISIONS 994f7d41e0): the syscall counts are attributed by thread. A window in which
+/// a thread that existed at its start made syscalls has NO syscall count and names the foreign
+/// thread; a declared spinner making none, and a thread the window spawned, do not make it foreign
+/// (the window keeps exactly its own 7, and the spawn's 5); a hold during which another thread
+/// ran is unattributable, never counted as held. Forced both ways, in the instruments' child.
+/// budgets-rev-39bb7fd43 LOW-2 (FLAGGED, restoring Linux coverage that a804c91c5 dropped): the THREAD-RULE half
+/// runs wherever the thread table is read (Apple and Linux); the syscall-COUNT half is Apple only (Linux has no
+/// kernel count, so every count is None there; the syscall budgets are Mac-owed). On Linux the hold claims are
+/// vacuous (with no count every hold is unattributed) and are not asserted. fc_spawned_outlives may read
+/// ThreadGone instead of ThreadNew on Linux (budgets-port-adversary saw 2 once, a race between the two);
+/// either is a refusal, so it is asserted refused for one of them there.
+#[cfg(any(target_vendor = "apple", target_os = "linux"))]
+#[test]
+fn the_budget_syscall_counts_are_attributed_by_thread() {
+    if in_child() {
+        return;
+    }
+    let c = cell("instruments");
+    let row = |op: &str| c.ops.get(op).and_then(|s| s.first()).unwrap_or_else(|| panic!("{op}: no sample")).clone();
+    let reason = |op: &str| row(op)["refusal"];
+    // The thread rule, both platforms.
+    let foreign = row("fc_foreign_window");
+    assert!(foreign["foreign_threads"] >= 1, "premise: the helper thread did not run inside the window: {foreign:?}");
+    assert!(row("fc_too_many_threads")["unlisted_callers"] >= 1, "premise: no thread past the table's 48 slots made a call");
+    assert_eq!(reason("fc_too_many_threads"), probe::Refusal::Table as u64, "CLAIM: fc_too_many_threads refused for another reason");
+    assert_eq!(reason("fc_gone_thread"), probe::Refusal::ThreadGone as u64, "CLAIM: fc_gone_thread refused for another reason");
+    let spinner = row("fc_spinner_window");
+    assert_eq!(spinner["foreign_threads"], 0, "CLAIM: a declared spinner made the window foreign: {spinner:?}");
+    let spawned = row("fc_spawned_window");
+    assert_eq!(spawned["foreign_threads"], 0, "CLAIM: a thread the window spawned was counted foreign: {spawned:?}");
+    let nothing = row("fc_nothing");
+    assert_eq!(nothing["foreign_threads"], 0, "CLAIM: an empty window had a foreign thread: {nothing:?}");
+    #[cfg(target_os = "linux")]
+    {
+        let r = reason("fc_spawned_outlives");
+        assert!(
+            r == probe::Refusal::ThreadNew as u64 || r == probe::Refusal::ThreadGone as u64,
+            "CLAIM: fc_spawned_outlives was not refused as ThreadNew or ThreadGone ({r})"
+        );
+    }
+    // The syscall counts and the shim, Apple only.
+    #[cfg(target_vendor = "apple")]
+    {
+        // Two modes: the per-thread counter (`feshim`) loaded, which attributes a window another thread
+        // ran in exactly (here the window's own 0, the helper's 10 excluded), or not, which refuses it.
+        let shim = row("fc_shim_loaded")["loaded"] == 1;
+        // FLAGGED, lead-ordered (probe-adversary item 3, DECISIONS newest): a foreign thread with
+        // syscalls REFUSES the window in both modes. The shim used to exclude its calls (Some(0)).
+        assert!(foreign.get("syscalls").is_none(), "CLAIM: a window another thread made syscalls in kept a syscall count (counter loaded: {shim}): {foreign:?}");
+        assert_eq!(foreign["shim_loaded"], u64::from(shim), "CLAIM: the sample does not record the probe's mode: {foreign:?}");
+        let quiet = row("fc_shim_quiet_foreign");
+        assert!(quiet["foreign_threads"] >= 1, "premise: the spinning helper did not run inside the window: {quiet:?}");
+        if shim {
+            assert_eq!(quiet.get("syscalls").copied(), Some(7), "CLAIM: the shim path did not accept a window whose only foreign thread made no syscall, at its own 7: {quiet:?}");
+        } else {
+            assert!(quiet.get("syscalls").is_none(), "CLAIM: a window another thread ran in kept a count with no shim: {quiet:?}");
+        }
+        for op in ["fc_shim_compensation", "fc_gone_thread", "fc_too_many_threads", "fc_spawned_outlives", "fc_shim_unseen_foreign"] {
+            let r = row(op);
+            assert!(r.get("syscalls").is_none(), "CLAIM: {op} kept a syscall count (counter loaded: {shim}): {r:?}");
+        }
+        // Each refused for its own reason (probe-adversary-2 L4: `probe::Refusal`).
+        assert_eq!(reason("fc_spawned_outlives"), probe::Refusal::ThreadNew as u64, "CLAIM: fc_spawned_outlives refused for another reason");
+        if shim {
+            assert_eq!(reason("fc_shim_unseen_foreign"), probe::Refusal::SumMismatch as u64, "CLAIM: fc_shim_unseen_foreign refused for another reason");
+        }
+        assert_eq!(spinner.get("syscalls").copied(), Some(7), "CLAIM: a declared spinner made the window foreign, or the count moved: {spinner:?}");
+        assert!(spawned.get("syscalls").is_some_and(|n| *n >= 5), "CLAIM: the spawned thread's 5 syscalls were not counted: {spawned:?}");
+        let hold = row("fc_foreign_hold");
+        // FLAGGED, lead-ordered (probe-adversary item 3): the helper makes syscalls inside the hold, so the
+        // hold is unattributable in both modes (the shim used to attribute it, 0 held).
+        assert_eq!(hold["held_unattributed"], 1, "CLAIM: a hold another thread made syscalls in was attributed (counter loaded: {shim}): {hold:?}");
+        assert_eq!(hold["held_syscalls"], 0, "CLAIM: another thread's syscalls were counted as held: {hold:?}");
+        assert_eq!(nothing["held_unattributed"], 0, "CLAIM: an empty window was not attributed: {nothing:?}");
+    }
+}
+
+/// Probe-adversary item 1: a run labelled a shim run (`FE_SHIM_RUN`, set by feshim-run) whose shim is
+/// not loaded is refused, not measured as one. A child of this binary, with the label and with the
+/// shim stripped, must panic in `probe::prime` naming the refusal; a child with neither must not.
+#[test]
+fn a_run_labelled_shim_without_the_shim_is_refused() {
+    if std::env::var_os("FE_PRIME_CHILD").is_some() {
+        probe::prime();
+        return;
+    }
+    let run = |label: bool| {
+        let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+        cmd.args(["branch::budget_tests::a_run_labelled_shim_without_the_shim_is_refused", "--exact", "--nocapture", "--test-threads=1"])
+            .env("FE_PRIME_CHILD", "1")
+            .env_remove("DYLD_INSERT_LIBRARIES")
+            .env_remove("FE_SHIM_RUN");
+        if label {
+            cmd.env("FE_SHIM_RUN", "1");
+        }
+        let out = cmd.output().unwrap();
+        (out.status.success(), String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr))
+    };
+    let (ok, text) = run(true);
+    assert!(!ok && text.contains("REFUSED: this run is labelled a shim run"), "CLAIM: a labelled run without the shim was not refused: {text}");
+    let (ok, text) = run(false);
+    assert!(ok, "premise: an unlabelled run without the shim primes: {text}");
+}
+
 /// Every counter the budgets read moves by exactly what was done, and not at all when nothing was
 /// (forced both ways, in a child that runs nothing else).
 #[test]
@@ -2010,6 +3268,35 @@ fn the_budget_counters_count_exactly_what_was_done() {
     for k in ["allocs", "locks", "held_syscalls", "held_allocs", "fsync", "full_fsync", "barrier"] {
         assert_eq!(get("fc_nothing", k), 0, "an empty window moved {k}");
     }
+    // Counters review 4 MED-1: windows whose counts are asserted and that reach the configured code: a
+    // ThreadNew refusal and a foreign one (each diagnostic's trigger, under the flags of
+    // `the_instruments_count_exactly_under_every_flag`) and a harness window with nothing in it. Each
+    // window's own thread allocates nothing; any allocation counted is the instrument's or the
+    // harness's.
+    assert_eq!(get("fc_thread_new_quiet", "refusal"), probe::Refusal::ThreadNew as u64, "premise: fc_thread_new_quiet was not refused as ThreadNew");
+    assert!(get("fc_foreign_window", "foreign_threads") >= 1, "premise: fc_foreign_window had no foreign thread");
+    // The Linux port (2026-10-18): an empty harness window is quiet wherever the thread states can be
+    // read. Off Apple no kernel syscall count exists, so quiet cannot rest on an attributed count there.
+    #[cfg(any(target_vendor = "apple", target_os = "linux"))]
+    assert_eq!(get("fc_measure_empty", "quiet"), 1, "CLAIM: an empty harness window is not quiet, so no cell of this platform can pass");
+    // budgets-port-adversary HIGH-2: the off-Apple refusal fires. Where no kernel count exists (Linux),
+    // each refused or foreign window reads NOT threads-quiet, and a harness window an undeclared thread ran
+    // a burst in is NOT quiet (mutant probe_threads_quiet_always: every window threads-quiet off Apple). On
+    // Apple quiet rests on the attributed count, and the shim may attribute a syscall-free foreign burst
+    // exactly (fc_shim_quiet_foreign), so these claims are Linux's.
+    #[cfg(target_os = "linux")]
+    {
+        for op in ["fc_foreign_window", "fc_thread_new_quiet", "fc_gone_thread", "fc_too_many_threads", "fc_measure_foreign"] {
+            assert_eq!(get(op, "threads_quiet"), 0, "CLAIM: {op}, a window the thread rule refuses, reads threads-quiet");
+        }
+        assert!(get("fc_measure_foreign", "foreign_threads") >= 1, "premise: fc_measure_foreign's burst thread was not seen running in the window");
+        assert_eq!(get("fc_measure_foreign", "quiet"), 0, "CLAIM: a window a foreign thread ran a 5 ms burst in is quiet");
+    }
+    for op in ["fc_thread_new_quiet", "fc_foreign_window", "fc_measure_empty"] {
+        for k in ["allocs", "alloc_bytes", "held_allocs"] {
+            assert_eq!(get(op, k), 0, "{op}: a window whose own work allocates nothing moved {k}: the instrument or the harness allocated inside it");
+        }
+    }
     assert_eq!(get("fc_box_23", "allocs"), 23, "23 boxes");
     assert_eq!(get("fc_box_23", "frees"), 23, "23 boxes dropped");
     assert_eq!(get("fc_box_23", "free_bytes"), 23 * 8, "23 boxes of a u64 dropped");
@@ -2018,6 +3305,10 @@ fn the_budget_counters_count_exactly_what_was_done() {
     assert_eq!(get("fc_box_23", "held_allocs"), 0, "allocations outside a store mutex counted as held");
     assert_eq!(get("fc_held_5_syscalls_3_allocs", "locks"), 1, "one hold");
     assert_eq!(get("fc_held_5_syscalls_3_allocs", "held_allocs"), 3, "three allocations while held");
+    // Counters review 5: `arm(true)` primes inside these windows, so what they allocate outside the
+    // hold is the probe's own: primed, nothing.
+    assert_eq!(get("fc_held_5_syscalls_3_allocs", "allocs"), 3, "allocations outside the hold (arm's prime, inside the window)");
+    assert_eq!(get("fc_foreign_hold", "allocs"), 0, "fc_foreign_hold's own thread allocated (arm's prime, inside the window)");
     assert_eq!(get("fc_one_store_lock", "locks"), 1, "catalog_counters takes the store mutex once");
     assert!(get("fc_catalog_shape", "locks") >= 1, "the catalog walk took no store mutex");
     assert!(get("fc_lookup_cataloged", "catalog_queries") >= 1, "a cataloged name's lookup asked nothing");
@@ -2078,8 +3369,21 @@ fn the_budget_counters_count_exactly_what_was_done() {
     assert!(get("fc_writer_park", "live") >= 1, "premise: the instruments store runs a confirmation writer");
     assert_eq!(get("fc_writer_park", "settled_mid_write"), 0, "a confirmation writer held mid-write read as parked (review 2 L3)");
     assert_eq!(get("fc_writer_park", "settled_after"), 1, "a released confirmation writer never parked with nothing pending (review 2 L3)");
-    assert_eq!(get("fc_thread_count", "after"), get("fc_thread_count", "base"), "an exited thread counted");
     #[cfg(target_vendor = "apple")]
+    {
+        assert_eq!(get("fc_writer_stale_park", "parked_before"), 1, "premise: the writer parked before it was suspended");
+        assert_eq!(get("fc_writer_stale_park", "found"), 1, "premise: exactly one branch-confirm thread, suspended");
+        assert_eq!(get("fc_writer_stale_park", "landed_before_check"), 1, "premise: the held create landed while the writer was suspended");
+        assert_eq!(get("fc_writer_stale_park", "settled_stale"), 0, "a held window accepted the writer's stale park: notified, not yet woken (review C14 MED)");
+        assert_eq!(get("fc_writer_stale_park", "settled_resumed"), 1, "a resumed writer never parked again (review C14)");
+        assert_eq!(get("fc_writer_settled_cost", "syscalls"), 0, "1,000 settle checks of a parked writer made a syscall (review C14)");
+    }
+    for k in ["allocs", "locks", "fsync", "full_fsync", "barrier"] {
+        assert_eq!(get("fc_writer_settled_cost", k), 0, "1,000 settle checks of a parked writer moved {k} (review C14)");
+    }
+    assert_eq!(get("fc_thread_count", "after"), get("fc_thread_count", "base"), "an exited thread counted");
+    // FLAGGED (the Linux port, 2026-10-18): the thread-state checks run wherever the readers exist.
+    #[cfg(any(target_vendor = "apple", target_os = "linux"))]
     {
         assert_eq!(get("fc_thread_count", "with_persistent"), get("fc_thread_count", "base"), "a persistent store thread counted");
         assert_eq!(get("fc_thread_count", "parked_blocked"), 1, "a parked thread not read as blocked");
@@ -2150,6 +3454,471 @@ fn create_logs_its_record_and_one_flight_end() {
             "journal.rs format 11: its own ForkNamed and one 17 B flight end (review 2 #8)",
         )],
     );
+}
+
+/// Counters review 2 HIGH 1 and review 3 MED-A (DECISIONS 7d1c461378, 4e5b6e3b0a): an instrument
+/// does no work inside a window. The instrument of record is DYNAMIC
+/// (`the_instruments_count_exactly_under_every_flag`); this is a LINT over the source (review 3
+/// LOW-1/2/3): no function on the probe's window and hold paths, callees included, calls a known
+/// allocator, prints, reads the environment, or calls `fe_mutant` (whose first call reads it; the
+/// path asks `budget_probe::mutant_on`, primed outside any window). A line marked `lint-allow:`
+/// with its reason is skipped. Bodies are found at a definition (a line starting `fn`, `pub fn` or
+/// `pub(crate) fn`, each optionally `unsafe`, the name followed by `(` or `<`), and braces inside
+/// strings, char literals and comments are not counted.
+///
+/// Counters review 4 LOW-C and review 5, the scope: the bodies listed below, which are the window
+/// and hold paths and their callees (the counting allocator's hooks: `note_alloc`, `record_alloc`,
+/// `record_free` and the `GlobalAlloc` methods `alloc`, `alloc_zeroed`, `realloc`, `dealloc`; the
+/// thread-table readers; the scope lookups; the harness's in-window waits and confirm reads) EXCEPT
+/// `prime`, `arm` and `window_diagnostics` and `ran_between` (called only from `window_diagnostics`).
+/// `window_diagnostics` allocates by design, after a window's last count. `prime` reads the
+/// environment by design: first from `begin`, before any count, and again inside a window from
+/// `arm(true)`, where primed it must allocate nothing: that is checked dynamically, not here
+/// (`fc_held_5_syscalls_3_allocs`'s allocations outside its hold are 0). Its blind spots: a callee not
+/// listed here, a raw string holding `"` or `\`, and an escaped-quote char literal (`'\''`) are not
+/// parsed.
+#[test]
+fn nothing_on_the_probes_window_path_allocates() {
+    const FORBIDDEN: [&str; 24] = [
+        "env::var", "format!", ".to_string()", "String::from", "String::new", "Vec::new()", "Vec::with_capacity", "vec![",
+        "Box::new", "Arc::new", ".collect", ".to_owned()", ".to_vec()", ".clone()", "eprintln!", "println!", "print!(",
+        "dbg!", "write!", "writeln!", "getenv", "fe_mutant(", ".push(", ".insert(",
+    ];
+    let sources = [
+        (
+            "budget_probe.rs",
+            include_str!("budget_probe.rs"),
+            &[
+                "begin", "end", "end_owning", "user_counts", "window_syncs", "attribute", "foreign_threads", "thread_table",
+                "shim_counts", "shim", "shim_lost", "unix_syscalls", "instructions", "store_locked_at", "store_unlocked_of",
+                "mutant_on", "threads", "others_blocked", "each_thread", "spinning", "bump", "record_alloc", "record_free",
+                "wal_lock_held", "persistent_live", "note_alloc", "alloc", "alloc_zeroed", "realloc", "dealloc",
+                // The Linux thread-state readers (the Linux port, 2026-10-18).
+                "owned_named", "linux_tid", "linux_read_into", "linux_task_path", "linux_task_alive", "linux_task_stat",
+                "linux_task_run_ns", "linux_each_tid", "note_held_work", "site_work_begin", "site_work_end",
+                // budgets-port-adversary MED-1: ownership by registration (owned_named's key; a store thread's
+                // registration, which may run inside a window).
+                "name_key", "register_owned_thread",
+            ][..],
+        ),
+        ("budget_tests.rs", include_str!("budget_tests.rs"), &["absorb_confirm", "writer_settled", "spin_settled", "settled"][..]),
+        (
+            "store.rs",
+            include_str!("store.rs"),
+            &["own_sync_counts", "own_test_counts", "scope_top", "scope_is_audited", "scope_store_id", "confirm_park_for_test", "confirm_counts"][..],
+        ),
+        ("mod.rs", include_str!("mod.rs"), &["sync_counts", "branch_confirm_counts"][..]),
+    ];
+    let mut found = String::new();
+    let mut read = 0;
+    for (file, src, fns) in sources {
+        for name in fns {
+            let heads = ["fn ", "pub fn ", "pub(crate) fn ", "unsafe fn ", "pub unsafe fn ", "pub(crate) unsafe fn "].map(|v| format!("{v}{name}"));
+            let opens = |rest: &str| heads.iter().any(|h| rest.starts_with(h.as_str()) && matches!(rest.as_bytes().get(h.len()), Some(b'(' | b'<')));
+            let Some(at) = src.match_indices('\n').map(|(i, _)| i + 1).find(|&i| opens(src[i..].trim_start())) else {
+                let _ = writeln!(found, "  {file}: fn {name} not found");
+                continue;
+            };
+            let bytes = src.as_bytes();
+            let open = at + src[at..].find('{').unwrap();
+            let (mut depth, mut j, mut end) = (0i32, open, open);
+            let (mut in_str, mut in_comment) = (false, false);
+            while j < bytes.len() {
+                let c = bytes[j];
+                if in_comment {
+                    in_comment = c != b'\n';
+                } else if in_str {
+                    if c == b'\\' {
+                        j += 1;
+                    } else if c == b'"' {
+                        in_str = false;
+                    }
+                } else if c == b'/' && bytes.get(j + 1) == Some(&b'/') {
+                    in_comment = true;
+                } else if c == b'"' {
+                    in_str = true;
+                } else if c == b'\'' && bytes.get(j + 2) == Some(&b'\'') {
+                    j += 2;
+                } else if c == b'{' {
+                    depth += 1;
+                } else if c == b'}' {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = j;
+                        break;
+                    }
+                }
+                j += 1;
+            }
+            read += 1;
+            for line in src[open..=end].lines() {
+                if line.contains("lint-allow:") {
+                    continue;
+                }
+                let code = line.split("//").next().unwrap_or("");
+                for bad in FORBIDDEN {
+                    if code.contains(bad) {
+                        let _ = writeln!(found, "  {file}: fn {name}: {bad} in `{}`", line.trim());
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(read, 56, "premise: every function on the window path was read:\n{found}");
+    assert!(found.is_empty(), "the probe's window path allocates, prints, reads the environment or calls fe_mutant:\n{found}");
+}
+
+/// Counters review 3 MED-A, the instrument of record (DECISIONS 4e5b6e3b0a): the instruments'
+/// exact-count fire-checks (`fc_nothing` moves nothing, `fc_box_23` allocates 23 boxes of 184 bytes)
+/// hold in a child with FE_MUTANT set to a name no mutant has and every diagnostic flag set, so that
+/// a flag's first read, or a diagnostic's work, cannot land inside a window unseen.
+///
+/// Counters review 4 LOW-B, the scope: "every flag" is the probe's own diagnostics
+/// (FE_BUDGET_FOREIGN_NAMES, FE_BUDGET_NEW_NAMES; FE_BUDGET_CHILD is set in the cell's own child)
+/// and the two mutant selectors read once per process (FE_MUTANT, R13_MUTANT), each set to a name no
+/// mutant has. NOT in scope, because a run with one set is not a budget configuration: behaviour
+/// knobs (R11_*, R12_PREWARM*, R13_FW1/FW2/MERGER, FE_LOSE_UNSYNCED, FE_KILL_*,
+/// TURSO_MEASURE_WORD_HOLD), other lanes' instruments that record by design (R12_TRACE_READS pushes
+/// every page read, R11_TRACE_*), FE_CAPTURE_VERIFY (verifies captures, and aborts), and
+/// R12_MUTANT (read on every call).
+#[test]
+fn the_instruments_count_exactly_under_every_flag() {
+    if in_child() || std::env::var_os("FE_FLAGS_CHILD").is_some() {
+        return;
+    }
+    let dir = tempfile::TempDir::new().unwrap();
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["branch::budget_tests::the_budget_counters_count_exactly_what_was_done", "--exact", "--test-threads=1", "--nocapture"])
+        .env("FE_FLAGS_CHILD", "1")
+        // A mutant run passes its mutant on (counters review 4 MED-1: the probe's and the harness's
+        // window mutants are killed here); otherwise a name no mutant has, so the name is still read.
+        .env("FE_MUTANT", std::env::var("FE_MUTANT").unwrap_or_else(|_| "no_mutant_has_this_name".to_string()))
+        .env("R13_MUTANT", "no_mutant_has_this_name")
+        .env("FE_BUDGET_FOREIGN_NAMES", "1")
+        .env("FE_BUDGET_NEW_NAMES", dir.path().join("new-names.txt"))
+        .env_remove("FE_BUDGET_RAW_DIR")
+        .output()
+        .unwrap();
+    let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    // Counters review 4 LOW-A: "running 1 test" and exit 0 also accept an ignored test.
+    assert!(text.contains("running 1 test"), "premise: the instruments test ran under the flags:\n{text}");
+    assert!(out.status.success(), "the instruments' exact counts fail with every flag set:\n{text}");
+    assert!(text.contains("test result: ok. 1 passed"), "premise: the instruments test passed, not ignored or filtered, under the flags:\n{text}");
+}
+
+/// Counters review 4 LOW-D (DECISIONS 6399fd35bf): an armed hold taken before any window allocates
+/// nothing under the store mutex. Measured in a fresh process, where nothing is primed, with
+/// FE_MUTANT set (so the mutant name's first read allocates): `arm(true)`, one hold through the
+/// probe, and the thread's held allocations must not move. A held allocation here is the probe's
+/// own (`mutant_on`'s unprimed fallback, or a lazy lookup at the lock), charged to a measured hold.
+#[test]
+fn an_armed_hold_before_any_window_allocates_nothing_under_the_mutex() {
+    if std::env::var_os("FE_ARM_CHILD").is_some() {
+        let (_, _, held0, bytes0) = probe::thread_allocs();
+        probe::arm(true);
+        probe::store_locked();
+        probe::store_unlocked();
+        let (_, _, held1, bytes1) = probe::thread_allocs();
+        probe::arm(false);
+        println!("ARM-CHILD held_allocs {} held_bytes {}", held1 - held0, bytes1 - bytes0);
+        return;
+    }
+    if in_child() || std::env::var_os("FE_FLAGS_CHILD").is_some() {
+        return;
+    }
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["branch::budget_tests::an_armed_hold_before_any_window_allocates_nothing_under_the_mutex", "--exact", "--test-threads=1", "--nocapture"])
+        .env("FE_ARM_CHILD", "1")
+        .env("FE_MUTANT", std::env::var("FE_MUTANT").unwrap_or_else(|_| "no_mutant_has_this_name".to_string()))
+        .env_remove("FE_BUDGET_CHILD")
+        .output()
+        .unwrap();
+    let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(out.status.success() && text.contains("test result: ok. 1 passed"), "premise: the arm child ran:\n{text}");
+    let line = text.lines().find_map(|l| l.find("ARM-CHILD ").map(|i| l[i..].to_string())).unwrap_or_else(|| panic!("premise: the arm child reported nothing:\n{text}"));
+    assert_eq!(line.trim(), "ARM-CHILD held_allocs 0 held_bytes 0", "an armed hold before any window allocated under the store mutex");
+}
+
+/// The probe's thread-state readers (lead ruling 2026-10-18, the Linux port): `thread_table`,
+/// `others_blocked` and `threads`, on which every budget window closes, read a parked thread as
+/// blocked and a spinning one as running, each forced, list every thread with its own id and CPU
+/// time, and mark the caller. The same assertions hold on Apple (Mach, the semantics of record) and
+/// on Linux (/proc/self/task): this is the parity check; where the platforms differ is stated at
+/// `thread_table`. Run in a child of its own, so no other test's threads run beside it. Expected ids
+/// come from the platform (pthread_threadid_np, gettid), never from the readers.
+#[cfg(any(target_vendor = "apple", target_os = "linux"))]
+#[test]
+fn the_thread_state_readers_read_blocked_and_running_threads() {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::{Acquire, Release}};
+    fn platform_tid() -> u64 {
+        #[cfg(target_vendor = "apple")]
+        let id = {
+            let mut me = 0u64;
+            // SAFETY: this thread's own id into a local.
+            unsafe { libc::pthread_threadid_np(0, &mut me) };
+            me
+        };
+        // SAFETY: the raw syscall (glibc before 2.30 has no gettid wrapper); it cannot fail.
+        #[cfg(not(target_vendor = "apple"))]
+        let id = unsafe { libc::syscall(libc::SYS_gettid) } as u64;
+        id
+    }
+    if std::env::var_os("FE_THREAD_STATE_CHILD").is_none() {
+        if in_child() || std::env::var_os("FE_FLAGS_CHILD").is_some() || std::env::var_os("FE_ARM_CHILD").is_some() {
+            return;
+        }
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["branch::budget_tests::the_thread_state_readers_read_blocked_and_running_threads", "--exact", "--test-threads=1", "--nocapture"])
+            .env("FE_THREAD_STATE_CHILD", "1")
+            .env_remove("FE_BUDGET_CHILD")
+            .output()
+            .unwrap();
+        let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        assert!(out.status.success() && text.contains("test result: ok. 1 passed"), "the thread-state readers, in their own child:\n{text}");
+        return;
+    }
+    let me = platform_tid();
+    let (parked_id, spinner_id) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    let parked = {
+        let id = parked_id.clone();
+        std::thread::spawn(move || {
+            id.store(platform_tid(), Release);
+            let _ = rx.recv();
+        })
+    };
+    let stop = Arc::new(AtomicBool::new(false));
+    // The spinner's own progress (budgets-port-adversary MED-2): a count it moves while it runs, so a try
+    // can show the spinner RAN between two readings, whatever the load.
+    let progress = Arc::new(AtomicU64::new(0));
+    let spinner = {
+        let (id, stop, progress) = (spinner_id.clone(), stop.clone(), progress.clone());
+        std::thread::spawn(move || {
+            id.store(platform_tid(), Release);
+            while !stop.load(Acquire) {
+                progress.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                std::hint::spin_loop();
+            }
+        })
+    };
+    while parked_id.load(Acquire) == 0 || spinner_id.load(Acquire) == 0 {
+        std::hint::spin_loop();
+    }
+    let (pid, sid) = (parked_id.load(Acquire), spinner_id.load(Acquire));
+    let read = || {
+        let mut t = [probe::ThreadCpu::EMPTY; 48];
+        let n = probe::thread_table(&mut t).expect("CLAIM: the thread table cannot be read on this platform");
+        (n, t)
+    };
+    let find = |t: &[probe::ThreadCpu; 48], id: u64| t.iter().copied().find(|x| x.id == id && x.id != 0);
+    // Forced blocked: the parked thread reads waiting (it may still be on its way into the wait).
+    let t0 = std::time::Instant::now();
+    let (n, t) = loop {
+        let (n, t) = read();
+        if find(&t, pid).is_some_and(|x| x.waiting) || t0.elapsed() > std::time::Duration::from_secs(5) {
+            break (n, t);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    };
+    assert!(n >= 3 && n <= 48, "premise: {n} threads listed (this thread, the parked one, the spinner, the harness's)");
+    let mine: Vec<_> = t.iter().filter(|x| x.me).collect();
+    assert_eq!(mine.len(), 1, "CLAIM: the caller is not marked exactly once");
+    assert_eq!(mine[0].id, me, "CLAIM: the caller's id is not the platform's thread id");
+    let p = find(&t, pid).unwrap_or_else(|| panic!("CLAIM: the parked thread (id {pid}) is not listed"));
+    assert!(p.waiting, "CLAIM: a parked thread does not read blocked");
+    let s0 = find(&t, sid).unwrap_or_else(|| panic!("CLAIM: the spinning thread (id {sid}) is not listed"));
+    assert!(!s0.waiting, "CLAIM: a spinning thread reads blocked");
+    let mut ids: Vec<u64> = t[..n].iter().map(|x| x.id).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    assert_eq!(ids.len(), n, "CLAIM: two listed threads share an id");
+    // CPU time: the spinner's grows, the parked thread's does not.
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let (_, t2) = read();
+    let s1 = find(&t2, sid).expect("CLAIM: the spinning thread vanished");
+    let p1 = find(&t2, pid).expect("CLAIM: the parked thread vanished");
+    assert!(s1.cpu_ns >= s0.cpu_ns + 20_000_000, "CLAIM: 100 ms of spinning moved its CPU time {} ns -> {} ns", s0.cpu_ns, s1.cpu_ns);
+    assert_eq!(p1.cpu_ns, p.cpu_ns, "CLAIM: a parked thread's CPU time moved");
+    // A running thread's CPU time is current when read, not as of its last scheduler event: between
+    // two readings a thread that RAN in between has gained time, every time (fc_foreign_window's helper
+    // runs for well under a tick; the Linux port's run 1 read it as not having run, ecetesla4 and
+    // iccad6). FLAGGED, budgets-port-adversary MED-2 (load-immune; the bound unchanged): the reader
+    // sleeps 200 us instead of spinning (on one CPU its spin kept the spinner from running: 3 of 3 red
+    // under taskset -c 0), and a try counts only if the spinner's own progress count moved between the
+    // two readings (it provably ran). 20 counted tries are required; fewer than 20 in 2,000 refuses the
+    // premise, never passes. BLIND SPOT (budgets-rev-39bb7fd43 LOW-1, measured): PINNED to one CPU this claim
+    // cannot see a stale reader (a schedstat reader survived 7/7 pinned runs, budgets-rev-39bb7fd43): the reader's sleep forces a context
+    // switch, which brings schedstat up to date. Pinned, it shows only that no false red remains; the
+    // stale-reader evidence is the UNPINNED run (that mutant killed in 25 of 26 unpinned runs).
+    let (mut counted, mut tries) = (0u32, 0u32);
+    while counted < 20 {
+        assert!(tries < 2_000, "premise: the spinner ran between two readings in only {counted} of {tries} tries");
+        tries += 1;
+        let (_, a) = read();
+        let p0 = progress.load(Acquire);
+        std::thread::sleep(std::time::Duration::from_micros(200));
+        let p1 = progress.load(Acquire);
+        let (_, b) = read();
+        if p1 == p0 {
+            continue;
+        }
+        let (x, y) = (find(&a, sid).expect("CLAIM: the spinning thread vanished"), find(&b, sid).expect("CLAIM: the spinning thread vanished"));
+        assert!(y.cpu_ns > x.cpu_ns, "CLAIM: a thread that ran between two readings read no more CPU time (try {tries}: {} ns -> {} ns): it is read stale", x.cpu_ns, y.cpu_ns);
+        counted += 1;
+    }
+    assert_eq!(probe::others_blocked(), Some(false), "CLAIM: others_blocked missed the running spinner");
+    let with = probe::threads().expect("CLAIM: the thread count cannot be read on this platform");
+    stop.store(true, Release);
+    spinner.join().unwrap();
+    // Forced blocked again: with the spinner gone, every other thread reads blocked, soon.
+    let t0 = std::time::Instant::now();
+    while probe::others_blocked() != Some(true) && t0.elapsed() < std::time::Duration::from_secs(5) {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert_eq!(probe::others_blocked(), Some(true), "CLAIM: with only a parked thread beside it, others_blocked is not true");
+    let t0 = std::time::Instant::now();
+    while probe::threads() != Some(with - 1) && t0.elapsed() < std::time::Duration::from_secs(5) {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert_eq!(probe::threads(), Some(with - 1), "CLAIM: the joined spinner is still counted");
+    tx.send(()).unwrap();
+    parked.join().unwrap();
+}
+
+/// Counters review MED-5, review 2 HIGH 2 and review 3 MED-B/LOW-4/LOW-10 (DECISIONS 7d1c461378,
+/// 4e5b6e3b0a): a parity check needs an independent second count. In a budget child the process's
+/// sync counts are exact (one cell's stores at a time) and the budget's reading IS them
+/// (`window_syncs`), so the second count is the stores' own attribution (`_own`). Every window that
+/// records the process's syncs records the budget's own key and `_own` too, and they agree; every
+/// cell compares at least one window and its process syncs sum above zero (a 0 == 0 comparison
+/// guards nothing). Never process against process.
+///
+/// Mutant `drop_journal_sync_count` (test builds only) hides every counted arm of a branch file's
+/// sync from the process (fsync, F_FULLFSYNC, barrier). Its expected killer, per cell and
+/// platform (`killer`): on Apple, the D1 open cell's `fsync` and the D2 cells' `full_fsync`; off
+/// Apple, every cell's `fsync` (F_FULLFSYNC is fsync there). Counters review 4 LOW-E, fail-closed:
+/// the table is checked, not assumed: unmutated, every cell's killer key moves in its own stores'
+/// count (`{killer}_own` sums above zero), so the mutant has something to hide there; under the
+/// mutant, every cell compared a window and has a mismatch on its killer key. By the mutation
+/// convention a mutant run FAILS when the mutant is killed ("KILLED in every cell") and PASSES,
+/// printing "SURVIVED ..." with the reason, when it survives (`parity_mutant_verdict`: a run that
+/// compared nothing or read no cell survives too), so a harness that judges by exit status never
+/// counts a survivor as killed. Unmutated, an empty cell list fails.
+#[test]
+fn every_budget_windows_syncs_equal_the_process_syncs_in_its_child() {
+    if in_child() {
+        return;
+    }
+    const D2_CELLS: [&str; 12] = [
+        "n10_small", "n1e4_small", "n10_large", "ckpt_n10", "confirm_load", "confirm_n10", "first_create", "shared_c1", "shared_c8",
+        "shared_c64", "shared_c256", "shared_c1024",
+    ];
+    let killer = |spec: &str| -> &'static str {
+        if cfg!(target_vendor = "apple") && D2_CELLS.contains(&spec) {
+            "full_fsync"
+        } else {
+            "fsync"
+        }
+    };
+    let mutant = super::store::fe_mutant("drop_journal_sync_count");
+    let mut failures = String::new();
+    let mut survived = String::new();
+    let (mut compared, mut cells_read) = (0, 0);
+    let cells = MAIN
+        .iter()
+        .copied()
+        .chain(["ckpt_n10", "confirm_load", "confirm_n10", "first_create", "open_d1"])
+        .chain(["shared_c1", "shared_c8", "shared_c64", "shared_c256", "shared_c1024"]);
+    for spec in cells {
+        let c = cell(spec);
+        cells_read += 1;
+        let (mut in_cell, mut process_sum, mut killer_own, mut killed) = (0, 0u64, 0u64, false);
+        for (op, samples) in &c.ops {
+            for (i, s) in samples.iter().enumerate() {
+                for k in ["fsync", "full_fsync", "barrier"] {
+                    let Some(&process) = s.get(&format!("{k}_process")) else { continue };
+                    if !s.contains_key(k) {
+                        let _ = writeln!(failures, "  {spec}: {op} {i}: {k}_process with no {k}: the budget's own reading is missing");
+                    }
+                    let Some(&own) = s.get(&format!("{k}_own")) else {
+                        let _ = writeln!(failures, "  {spec}: {op} {i}: {k}_process with no {k}_own: no independent count");
+                        continue;
+                    };
+                    compared += 1;
+                    in_cell += 1;
+                    process_sum += process;
+                    if k == killer(spec) {
+                        killer_own += own;
+                    }
+                    if own != process {
+                        if k == killer(spec) {
+                            killed = true;
+                        }
+                        let _ = writeln!(failures, "  {spec}: {op} {i}: {k}_own {own}, the process {process}");
+                    }
+                }
+            }
+        }
+        if in_cell == 0 {
+            let _ = writeln!(failures, "  {spec}: no window compared");
+        }
+        if process_sum == 0 && !mutant {
+            let _ = writeln!(failures, "  {spec}: its windows' process syncs sum to 0: the comparison guards nothing");
+        }
+        if killer_own == 0 && !mutant {
+            let _ = writeln!(failures, "  {spec}: its killer key {} never moved in its stores' own count: the mutant could not be killed here", killer(spec));
+        }
+        if mutant && (in_cell == 0 || !killed) {
+            let _ = writeln!(survived, "  {spec} (killer {}, {in_cell} windows compared)", killer(spec));
+        }
+    }
+    if mutant {
+        match parity_mutant_verdict(cells_read, compared, &survived, &failures) {
+            Ok(survivors) => {
+                // Straight to stderr: a passing test's eprintln! is captured by libtest and lost.
+                let _ = std::io::Write::write_all(&mut std::io::stderr(), format!("{survivors}\n").as_bytes());
+                return;
+            }
+            Err(killed) => panic!("{killed}"),
+        }
+    }
+    assert!(cells_read > 0, "premise: no cell was read");
+    assert!(compared > 0, "premise: no window carried both counts");
+    assert!(failures.is_empty(), "budget windows whose stores' own sync counts are not the process's ({compared} compared):\n{failures}");
+}
+
+/// The parity test's verdict under `drop_journal_sync_count`, by the mutation convention: `Ok`, the
+/// mutant SURVIVED (the run passes, the message names the survivors); `Err`, it was KILLED (the run
+/// fails). `survived` lists the cells with no window compared or no mismatch on their killer key.
+fn parity_mutant_verdict(cells_read: usize, compared: usize, survived: &str, failures: &str) -> Result<String, String> {
+    // Counters review 5 LOW-E: survival is decided first; a missing premise is a reason to survive,
+    // never a kill. (With cells read and nothing compared, every cell is already in `survived`.)
+    if cells_read == 0 {
+        return Ok("drop_journal_sync_count SURVIVED: no cell was read, so nothing could kill it".to_string());
+    }
+    if !survived.is_empty() {
+        return Ok(format!("drop_journal_sync_count SURVIVED in ({compared} windows compared):\n{survived}"));
+    }
+    if compared == 0 {
+        return Ok("drop_journal_sync_count SURVIVED: no window carried both counts, so nothing could kill it".to_string());
+    }
+    Err(format!("drop_journal_sync_count KILLED in every cell ({cells_read} cells, {compared} compared):\n{failures}"))
+}
+
+/// Counters review 5 LOW-E (DECISIONS 52616c176d): under the mutation convention no premise may turn a
+/// survivor into a kill. A run that compared nothing (every cell a survivor) and a run that read no
+/// cell are SURVIVED, with the reason; only a mismatch on every cell's killer key is KILLED.
+#[test]
+fn the_parity_verdict_counts_no_survivor_as_killed() {
+    let all_uncompared = "  a (killer fsync, 0 windows compared)\n  b (killer full_fsync, 0 windows compared)\n";
+    let v = parity_mutant_verdict(2, 0, all_uncompared, "");
+    assert!(v.as_ref().is_ok_and(|m| m.contains("SURVIVED")), "every cell uncompared read as killed: {v:?}");
+    let v = parity_mutant_verdict(0, 0, "", "");
+    assert!(v.as_ref().is_ok_and(|m| m.contains("SURVIVED") && m.contains("no cell")), "an empty cell list read as killed: {v:?}");
+    let v = parity_mutant_verdict(2, 7, "  a (killer fsync, 3 windows compared)\n", "  ...\n");
+    assert!(v.as_ref().is_ok_and(|m| m.contains("SURVIVED in") && m.contains("  a ")), "a cell without a killer mismatch read as killed: {v:?}");
+    let v = parity_mutant_verdict(2, 7, "", "  a: x\n  b: y\n");
+    assert!(v.as_ref().is_err_and(|m| m.contains("KILLED in every cell")), "a mismatch on every cell's killer key did not read as killed: {v:?}");
 }
 
 #[cfg(target_vendor = "apple")]
@@ -2565,14 +4334,35 @@ fn recovery_appends_nothing_to_the_log() {
 /// (`ckpt_started == 0`), summed per counter, with the checkpoints installed. Refuses fewer than
 /// three.
 fn checkpoint_excess(spec: &str) -> (u64, BTreeMap<&'static str, i64>) {
+    let (installed, excess, _) = checkpoint_excess_of(spec, true);
+    (installed, excess)
+}
+
+/// The excess of the operations that started a checkpoint over their calm minimum, summed, and the
+/// checkpoints they installed: over the QUIET samples only (`quiet_only`, every budget but the
+/// selection-bias check) or over every sample. Reports the checkpoint-starting rounds attributable
+/// and refused. With `quiet_only`, refuses below three attributable installs (class (b): never a
+/// verdict from fewer).
+fn checkpoint_excess_of(spec: &str, quiet_only: bool) -> (u64, BTreeMap<&'static str, i64>, (u64, u64)) {
     let c = cell(spec);
     let mut excess: BTreeMap<&'static str, i64> = BTreeMap::new();
     let mut installed = 0;
+    let (mut attributable, mut refused) = (0u64, 0u64);
     for op in ["ckpt_create", "ckpt_first_write"] {
+        let all = c.ops.get(op).map(Vec::as_slice).unwrap_or_default();
         let samples = quiet(&c, op);
         let calm: Vec<&&Map> = samples.iter().filter(|s| s["ckpt_started"] == 0).collect();
         assert!(calm.len() * 2 >= samples.len(), "{spec}: {op}: most operations started a checkpoint");
-        for s in samples.iter().filter(|s| s["ckpt_started"] > 0) {
+        for s in all.iter().filter(|s| s["ckpt_started"] > 0) {
+            let quiet = s.get("quiet").copied().unwrap_or(1) == 1;
+            if quiet {
+                attributable += 1;
+            } else {
+                refused += 1;
+            }
+            if quiet_only && !quiet {
+                continue;
+            }
             installed += s["ckpt_installed"];
             for k in ["syscalls", "held_syscalls", "held_syncs", "fsync", "full_fsync", "barrier", "locks_process", "catalog_queries"] {
                 let Some(&v) = s.get(k) else { continue };
@@ -2581,8 +4371,13 @@ fn checkpoint_excess(spec: &str) -> (u64, BTreeMap<&'static str, i64>) {
             }
         }
     }
-    assert!(installed >= 3, "{spec}: premise: at least three checkpoints installed ({installed})");
-    (installed, excess)
+    if quiet_only {
+        assert!(
+            installed >= 3,
+            "{spec}: premise: at least three checkpoints installed in attributable rounds ({installed}; checkpoint rounds attributable {attributable}, refused {refused})"
+        );
+    }
+    (installed, excess, (attributable, refused))
 }
 
 /// Review 1 #7 and the engine's b79dc250e (a fuzzy checkpoint issues no sync inside the store
@@ -2645,6 +4440,28 @@ fn a_checkpoint_flushes_at_most_three_times() {
     }
 }
 
+/// The lead's selection-bias condition on the CKPT_ROUNDS ruling: the flush budget over EVERY
+/// checkpoint-starting round, attributable or not (the engine's flush counters, not the syscall
+/// attribution), with each operation's own calm cost subtracted, so a cost that appears only in the
+/// overlapping, refused rounds cannot hide behind the selection. Same thresholds as
+/// `a_checkpoint_flushes_at_most_three_times`: 3 full flushes and 1 other sync per checkpoint.
+#[test]
+fn a_checkpoint_flushes_at_most_three_times_over_every_round() {
+    if in_child() {
+        return;
+    }
+    for spec in ["ckpt_n10", "ckpt_n1e4"] {
+        let (n, excess, (attributable, refused)) = checkpoint_excess_of(spec, false);
+        assert!(n >= 3, "{spec}: premise: at least three checkpoints installed over every round ({n})");
+        let full = excess.get(FULL).copied().unwrap_or(0);
+        let other = excess.get(NOT_FULL).copied().unwrap_or(0) + excess.get("barrier").copied().unwrap_or(0);
+        assert!(
+            full <= 3 * n as i64 && other <= n as i64,
+            "{spec}: over every round ({attributable} attributable, {refused} refused): {n} checkpoints issued {full} full flushes and {other} other syncs; budget 3 and 1 each [review 1 #7]"
+        );
+    }
+}
+
 /// A checkpoint costs the same at 10 and at 10^4 live branches: it writes what changed since the
 /// last one, not the store. Syncs and catalog statements are compared exactly. Syscalls are
 /// compared within `CKPT_SYSCALL_SLACK`, because the window runs two threads and contention between
@@ -2667,7 +4484,10 @@ fn a_checkpoint_costs_the_same_at_10_and_at_10_000_live_branches() {
     }
     if let (Some(&x), Some(&y)) = (a.get("syscalls"), b.get("syscalls")) {
         let ratio = y as f64 / x.max(1) as f64;
-        if ratio > CKPT_SYSCALL_SLACK || ratio < 1.0 / CKPT_SYSCALL_SLACK {
+        // Two comparisons, not a range's `contains`: a NaN ratio must not read as outside it.
+        #[allow(clippy::manual_range_contains)]
+        let outside = ratio > CKPT_SYSCALL_SLACK || ratio < 1.0 / CKPT_SYSCALL_SLACK;
+        if outside {
             let _ = writeln!(failures, "  syscalls: N=10 {x}, N=10^4 {y} (x{ratio:.2})");
         }
     }
@@ -2788,6 +4608,7 @@ fn leap_l2_a_create_takes_no_store_mutex() {
 /// - creates per flush RISE with C at every step 1, 8, 64, 256, 1024 (lead, 2026-10-06), "near-linear
 ///   until CPU-bound" (DECISIONS L3): past 64 the serial section, not the flush, may bound it, so only
 ///   the rise is held there.
+///
 /// Alternating cohorts (review 1 #9) give about C/2 per flush: the 0.9·C bound up to 64 catches
 /// them; the rise alone above 64 does not (C/2 rises too), and a CPU ceiling past 64 would fail
 /// the rise while L3 is reached — that case is argued from its numbers, not waived.
@@ -2913,15 +4734,22 @@ fn leap_l4_an_open_keeps_at_most_100_bytes_resident_per_live_branch() {
 /// * the largest single hold by the OPENING thread (marked foreground), the same;
 /// * the opening thread's held bytes summed over every hold of the open, at most + 4 KiB;
 /// * the all-threads maximum, the same as the per-kind ones.
+///
 /// Both samples must be quiet (review 2 M7's LOW: a hold still open when the maxima are taken would
 /// be lost). The opening thread's held allocations are also held exactly equal between n10 and n1e4
 /// by recovery_of_named_branches_is_independent_of_live_branches_on_the_opening_thread (the
 /// backstop, red at base: +14 allocations). base14 (f5e9d5693): background 147,464 B at 10^4 ->
 /// 1,179,656 B at 10^5 (the filter set's table, built under the mutex; fixed by fastest-engine
-/// f315c960d, unrun). BLIND SPOTS: an O(N) walk under the mutex that allocates nothing and reads no
-/// catalog row (the D0 recovery instruction test sees that one); a catalog statement that changes
-/// many rows counts one (`Stmt::exec`). Mutants env `name_filter_built_under_mutex`,
-/// `opener_filter_set`. WRITTEN NOT RUN in this form.
+/// f315c960d, unrun). Linux finding (b): the held WORK counter (`note_held_work`, one unit per name
+/// filter insert) bounds an O(N) fill of the filter under the mutex on every platform. BLIND SPOTS:
+/// any other O(N) walk under the mutex that allocates nothing, reads no catalog row and counts no
+/// work (the D0 recovery instruction test sees that one, on Apple); a catalog statement that changes
+/// many rows counts one (`Stmt::exec`); max_recovery_work counts only `note_held_work`, whose one
+/// caller is `FilterTable::insert`, so it reads 0 for replay and an O(N) replay loop of any other kind
+/// (map inserts) is invisible to it (budgets-rev-242345 LOW-8: named, not instrumented; replay's own
+/// cost is O(records since the checkpoint), which a slack in N could not bound). Mutants env `name_filter_built_under_mutex`,
+/// `opener_filter_set`. Run at 242345bec (budgets-rev-242345, ecetesla1): green at base (held work 16 at
+/// both sizes), red under name_filter_built_under_mutex (10,000 against 100,000 units).
 #[test]
 fn leap_l4_an_open_holds_the_store_mutex_for_no_o_n_work() {
     if in_child() {
@@ -2939,6 +4767,19 @@ fn leap_l4_an_open_holds_the_store_mutex_for_no_o_n_work() {
         ("fg_held_alloc_bytes_sum", 4096),
         ("max_hold_alloc_bytes", 4096),
         ("max_hold_catalog_rows", 64),
+        // Linux finding (b): work that allocates nothing and reads no catalog row (filter inserts). Slack 0
+        // (budgets-rev-242345 LOW-1): measured 16 at 10^4 and at 10^5 with no spread, and a slack of 64 hid
+        // a planted O(N) term of one unit per 2,000 names (16 -> 50).
+        ("max_bg_hold_work", 0),
+        ("max_fg_hold_work", 0),
+        ("max_hold_work", 0),
+        // budgets-rev-242345 LOW-4: the install hold's work apart, so an O(N) term there under the largest
+        // other hold is seen.
+        ("max_install_hold_work", 0),
+        // LOW-5: every other per-name site apart too.
+        ("max_seed_hold_work", 0),
+        ("max_growth_hold_work", 0),
+        ("max_recovery_work", 0),
     ] {
         let (x, y) = (sa[k], sb[k]);
         if y > x + slack {
@@ -2946,6 +4787,30 @@ fn leap_l4_an_open_holds_the_store_mutex_for_no_o_n_work() {
         }
     }
     assert!(failures.is_empty(), "an open's store-mutex holds grow with the live branches:\n{failures}");
+}
+
+/// budgets-rev-242345 MED-7: a growth of the name filter holds the store mutex for no more work at 10^5
+/// live branches than at 10^4 (slack 0, as the other per-site keys): the memory cells' `growth` line,
+/// one growth forced at the next create (`FILTER_GROW_NEXT`). PREMISE: the growth site ran at both sizes
+/// (its two holds: at least 2 runs), so a growth that never ran cannot read as 0 units. The open
+/// test's own max_growth_hold_work key reads 0/0 by construction (no growth in the open). Mutant
+/// `name_filter_growth_work_one_in_10000`.
+#[test]
+fn leap_l4_a_name_filter_growth_holds_the_store_mutex_for_no_o_n_work() {
+    if in_child() {
+        return;
+    }
+    let (a, b) = (cell("mem_n1e4"), cell("mem_n1e5"));
+    let (ga, gb) = (&a.ops["growth"][0], &b.ops["growth"][0]);
+    assert!(ga["quiet"] == 1 && gb["quiet"] == 1, "premise: both growth samples quiet (10^4: {}, 10^5: {})", ga["quiet"], gb["quiet"]);
+    assert!(
+        ga["growth_runs"] >= 2 && gb["growth_runs"] >= 2,
+        "premise: a growth ran (both its holds) at both sizes (runs: {} at {N_LARGE}, {} at {N_HUGE})",
+        ga["growth_runs"],
+        gb["growth_runs"]
+    );
+    let (x, y) = (ga["max_growth_hold_work"], gb["max_growth_hold_work"]);
+    assert!(y <= x, "a name filter growth's store-mutex holds grow with the live branches: max_growth_hold_work {x} at {N_LARGE}, {y} at {N_HUGE}; budget <= {x} + 0");
 }
 
 /// The confirm arm's rounds as pairs `(a, reference)` of the same round, both quiet (review 2 H6: the
@@ -2976,10 +4841,13 @@ fn worst_diff(pairs: &[(&Map, &Map)], k: &str) -> i64 {
 /// to park again — and no sync, no store-mutex acquisition and no syscall under it, on any thread;
 /// in EVERY quiet round, paired by index (review 2 H6). CORRECTED before its first run (2026-10-15,
 /// a flagged change of this lane's own unrun budget): 18e98e977 said three and left out the timed
-/// wait. Four is the minimum for the ruled design (a background writer that waits out a quiet
-/// period after a landing wakes it): the wake, the quiet period's wait, the write and the park are
-/// each one call, and none of them can be another's. The window now ends only once the writer is
-/// parked with nothing pending (`writer_settled`, review 2 L3), so all four land inside it. A word that owns a duplicated descriptor adds its close (and std's
+/// wait. Four is the bound for this cell's schedule (an idle writer woken at the landing, under the
+/// ruled design: a background writer that waits out a quiet period after a landing wakes it): the
+/// wake, the quiet period's wait, the write and the park are each one call. It is an upper bound,
+/// not a minimum (review C14): a writer first scheduled after the quiet period has passed skips
+/// the timed wait. Spurious wake-ups, and the probe's own work, are not in the four. The window
+/// ends only once the writer is parked with nothing pending (`writer_settled`, review 2 L3 and
+/// C14), so all four land inside it. A word that owns a duplicated descriptor adds its close (and std's
 /// debug-build F_GETFD at that close): base13 read +4 against the held create, and an lldb trace of
 /// the confirm cell put the writer's pwrite, close and F_GETFD on `branch-confirm`; review 1 #14 /
 /// review 2 #6 (one shared descriptor, no dup per flight) remove the close. Mutant
@@ -3132,9 +5000,13 @@ fn a_fork_outside_a_schema_window_rereads_nothing() {
 /// * the fork does not wait for the parked commit: not released at 30 s, and no more store waits and
 ///   no more sleeps (`crate::thread::sleep`, review 2 M3) than the control's. BLIND SPOT: a direct
 ///   `std::thread::sleep`, or a wait on a condition variable outside `Group::wait`, is not counted;
-///   a bounded wait followed by a re-read is caught anyway by the create's parse ratchet.
+///   a bounded wait followed by a re-read is caught anyway by the create's parse ratchet;
+/// * neither does the child's first connection, made while the DDL is still parked (review C08 #2):
+///   not released at 30 s, and no more store waits and sleeps than the control's first connection.
+///
 /// On both paths, at 10 and at 10^3 tables. Mutants `schema_reread_twice`,
-/// `schema_window_waits_for_publish`, env `fork_rereads_schema_window`. WRITTEN NOT RUN.
+/// `schema_window_waits_for_publish`, `connect_waits_for_publish`, env `fork_rereads_schema_window`.
+/// WRITTEN NOT RUN.
 #[test]
 fn a_fork_inside_a_schema_window_rereads_the_schema_once() {
     if in_child() {
@@ -3150,6 +5022,8 @@ fn a_fork_inside_a_schema_window_rereads_the_schema_once() {
             let base = |k: &str| schema_min(&c, &control, k);
             let control_waits = values(&c, &control, &schema_samples(&c, &control), "store_waits").into_iter().max().unwrap();
             let control_sleeps = values(&c, &control, &schema_samples(&c, &control), "sleeps").into_iter().max().unwrap();
+            let control_connect_waits = values(&c, &control, &schema_samples(&c, &control), "connect_store_waits").into_iter().max().unwrap();
+            let control_connect_sleeps = values(&c, &control, &schema_samples(&c, &control), "connect_sleeps").into_iter().max().unwrap();
             for (i, s) in schema_samples(&c, &op).into_iter().enumerate() {
                 let (rows, scan) = (s["schema_table_rows"], s["ref_scan_page_reads"]);
                 for k in ["prepares", "schema_rows"] {
@@ -3176,6 +5050,17 @@ fn a_fork_inside_a_schema_window_rereads_the_schema_once() {
                 }
                 if s["sleeps"] > control_sleeps {
                     let _ = writeln!(failures, "  {spec}: {op} #{i}: {} sleeps against the control's at most {control_sleeps}; budget no more (review 2 M3: a bounded wait for the publication)", s["sleeps"]);
+                }
+                // Review C08 #2: the child's first connection, made while the DDL is still parked,
+                // does not wait for the trunk's publication either.
+                if s["connect_waited_for_ddl"] != 0 {
+                    let _ = writeln!(failures, "  {spec}: {op} #{i}: the child's first connection waited for the parked DDL commit (released after 30 s)");
+                }
+                if s["connect_store_waits"] > control_connect_waits {
+                    let _ = writeln!(failures, "  {spec}: {op} #{i}: the first connection made {} store waits against the control's at most {control_connect_waits}; budget no more", s["connect_store_waits"]);
+                }
+                if s["connect_sleeps"] > control_connect_sleeps {
+                    let _ = writeln!(failures, "  {spec}: {op} #{i}: the first connection made {} sleeps against the control's at most {control_connect_sleeps}; budget no more", s["connect_sleeps"]);
                 }
             }
         }
@@ -3233,8 +5118,9 @@ fn a_schema_window_adds_nothing_under_the_wal_write_lock() {
 /// 64 B. A cost linear in tables with a fixed part meets this (the fixed part only raises the
 /// 10-table figure); one that grows faster than the tables does not (a schema copied once per parsed
 /// row costs about tables/2 copies per table). Read generously: the 10^3 cell's smallest extra (its
-/// window's least minus its control's most) against the 10 cell's largest. Mutant
-/// `schema_parse_quadratic`. WRITTEN NOT RUN.
+/// window's least minus its control's most) against the 10 cell's largest. A bound on these samples
+/// and the paths they take, not on every allocation path (review C08); pure CPU work is invisible
+/// to it. Mutant `schema_parse_quadratic`. WRITTEN NOT RUN.
 #[test]
 fn a_schema_window_reread_allocates_at_most_linearly_in_tables() {
     if in_child() {
@@ -3269,17 +5155,23 @@ fn a_schema_window_reread_allocates_at_most_linearly_in_tables() {
 }
 
 /// Review 2 L6 (an engine FIX, one-time per database): a store's first create creates its catalog,
-/// under the store mutex: `Catalog::open` runs 13 `CREATE ... IF NOT EXISTS` statements, each its
-/// own commit, sets 2 pragmas and prepares 42 statements, then the meta row commits in a transaction
-/// of its own. Budgets, against the reopened reference in the same cell (both creates are a trunk's
+/// under the store mutex (`ensure_backing`). As measured by fastest-engine at turso 6a30fba7c
+/// (engine-fcdiag-6a30fba7c-iccad4, artie 81fcf7f004; this text was written against an older catalog,
+/// whose 13 CREATEs each committed and 42 statements were prepared eagerly): the schema is ONE
+/// transaction and statements are compiled lazily, and each first create compiles 40 statements
+/// there (26 in the schema closure, 8 pragmas on 2 connections, 2 lazy meta statements, 2 BEGIN/COMMIT,
+/// 1 + 1 for the meta transaction), the meta row committing in a transaction of its own. Budgets, against the reopened reference in the same cell (both creates are a trunk's
 /// first child, so both take the trunk's WAL write lock once):
 /// * the catalog is created in ONE commit: the fresh create's write transactions exceed the
-///   reference's by at most 1 (the schema and the meta row together; today 13 + 1);
+///   reference's by at most 1 (the schema and the meta row together; 13 + 1 on macOS at the time it was written; on Linux, at e40d9c2e2, fresh 3 against the reference's 1, budgets-rev-242345 LOW-12);
 /// * nothing is compiled under the store mutex to create it: `held_prepares` equal to the
 ///   reference's (the catalog's creation needs nothing the mutex guards: it can be made and
-///   prepared before the mutex is taken, or at the open).
+///   prepared before the mutex is taken, or at the open);
+/// * and it allocates at most 8 KiB under the store mutex beyond the reference's (engine-rev-l2b:
+///   bytes, not only commits and statements; the bound leap_l2b uses).
+///
 /// Flushes are reported, not budgeted (the fresh create also makes the log and the arena). Expected
-/// RED today. The review's split-transaction mutant is today's code, so this red at base is its
+/// RED today, so no mutant against it can earn a kill before a green baseline exists (review C08). The review's split-transaction mutant is today's code, so this red at base is its
 /// kill; once the FIX lands, mutant `catalog_schema_split` splits the transaction again (registered
 /// against the fixed code). WRITTEN NOT RUN.
 #[test]
@@ -3306,6 +5198,16 @@ fn a_first_create_makes_its_catalog_in_one_commit_off_the_store_mutex() {
     if held > 0 {
         let _ = writeln!(failures, "  the catalog's creation compiled {held} statements under the store mutex; budget 0");
     }
+    // engine-rev-l2b (via fastest-engine): a byte bound under the store mutex, so a fix that commits once
+    // and compiles nothing there cannot still allocate the ~2.6 MB the creation holds today (2,604,646 B at
+    // create 0 with 15 live, lane raw 78d2823373). The same instrument and bound as leap_l2b (the thread's
+    // allocation bytes under the mutex), over the reopened reference.
+    // budgets-rev-242345 LOW-9 (FLAGGED, stricter): the MOST any fresh sample held against the LEAST any
+    // reference did, so every fresh sample is bounded, not only the best one.
+    let held_bytes = most(&fresh[..], "held_alloc_bytes").saturating_sub(least(&reference[..], "held_alloc_bytes"));
+    if held_bytes > 8 << 10 {
+        let _ = writeln!(failures, "  the catalog's creation allocated {held_bytes} B under the store mutex; budget <= 8 KiB");
+    }
     println!(
         "first create: fresh {}..{} F_FULLFSYNC, {}..{} fsync; reopened {}..{} F_FULLFSYNC, {}..{} fsync",
         least(&fresh[..], "full_fsync"),
@@ -3329,11 +5231,11 @@ fn shared_lines() -> Vec<(String, u64, &'static str, Map)> {
     for c in SHARED_CS {
         let spec = format!("shared_c{c}");
         let data = cell(&spec);
-        for arm in ["shared_create", "shared_cfw", "shared_commits"] {
+        for arm in ["shared_create", "shared_cfw", "shared_commits", "shared_serial"] {
             match data.ops.get(arm).and_then(|v| v.first()) {
                 Some(s) => lines.push((spec.clone(), c, arm, s.clone())),
                 None => assert!(
-                    (arm == "shared_cfw" && c > 64) || (arm == "shared_commits" && !(c == 8 || c == 64)),
+                    (arm == "shared_cfw" && c > 64) || (arm == "shared_commits" && !(c == 8 || c == 64)) || (arm == "shared_serial" && c != 8),
                     "{spec}: no {arm} line"
                 ),
             }
@@ -3368,11 +5270,15 @@ fn contention_no_create_is_refused_and_retried_at_any_client_count() {
 /// everything buffered, so an acknowledgement waits for at most two flights — the one in progress,
 /// then its own. At every C from 1 to 1,024 no single acknowledgement (a create, or a first write)
 /// makes more than 2 store waits (`store::thread_waits`, one per condition-variable wait call, so a
-/// waiter woken and waiting again counts again). This holds by construction today (review 2 H5): it
+/// waiter woken and waiting again counts again). A CONSTRUCTION BOUND (review 2 H5, review C08): it
+/// holds by the group's shape today and is no independent evidence of contention efficiency; it
 /// guards the shape, against a waiter that polls on timed waits or a flight that takes part of the
-/// buffer. It cannot see review 1 #9's herd: that is the futile-lead budget's. A line at C >= 8 with
-/// no store wait at all is refused: some waiter must sleep, and a wait outside `Group::wait` (a
-/// sleep-and-relock poll, or creates serialised on the store mutex) would read as none. Reported per
+/// buffer. It cannot see review 1 #9's herd: that is the futile-lead budget's. A PREMISE, not a
+/// budget: a line at C >= 8 whose flights were shared (more acknowledgements than device flushes) and
+/// that made no store wait at all is refused (a rider must sleep, and a wait outside `Group::wait`, a
+/// sleep-and-relock poll, would read as none). Lines with no shared flight are reported, not refused
+/// (DECISIONS 6d491917d2 proposal 2; control `shared_serial`, red at 8678d5485): a serialised
+/// schedule waits for nothing. Reported per
 /// line: the mean per acknowledgement, the worst acknowledgement, and the worst client's waits per
 /// its own acknowledgements (the lead's condition, DECISIONS 2026-10-09). Mutants
 /// `group_wait_polls`, `poll_outside_group_wait`, `flush_under_mutex`. WRITTEN NOT RUN.
@@ -3401,10 +5307,15 @@ fn contention_an_acknowledgement_waits_for_at_most_two_flights_at_any_client_cou
             locks as f64 / acks as f64,
         );
         if s["store_waits_max_ack"] > 2 {
-            let _ = writeln!(failures, "  {spec}: {arm}: one acknowledgement made {} store waits with {c} clients; budget <= 2", s["store_waits_max_ack"]);
+            let _ = writeln!(failures, "  {spec}: {arm}: one acknowledgement made {} store waits with {c} clients; budget <= 2 [construction bound: group commit's shape]", s["store_waits_max_ack"]);
         }
-        if c >= 8 && waits == 0 {
-            let _ = writeln!(failures, "  {spec}: {arm}: {c} clients made no store wait at all: a wait outside Group::wait, or creates serialised elsewhere (refused)");
+        // DECISIONS 6d491917d2 (proposal 2): only where the flights were SHARED (more
+        // acknowledgements than device flushes) must some waiter have slept; a serialised schedule
+        // shares none and waits for none (control `shared_serial`), and the poll mutants share
+        // flights, so they still trip it.
+        let shared_flights = acks > s[FULL];
+        if c >= 8 && shared_flights && waits == 0 {
+            let _ = writeln!(failures, "  {spec}: {arm}: {c} clients shared flights ({acks} acknowledgements over {} device flushes) and made no store wait at all: a wait outside Group::wait (premise refused)", s[FULL]);
         }
     }
     assert!(failures.is_empty(), "acknowledgements under contention (all:{seen}):\n{failures}");
@@ -3436,13 +5347,23 @@ fn contention_no_flight_waiter_leads_in_vain_at_any_client_count() {
 /// Review 2 H1 and DECISIONS (review 6 #1's ruling: "under load, no confirmation word at all"): with
 /// the shipped 5 ms quiet period and C clients making back-to-back creates,
 /// * while flights overlap (C >= 8) the writer writes no word during the burst;
-/// * the idle tail after a burst gets at most one word, at every C;
+/// * the idle tail after a burst gets exactly one word, at every C (DECISIONS 6d491917d2 proposal 3:
+///   with the tail settled, none is a word lost; mutant `confirm_tail_lost`);
 /// * the writer wakes, with a word pending, at most twice per flight during the burst: once at the
 ///   landing that wakes the group's condition variable, and at most once on its quiet-period timer
 ///   between two flights (a stated constant: a poll wakes many times per flight).
+///
 /// At C = 1 the burst's words are reported and not budgeted: one client's creates do not overlap,
-/// and a gap of 5 ms between two of them is a legitimate idle tail. Mutants `confirm_quiet_zero`,
-/// env `confirm_poll_100us` and `confirm_holds_slot`. WRITTEN NOT RUN.
+/// and a gap of 5 ms between two of them is a legitimate idle tail. Review C08 #1: a word is the
+/// tail's when it is the burst's last landed flight's own and a burst's otherwise (the writer counts
+/// them as it writes them, `confirm_tail_words_for_test`), so a parent descheduled past the quiet
+/// period does not move the idle tail's honest word into the burst; `load_c8_delayed` is that
+/// schedule, a control that must read like `load_c8` (red at a46f64caf, which read the words when
+/// the parent did). The burst's idle holes (`idle_holes`: gaps of 5 ms or more with no create in
+/// progress) are judged beside it: the C >= 8 clause assumes the creates kept a flight in the air, so
+/// an arm with an idle hole is REFUSED as a premise failure naming `idle_holes` (DECISIONS
+/// 6d491917d2; control `load_c8_gapped`, judged by its own test). Mutants `confirm_quiet_zero`, env
+/// `confirm_poll_100us` and `confirm_holds_slot`. WRITTEN NOT RUN.
 #[test]
 fn the_confirmation_writer_under_load_writes_no_word_while_flights_overlap() {
     if in_child() {
@@ -3451,23 +5372,139 @@ fn the_confirmation_writer_under_load_writes_no_word_while_flights_overlap() {
     let data = cell("confirm_load");
     let mut failures = String::new();
     let mut seen = String::new();
-    for c in CONFIRM_LOAD_CS {
-        let op = format!("load_c{c}");
+    for (c, delay_ms) in CONFIRM_LOAD_ARMS {
+        let op = load_arm(c, delay_ms);
         let s = data.ops.get(&op).and_then(|v| v.first()).unwrap_or_else(|| panic!("confirm_load: no {op} line"));
-        let (flights, burst, total, wakes) = (s["flights"], s["confirms_burst"], s["confirms_total"], s["wakeups_burst"]);
-        assert!(flights > 0, "confirm_load: {op}: no flight counted: the instrument saw nothing");
-        let _ = write!(seen, " C={c}: {} acks, {flights} flights, words {burst} in the burst and {total} by the tail's end, {wakes} wake-ups;", s["acks"]);
-        if c >= 8 && burst != 0 {
-            let _ = writeln!(failures, "  C={c}: {burst} confirmation words written while flights overlapped; budget 0");
-        }
-        if total - burst > 1 {
-            let _ = writeln!(failures, "  C={c}: {} words in the idle tail after the burst; budget <= 1", total - burst);
-        }
-        if wakes > 2 * flights {
-            let _ = writeln!(failures, "  C={c}: {wakes} writer wake-ups over {flights} flights; budget <= 2 per flight");
-        }
+        let _ = write!(
+            seen,
+            " {op}: {} acks, {} flights, words {} in the burst and {} in the tail ({} by the parent's read), {} idle holes, {} wake-ups;",
+            s["acks"],
+            s["flights"],
+            s["confirms_burst"],
+            s["confirms_tail"],
+            s["confirms_by_read"],
+            s["idle_holes"],
+            s["wakeups_burst"]
+        );
+        judge_load_arm(c, &op, s, &mut failures);
     }
     assert!(failures.is_empty(), "the confirmation writer under load (all:{seen}):\n{failures}");
+}
+
+/// One `confirm_load` arm's judgement (`c` clients, line `op`): one failure line each, a premise's
+/// marked "premise refused".
+fn judge_load_arm(c: u64, op: &str, s: &Map, failures: &mut String) {
+    let (flights, burst, tail, total, wakes) = (s["flights"], s["confirms_burst"], s["confirms_tail"], s["confirms_total"], s["wakeups_burst"]);
+    assert!(flights > 0, "confirm_load: {op}: no flight counted: the instrument saw nothing");
+    assert_eq!(burst + tail, total, "confirm_load: {op}: the words attributed do not add up");
+    if s["tail_settled"] != 1 {
+        let _ = writeln!(failures, "  {op}: the writer never settled in the idle tail (1 s); premise refused: the tail's words are all counted");
+    }
+    // DECISIONS 6d491917d2 (proposal 1): the C >= 8 clause assumes the creates kept a flight in the
+    // air; a burst with an idle hole is refused, never judged by its words (no allowance per hole: a
+    // stall can cause the hole). Refusing often is a finding about the load or a stall.
+    if c >= 8 && s["idle_holes"] > 0 {
+        let _ = writeln!(failures, "  {op}: {} idle_holes (gaps of 5 ms or more with no create in progress); premise refused: back-to-back flights", s["idle_holes"]);
+    } else if c >= 8 && burst != 0 {
+        let _ = writeln!(failures, "  {op}: {burst} confirmation words written while flights overlapped; budget 0");
+    }
+    // DECISIONS 6d491917d2 (proposal 3): exactly one; with the tail settled (unheld, nothing pending)
+    // a tail with no word is a word lost.
+    if tail != 1 {
+        let _ = writeln!(failures, "  {op}: {tail} words in the idle tail after the burst; budget == 1");
+    }
+    if wakes > 2 * flights {
+        let _ = writeln!(failures, "  {op}: {wakes} writer wake-ups over {flights} flights; budget <= 2 per flight");
+    }
+}
+
+/// The reachability arm (lead, DECISIONS 2026-10-15): with every flight in the air past the quiet
+/// period (`load_c8_slow_flights`), the writer still writes no word while flights overlap, exactly one
+/// in the tail, and wakes at most twice per flight. A writer that polls while a flight is in the air
+/// (env mutant `confirm_poll_100us`) wakes many times per flight here, where the shipped schedule's
+/// short flights hid it. PREMISE: the flights did outlast the quiet period (the burst's wall time over
+/// its flights, at least 5 ms each), or the arm proves nothing and is refused. WRITTEN NOT RUN.
+#[test]
+fn the_confirmation_writer_wakes_at_most_twice_per_flight_when_flights_outlast_the_quiet_period() {
+    if in_child() {
+        return;
+    }
+    let data = cell("confirm_load");
+    let s = data.ops.get(LOAD_SLOW).and_then(|v| v.first()).unwrap_or_else(|| panic!("confirm_load: no {LOAD_SLOW} line"));
+    let per_flight_us = s["burst_us"] / s["flights"].max(1);
+    assert!(
+        per_flight_us >= CONFIRM_QUIET_MS_SHIPPED * 1000,
+        "premise refused: {LOAD_SLOW}'s flights took {per_flight_us} us each, not past the {CONFIRM_QUIET_MS_SHIPPED} ms quiet period"
+    );
+    let mut failures = String::new();
+    judge_load_arm(8, LOAD_SLOW, s, &mut failures);
+    assert!(
+        failures.is_empty(),
+        "the confirmation writer with flights longer than the quiet period ({} acks, {} flights, {per_flight_us} us each, {} wake-ups, words {} burst / {} tail):\n{failures}",
+        s["acks"],
+        s["flights"],
+        s["wakeups_burst"],
+        s["confirms_burst"],
+        s["confirms_tail"]
+    );
+}
+
+/// The reachability arm for the confirmation writer's slot hold (lead, DECISIONS 2026-10-15): the
+/// writer is held mid-word (`HOLD_CONFIRM_WRITE`, after it took a word and before it writes it), and a
+/// create meanwhile must finish: on unix the writer takes no flight slot, so nothing waits on its word.
+/// The env mutant `confirm_holds_slot` holds the slot across the write, so the create waits until the
+/// writer is released (the load arms never reach it: the burst writes no word). Run here, in the test
+/// process, on a database of its own (no counter is read). WRITTEN NOT RUN.
+#[test]
+fn a_create_does_not_wait_for_a_confirmation_word_being_written() {
+    if in_child() {
+        return;
+    }
+    use super::store::{HOLD_ARRIVED, HOLD_CONFIRM_WRITE};
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("hold.db"));
+    let trunk = db.connect().unwrap();
+    seed(&trunk, false);
+    hold_word(false);
+    db.branches.confirm_hold_for_test(HOLD_CONFIRM_WRITE);
+    trunk.create_branch("held-0").unwrap();
+    let t = std::time::Instant::now();
+    while db.branches.confirm_held_for_test() != (HOLD_CONFIRM_WRITE | HOLD_ARRIVED) {
+        assert!(t.elapsed() < std::time::Duration::from_secs(5), "premise: the writer never reached its held word");
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let db2 = db.clone();
+    let create = std::thread::spawn(move || db2.connect().unwrap().create_branch("held-1").map_err(|e| e.to_string()));
+    let finished = finished_within(&create, std::time::Duration::from_secs(5));
+    let still_held = db.branches.confirm_held_for_test() == (HOLD_CONFIRM_WRITE | HOLD_ARRIVED);
+    db.branches.confirm_hold_for_test(0);
+    create.join().unwrap().unwrap();
+    hold_word(true);
+    assert!(still_held, "premise: the writer was released before the create was judged");
+    assert!(finished, "a create waited (5 s) for the confirmation writer's word being written: the writer held the flight slot");
+}
+
+/// DECISIONS 6d491917d2 (proposal 1): a `confirm_load` arm whose burst had an idle hole (a gap of
+/// 5 ms or more with no create in progress) is REFUSED, a premise failure naming `idle_holes`, never
+/// judged by its burst words: a stall can cause the hole, and an allowance of one word per hole would
+/// excuse both. The control `load_c8_gapped` makes the hole on purpose (every client pauses together
+/// for 20 ms half-way through its creates); its judgement must be that refusal, whatever words the
+/// gap let the writer write. WRITTEN NOT RUN.
+#[test]
+fn the_load_judgement_refuses_an_arm_with_an_idle_hole() {
+    if in_child() {
+        return;
+    }
+    let data = cell("confirm_load");
+    let s = data.ops.get(LOAD_GAPPED).and_then(|v| v.first()).unwrap_or_else(|| panic!("confirm_load: no {LOAD_GAPPED} line"));
+    assert!(s["idle_holes"] >= 1, "premise: {LOAD_GAPPED} made no idle hole (the clients' pause did not show)");
+    let mut failures = String::new();
+    judge_load_arm(8, LOAD_GAPPED, s, &mut failures);
+    assert!(
+        failures.lines().any(|l| l.contains("premise refused") && l.contains("idle_holes")),
+        "an arm with {} idle holes was not refused by its premise (DECISIONS 6d491917d2); its judgement read:\n{failures}",
+        s["idle_holes"]
+    );
 }
 
 // ---- the open's flushes, absolutely (lead order 2026-10-09, DECISIONS 1334833a4d; the open_* cells) ----
@@ -3534,6 +5571,7 @@ fn a_d2_open_of_an_unconfirmed_log_makes_one_device_flush_and_one_directory_sync
 ///   re-syncs the log (1 F_FULLFSYNC + 1 fsync), the restart-path engine SHAVE the lead filed;
 /// * it fails: a directory cannot be drained directly, so its entry reaches the device only through
 ///   a device flush after its plain fsync, and today's 1 F_FULLFSYNC + 1 fsync is the minimum.
+///
 /// No default: a line without `dir_full_rc` refuses. `open_cat_d2` (a catalog store) is the same case
 /// and is held to the same budget when its premises hold; when they do not (its open rewrites the
 /// log), its numbers stand in the raw as an observation and the test does not fail on it. Mutant env
@@ -3579,10 +5617,13 @@ fn a_d2_open_of_a_confirmed_log_syncs_only_its_directory() {
 /// them, so it must first make durable (a) the log's bytes, whose last flight the previous process may
 /// never have synced, and (b) the log's name, whose rename it may never have synced. POSIX:
 /// fsync(file) does not make the file's directory entry durable, and fsync(dir) does not make the
-/// file's data durable, so these are two syncs. At D1 on Apple nothing proves (a): the confirmation
-/// word is written only for a class that proves stable storage (`journal::proves_stable`: only
-/// FullFsync on Apple), so a D1 log's tail is never confirmed. Minimum 2; the engine issues 2.
-/// Mutant env `open_forgets_unsynced_rename`. WRITTEN NOT RUN.
+/// file's data durable, so these are two syncs. At D1 on Apple the open proves nothing of (a) from
+/// its class: its own syncs do not prove stable storage (`journal::proves_stable`: only FullFsync on
+/// Apple), and the open's arm is chosen by that class, not by the header's word. The word IS there:
+/// the clean close that built the cell wrote it after a full flush of its own
+/// (`Confirm::write_at_close`, a81058160), so the premise is `confirmed` 1 (DECISIONS ba515419c3:
+/// a premise repair, the budget unchanged; it read "never confirmed", 0, before).
+/// Minimum 2; the engine issues 2. Mutant env `open_forgets_unsynced_rename`. WRITTEN NOT RUN.
 #[cfg(target_vendor = "apple")]
 #[test]
 fn a_d1_open_makes_two_plain_fsyncs() {
@@ -3591,7 +5632,7 @@ fn a_d1_open_makes_two_plain_fsyncs() {
     }
     let c = cell("open_d1");
     let mut failures = String::new();
-    let v = open_premises(&c, Some(0), &mut failures);
+    let v = open_premises(&c, Some(1), &mut failures);
     open_exact(&c, &v, [0, 2, 0, 2, 1], "the log's bytes and its name, nothing proven at D1 on Apple", &mut failures);
     assert!(failures.is_empty(), "a D1 open:\n{failures}");
 }
@@ -3616,4 +5657,63 @@ fn contention_each_create_registers_once_at_any_client_count() {
         }
     }
     assert!(failures.is_empty(), "creates registered more than once under contention (an internal retry):\n{failures}");
+}
+
+// ---- the counted exceptions (DECISIONS bd0d845f97: every run records them; a credited cell has all four at 0) ----
+
+/// The sample keys of `Database::branch_exception_counters()`, in its order: held-free upgrades a
+/// freeing operation led past the hard cap, held-free upgrades that took the flight slot to raise
+/// the header's class, compactions that synced inline on an operation, operations that waited
+/// behind a background compaction. Each is a window's delta.
+const EXC_KEYS: [&str; 4] = ["exc_hardcap_upgrades", "exc_header_raise_exclusive", "exc_inline_compaction_syncs", "exc_compaction_waits"];
+
+/// DECISIONS bd0d845f97 (the routing of `branch_exception_counters`): every run records the four
+/// counted exceptions, so every window of every engine cell carries all four keys. Checked here on
+/// the cells of each producer (the per-operation rounds, recovery, the checkpoint arm, the
+/// confirmation arm and the writer under load, a shared-flight arm, the first create, an open).
+/// Expected RED at this commit: no window records them. WRITTEN NOT RUN.
+#[test]
+fn every_window_records_the_four_exception_counters() {
+    if in_child() {
+        return;
+    }
+    let mut missing = String::new();
+    for spec in MAIN.iter().copied().chain(["ckpt_n10", "confirm_n10", "confirm_load", "shared_c8", "first_create", "open_d2_unconfirmed"]) {
+        let data = cell(spec);
+        for (op, samples) in &data.ops {
+            for (i, s) in samples.iter().enumerate() {
+                for key in EXC_KEYS {
+                    if !s.contains_key(key) {
+                        let _ = writeln!(missing, "  {spec}: {op} #{i}: no {key} recorded");
+                    }
+                }
+            }
+        }
+        assert!(!data.ops.is_empty(), "{spec}: no sample at all: the check saw nothing");
+    }
+    assert!(missing.is_empty(), "windows that do not record the counted exceptions (DECISIONS bd0d845f97):\n{missing}");
+}
+
+/// DECISIONS bd0d845f97: a cell whose window moved one of the four counted exceptions is not
+/// credited: the cell is refused, naming the counter and the window, before any budget reads it.
+/// The plant `exc_sharp` moves one for real, not by a planted line: a SHARP catalog store
+/// (`BranchCheckpoint::Sharp`) at the checkpoint arm's lowered threshold, whose creates cross it, so
+/// a create compacts inline and the engine counts it (`inline_compaction_syncs`; store.rs
+/// `maybe_compact`: a catalog store that is not fuzzy compacts on the operation). Its refusal must
+/// name `exc_inline_compaction_syncs` as moved (not as missing). The negative control is every other
+/// cell: refused only when one of its windows moved one. Expected RED at this commit: the child knows
+/// no cell `exc_sharp`, and nothing refuses a moved counter. WRITTEN NOT RUN.
+#[test]
+fn a_cell_whose_window_moved_an_exception_counter_is_not_credited() {
+    if in_child() {
+        return;
+    }
+    let refused = std::panic::catch_unwind(|| cell("exc_sharp"))
+        .err()
+        .map(|e| e.downcast_ref::<String>().cloned().or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_default());
+    let text = refused.unwrap_or_else(|| panic!("exc_sharp was credited: no window's inline compaction was counted, or nothing refused it"));
+    assert!(
+        text.contains("not credited") && text.contains("exc_inline_compaction_syncs moved"),
+        "exc_sharp was refused, but not as a moved exception counter (DECISIONS bd0d845f97):\n{text}"
+    );
 }

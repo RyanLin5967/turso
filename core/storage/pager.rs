@@ -3428,7 +3428,8 @@ impl Pager {
             pages
         };
         crate::recipe::count(crate::recipe::counter::BRANCH_DIRTY, dirty.len() as u64);
-        branch.store.commit_pages(branch.id, &dirty)?;
+        let reserved = std::mem::take(&mut *branch.reserved.lock().unwrap_or_else(|e| e.into_inner()));
+        branch.store.commit_pages_reserved(branch.id, &dirty, &reserved)?;
         if schema_did_change {
             branch
                 .store
@@ -3885,7 +3886,9 @@ impl Pager {
         }
         let page_no = page.get().id as u32;
         if let Some(branch) = self.branch.get() {
-            return branch.store.first_write_branch(branch.id, page_no);
+            let reserved = branch.store.first_write_branch(branch.id, page_no)?;
+            branch.reserved.lock().unwrap_or_else(|e| e.into_inner()).insert(page_no, reserved);
+            return Ok(());
         }
         if let Some(store) = self.branch_store.get() {
             if store.trunk_has_children() {
@@ -4670,6 +4673,12 @@ impl Pager {
         if let IOResult::IO(c) = self.wait_for_spill_completions()? {
             return Ok(IOResult::IO(c));
         }
+        // Test builds (engine review 19 MED 3): one yield here when the store's hook is armed, as
+        // the wait above makes on an async IO (io_uring, MemoryYieldIO, the simulator).
+        #[cfg(test)]
+        if self.branch_store.get().is_some_and(|store| store.take_commit_yield_for_test()) {
+            io_yield_one!(Completion::new_yield());
+        }
 
         // A branch pager commits to its branch (`commit_wal_inner` refuses it too): refused before
         // it could open the TRUNK's commit gate without the WAL write lock (review A-F1).
@@ -4952,12 +4961,14 @@ impl Pager {
                         );
                         return Ok(IOResult::Done(()));
                     }
-                    // Submit all WAL writes
+                    // Submit all WAL writes. The WAL is dirty from their submission until a sync
+                    // covers them (`Wal::note_frames_written`).
                     let wal_file = wal.wal_file()?;
                     let mut batch = WriteBatch::new(wal_file);
                     for prepared in &commit_info.prepared_frames {
                         batch.writev(prepared.offset, &prepared.bufs);
                     }
+                    wal.note_frames_written();
                     commit_info.completions = batch.submit()?;
                     commit_info.completion_group = None;
                     commit_info.state = CommitState::WaitWrites;
@@ -6461,6 +6472,7 @@ impl Pager {
             self.clear_page_cache(clear_dirty);
             self.dirty_pages.write().clear();
             if let Some(branch) = self.branch.get() {
+                branch.reserved.lock().unwrap_or_else(|e| e.into_inner()).clear();
                 branch.store.abort_write(branch.id);
             }
         } else {

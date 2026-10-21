@@ -499,16 +499,22 @@ impl File for UnixFile {
                 FileSyncType::FullFsync => {
                     trace!("fcntl(F_FULLFSYNC)");
                     super::count_sync(true);
+                    #[cfg(test)]
+                    crate::branch::store::note_path_sync(&self.path, 1);
                 }
                 FileSyncType::Fsync => {
                     trace!("fsync");
                     super::count_sync(false);
+                    #[cfg(test)]
+                    crate::branch::store::note_path_sync(&self.path, 0);
                 }
             }
             #[cfg(not(target_vendor = "apple"))]
             {
                 trace!("fsync");
                 super::count_sync(false);
+                #[cfg(test)]
+                crate::branch::store::note_path_sync(&self.path, 0);
             }
 
             c.complete(0);

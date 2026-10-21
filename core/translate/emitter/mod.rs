@@ -2247,9 +2247,24 @@ fn emit_check_constraint_bytecode(
             | ResolveType::Fail
             | ResolveType::Rollback
             | ResolveType::Replace => {
+                // A domain's CHECK fails as the domain's, in PostgreSQL's words (the domain-CHECK
+                // failure class: `schema::domain_check_failure`).
+                // Mutant `domain_check_as_table_check` (test builds only): reported as a table
+                // CHECK, as before.
+                let domain = check_constraint
+                    .domain
+                    .as_ref()
+                    .filter(|_| !crate::branch::store::fe_mutant("domain_check_as_table_check"));
+                let (err_code, description) = match domain {
+                    Some(domain) => (
+                        crate::error::SQLITE_CONSTRAINT_CHECK_DOMAIN,
+                        crate::schema::domain_check_failure(domain, &constraint_name),
+                    ),
+                    None => (SQLITE_CONSTRAINT_CHECK, constraint_name.to_string()),
+                };
                 program.emit_insn(Insn::Halt {
-                    err_code: SQLITE_CONSTRAINT_CHECK,
-                    description: constraint_name.to_string(),
+                    err_code,
+                    description,
                     on_error: None,
                     description_reg: None,
                 });

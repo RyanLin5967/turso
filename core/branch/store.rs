@@ -236,15 +236,24 @@ pub(crate) struct BranchStore {
     /// What this open's prewarm did to files other than the catalog (r12-catload; the catalog's
     /// own part is on its handle).
     prewarm: PrewarmStats,
-    /// Threads of fuzzy checkpoints started (F-FZ): joined by `compact_now`, by `Drop`, and once
-    /// more than `FLIGHTS_KEPT` accumulate (the oldest is long past its install).
-    flights: Mutex<Vec<crate::thread::JoinHandle<()>>>,
+    /// The fuzzy checkpoints' persistent worker (`CkptWorker`), started at the first checkpoint
+    /// and joined at `Drop`; `flight_jobs` counts the checkpoints handed to it and finished, for
+    /// `join_flights` (F-FZ: `compact_now` and `Drop` wait for every one started so far).
+    ckpt_worker: Mutex<Option<CkptWorker>>,
+    /// A fuzzy checkpoint an operation owes, for the worker to start once it has let the store
+    /// mutex go (`maybe_compact`, `start_owed_flight`; L2(d)).
+    start_due: AtomicBool,
+    flight_jobs: Arc<(std::sync::Mutex<(u64, u64)>, std::sync::Condvar)>,
     /// The confirmation writer (`run_confirm_writer`; review 6 #1) and the process that started it
     /// (a fork(2) child has no such thread to join): `None` for a volatile or trunk-only store, and
     /// if it could not be started (the close then writes the last word).
     confirm_writer: Mutex<Option<(u32, crate::thread::JoinHandle<()>)>>,
     /// The name filter's build after open (`start_name_filter`), and its stop flag (set at drop).
-    name_filter_build: Mutex<Option<crate::thread::JoinHandle<()>>>,
+    /// Every name-filter thread started (a build, a growth, a rebuild) and the process that started
+    /// it (review REVIEW-claude-namefilter-2 MED-1: one slot let close leave a build holding a catalog
+    /// connection past close). All are joined by `wait_name_filter`; a fork(2) child forgets its
+    /// parent's.
+    name_filter_build: Mutex<Vec<(u32, crate::thread::JoinHandle<()>)>>,
     name_filter_stop: Arc<std::sync::atomic::AtomicBool>,
     /// Test and harness hook (F-FZ): while it holds `HOLD_BEFORE_COMMIT` or `HOLD_AFTER_COMMIT`, a
     /// fuzzy checkpoint in flight waits at that point (its catalog rows written but not committed;
@@ -304,10 +313,21 @@ pub(crate) struct BranchStore {
     /// catalog's own volatile store counts its catalog's, which the main store routes through its
     /// at-risk decision (`truncate_catalog_wal`; engine review 17 MED 3).
     sync_failures: AtomicU64,
+    /// Test builds (engine review 19 MED 3): the next trunk commit on this store yields once inside
+    /// its pager commit, before its copy-decision pass, as a spill's wait on an async IO does.
+    #[cfg(test)]
+    commit_yield: AtomicBool,
+    /// A branch catalog's own store: the group of the store whose catalog it is, which its failed
+    /// syncs go to as they happen (`trunk_wal_sync_failed`; engine review 21 MED 5). Unset
+    /// elsewhere.
+    drain_parent: crate::sync::OnceLock<crate::sync::Weak<Group>>,
     /// The store's class, fixed at open (`Off` when volatile), readable without the mutex.
     class: SyncClass,
-    /// Test hook: while it holds `HOLD_TRUNK_DECIDED`, a trunk commit waits inside its commit gate
-    /// (see `pause_at`), so a test can act on the store with the gate open.
+    /// Test hook (see `pause_at`): the stage it holds pauses the operation that reaches it, so a test
+    /// can act on the store meanwhile. `HOLD_TRUNK_DECIDED` (a trunk commit inside its commit gate),
+    /// `HOLD_TRUNK_BARRIER_DONE`, `HOLD_FORK_REGISTERING`, `HOLD_LOCKED_FLUSH`,
+    /// `HOLD_RELEASE_BUFFERED`, `HOLD_SCHEMA_PUBLISH`, `HOLD_DROP_LOOKED_UP` and
+    /// `HOLD_CONNECT_LOOKED_UP` (engine review 20 LOW 30: the doc named only the first).
     #[cfg(test)]
     pub(crate) trunk_commit_hold: Arc<AtomicU8>,
     /// Test hook: the publication wait in milliseconds, in place of `PUBLISH_WAIT` (0: unset).
@@ -373,14 +393,28 @@ pub(crate) struct BranchStore {
 pub(crate) struct Group {
     state: std::sync::Mutex<GroupState>,
     cv: std::sync::Condvar,
-    /// Wakes the confirmation writer (`run_confirm_writer`): a landing that left a confirmation to
-    /// write where there was none, and the store's close.
+    /// Wakes the background writer (`run_confirm_writer`): a landing that left a confirmation to
+    /// write where there was none, a trunk WAL flush that proved one, a held-free upgrade becoming
+    /// owed (`arm_upgrade`, once per crossing), a compaction becoming owed (`maybe_compact`), and
+    /// the store's close (engine review 18 LOW 12: the doc named only the first and the last).
     confirm_cv: std::sync::Condvar,
     /// `GroupState::durable`, readable without the group's lock (lead review 1 item 10): written
     /// under it, after the state, by `set_durable`.
     durable_now: [AtomicU64; 3],
+    /// Callers inside `wait_durable_on` now (waiting for a flight, or leading one): while any is,
+    /// the group is not idle, and the confirmation writer writes no word (the registered red
+    /// the_confirmation_writer_under_load: at 64 clients a leader waiting for the store mutex left
+    /// no flight in the air for 5 ms in the middle of a burst, and the writer took that for the idle
+    /// tail, 4, 4 and 5 words in 3 runs, raw l94). Counted without the group's lock.
+    awaiting: AtomicU64,
     /// The store's fail-stop flag, shared with its journal (`StoreInner::fail_stop`).
     failed: Arc<AtomicBool>,
+    /// The confirmation last WRITTEN (`Confirm::key`, 0 for none; raised by `fetch_max`, as keys
+    /// order as `supersedes` does), only once its write returned (lead ruling f329b0d2a8: it was
+    /// raised as the word was taken, so a failed write counted as done). An offer that supersedes
+    /// neither it nor `GroupState::confirm_taken` is refused (`offer_confirm`; DECISIONS
+    /// ba515419c3). Atomic, so the write path takes no lock for it.
+    confirm_done: AtomicU64,
     /// Observation only (review 6 #1): confirmation words written into the log's header, and those
     /// whose write failed; counted without the group's lock (engine review 8 #11).
     confirms_written: AtomicU64,
@@ -389,15 +423,49 @@ pub(crate) struct Group {
     /// log sequence number to make durable in the free class, 0 for none, `UPGRADE_IN_AIR` while
     /// one is led. Armed by `mature` under the store mutex; led by the store's background writer
     /// (`run_confirm_writer`), off every acknowledgement path (engine review 13 MED 2), as a sync
-    /// that holds no flight slot (`BranchStore::sync_upgrade`; engine review 18 HIGH 1).
+    /// that holds no flight slot (`BranchStore::sync_upgrade`; engine review 18 HIGH 1), OUTSIDE
+    /// two counted exceptions (C15 ruling, fastest DECISIONS 2026-10-15T04:15:07Z): the hard-cap
+    /// fallback (`upgrade_overdue`, counted `hardcap_upgrades`) and the first raise of the header's
+    /// class, which holds the flight slot (`Upgrade::exclusive`, counted `header_raise_exclusive`).
     upgrade_due: AtomicU64,
     /// The held frees passed the hard cap (`UPGRADE_HARD_CAP` bounds): the background writer has
-    /// fallen behind, so the next freeing operation leads the upgrade after its own wait.
+    /// fallen behind, so the next freeing operation leads the upgrade after its own wait: the
+    /// memory and slot safety bound, a counted exception (`hardcap_upgrades`).
     upgrade_overdue: AtomicBool,
+    /// A compaction that syncs (DECISIONS c9c821dd8d): `COMPACT_DUE` once the operation that found
+    /// the log past the threshold owed it (`BranchStore::maybe_compact`), `COMPACT_RUNNING` while
+    /// the background writer leads it (`BranchStore::lead_compaction`), off every acknowledgement
+    /// path; `COMPACT_IDLE` otherwise. Owed only from idle, so an operation finding the log still
+    /// long while one runs neither wakes the writer nor owes a second.
+    compact_due: AtomicU8,
+    /// The process whose background writer runs (`start_confirm_writer`), 0 once it has stopped
+    /// (`WriterExit`): a fork(2) child inherits the value and has no writer, so it compares its pid.
+    writer_pid: crate::sync::atomic::AtomicU32,
     /// Test hook (engine review 8 #11): while it holds `HOLD_CONFIRM_WRITE`, the confirmation
     /// writer waits once it has taken a word to write and before it writes it. Per store.
     #[cfg(test)]
     confirm_hold: AtomicU8,
+    /// Test builds: the cut offset (`BgCompaction::from`) of the background compaction last held
+    /// at `HOLD_COMPACT_INSTALLED`, so a test can line a later log up with it (Codex C25 HIGH 1).
+    #[cfg(test)]
+    held_cut_from: AtomicU64,
+    /// This group, for a branch catalog's own store to forward its catalog's failed syncs to as
+    /// they happen (`BranchStore::link_drain_parent`; engine review 21 MED 5). Set by
+    /// `Group::shared`.
+    me: crate::sync::OnceLock<crate::sync::Weak<Group>>,
+    /// Test builds (fastest-budgets, review C14): notifications of `confirm_cv`, each counted under
+    /// the group's lock just before it is sent (`confirm_notified`).
+    #[cfg(test)]
+    confirm_notifies: AtomicU64,
+    /// Test builds (fastest-budgets, review C08 #1): the word of the last flight that landed with a
+    /// confirmation (set under the group's lock at its landing), and the words written since that
+    /// landing that are that flight's own (`confirm_tail_words_for_test`). At the end of a burst those
+    /// are the idle tail's words, however late anyone reads them; every other word written was a
+    /// burst's. Atomics only: the writer's write path allocates and locks nothing more in a window.
+    #[cfg(test)]
+    confirm_last_landed: std::sync::atomic::AtomicU32,
+    #[cfg(test)]
+    confirm_last_landed_writes: AtomicU64,
 }
 
 /// `Group::upgrade_due` while the upgrade it named is being led.
@@ -421,6 +489,41 @@ pub(crate) const HOLD_CONFIRM_WRITE: u8 = 1;
 /// `HOLD_FLIGHT_TAKEN` on the same hook.
 #[cfg(test)]
 pub(crate) const HOLD_UPGRADE_DUE: u8 = 13;
+
+/// `Group::compact_due`'s states.
+const COMPACT_IDLE: u8 = 0;
+const COMPACT_DUE: u8 = 1;
+const COMPACT_RUNNING: u8 = 2;
+
+/// Test hook stage (`Group::confirm_hold`): the confirmation writer found a compaction due and has
+/// not yet taken the store mutex for it (DECISIONS c9c821dd8d).
+#[cfg(test)]
+pub(crate) const HOLD_COMPACT_DUE: u8 = 16;
+
+/// Test hook stage (`Group::confirm_hold`): the background compaction has taken what it syncs
+/// and written its marker, and syncs nothing yet; it holds no lock (DECISIONS bd0d845f97).
+#[cfg(test)]
+pub(crate) const HOLD_COMPACT_TAKEN: u8 = 17;
+
+/// `HOLD_COMPACT_TAKEN`'s name at c9c821dd8d, when the stage was inside the store mutex (the
+/// bd0d845f97 red names it).
+#[cfg(test)]
+pub(crate) const HOLD_COMPACT_LOCKED: u8 = HOLD_COMPACT_TAKEN;
+
+/// Test hook stage (`Group::confirm_hold`): the background compaction's cut copies what is left of
+/// the log under the store mutex, counted (`compaction_waits`; DECISIONS bd0d845f97).
+#[cfg(test)]
+pub(crate) const HOLD_COMPACT_TAIL: u8 = 18;
+
+/// Test hook stage (`Group::confirm_hold`): the background compaction's cut is prepared off the
+/// mutex and has not been caught up or installed (DECISIONS bd0d845f97).
+#[cfg(test)]
+pub(crate) const HOLD_COMPACT_PREPARED: u8 = 19;
+
+/// Test hook stage (`Group::confirm_hold`): the background compaction's snapshot is installed and
+/// its directory synced, its cut not yet taken, and the store mutex free (Codex C25 HIGH 1's window).
+#[cfg(test)]
+pub(crate) const HOLD_COMPACT_INSTALLED: u8 = 20;
 
 #[derive(Default)]
 struct GroupState {
@@ -462,11 +565,33 @@ struct GroupState {
     already_durable: u64,
     upgrades: u64,
     riders: u64,
+    /// Compactions the background writer led (DECISIONS c9c821dd8d; observation only), and
+    /// compactions that synced inline, on the operation that found the log past the threshold:
+    /// past the hard limit with the writer behind, with no writer, or in a sharp catalog store. An
+    /// exception counter (`BranchStore::exception_counters`): an operation that paid it is not
+    /// credited.
+    #[cfg(test)]
+    background_compactions: u64,
+    inline_compaction_syncs: u64,
+    /// Fuzzy checkpoints that failed Busy at `settle_ordered`'s bound (engine review 18 MED 4;
+    /// observation only, `BranchStore::settle_timeouts`): each lost its install for a threshold of
+    /// log. A run of creates and first writes expects 0.
+    settle_timeouts: u64,
+    /// The C15 ruling's two counted exceptions (2026-10-15T04:15:07Z; `BranchStore::
+    /// exception_counters`): held-free upgrades a freeing operation led past the hard cap
+    /// (`upgrade_if_overdue`), and upgrades that took the flight slot to raise the header's class
+    /// (`Upgrade::exclusive`).
+    hardcap_upgrades: u64,
+    header_raise_exclusive: u64,
     /// The confirmation of the last flight that landed, and when it landed (review 6 #1): written
     /// by the confirmation writer once no flight has landed for `confirm_quiet()`, or at close.
     confirm: Option<(Instant, Confirm)>,
     /// The store is closing: the confirmation writer stops (the close writes what is left).
     confirm_stop: bool,
+    /// The confirmation the writer or the close last took to write (`Confirm::key`, 0 for none):
+    /// an offer of it while its write runs is refused too, or it would be written twice
+    /// (DECISIONS ba515419c3). A taken word is written, or its failure fail-stops the store.
+    confirm_taken: u64,
     /// Test builds (engine review 9 #8): syncs of any file a fuzzy checkpoint's thread issued
     /// settling its capture, from the start of its wait for what the capture covers to the end of
     /// that step (`run_flight`).
@@ -476,27 +601,33 @@ struct GroupState {
     /// proved confirmation pending and went back to waiting.
     #[cfg(test)]
     confirm_wakeups: u64,
-    /// Test builds (fastest-budgets, review 2 L3): the confirmation writer is in one of its
-    /// condition-variable waits (set as it enters one, cleared as the wait returns, both under this
-    /// lock; `BranchStore::confirm_park_for_test`), and the waits it has entered.
+    /// Test builds (fastest-budgets, review 2 L3, review C14): which of its condition-variable waits
+    /// the confirmation writer is in (`CONFIRM_PARK_*`, 0 for none; set as it enters one, cleared as
+    /// the wait returns, both under this lock), the notifications of `confirm_cv` it had seen when it
+    /// entered it, and the waits it has entered (`BranchStore::confirm_park_for_test`).
     #[cfg(test)]
-    confirm_parked: bool,
+    confirm_parked: u8,
+    #[cfg(test)]
+    confirm_seen: u64,
     #[cfg(test)]
     confirm_parks: u64,
 }
 
-impl GroupState {
-    /// Test builds (fastest-budgets, review 2 L3): the confirmation writer enters a wait.
-    #[cfg(test)]
-    fn confirm_wait_entered(&mut self) {
-        self.confirm_parked = true;
-        self.confirm_parks += 1;
-    }
+/// Test builds (fastest-budgets): the confirmation writer's waits (`GroupState::confirm_parked`).
+#[cfg(test)]
+pub(crate) const CONFIRM_PARK_IDLE: u8 = 1;
+/// Test builds: waiting on the group's condition variable for a flight or a cut in the air.
+#[cfg(test)]
+pub(crate) const CONFIRM_PARK_FLIGHT: u8 = 2;
+/// Test builds: waiting out the quiet period with a word pending.
+#[cfg(test)]
+pub(crate) const CONFIRM_PARK_QUIET: u8 = 3;
 
+#[cfg(test)]
+impl GroupState {
     /// Test builds (fastest-budgets, review 2 L3): the confirmation writer's wait returned.
-    #[cfg(test)]
     fn confirm_wait_left(&mut self) {
-        self.confirm_parked = false;
+        self.confirm_parked = 0;
     }
 }
 
@@ -518,14 +649,51 @@ impl Group {
             cv: std::sync::Condvar::new(),
             confirm_cv: std::sync::Condvar::new(),
             durable_now: [AtomicU64::new(durable), AtomicU64::new(durable), AtomicU64::new(durable)],
+            awaiting: AtomicU64::new(0),
             failed,
+            confirm_done: AtomicU64::new(0),
             confirms_written: AtomicU64::new(0),
             confirm_failures: AtomicU64::new(0),
             upgrade_due: AtomicU64::new(0),
             upgrade_overdue: AtomicBool::new(false),
+            compact_due: AtomicU8::new(COMPACT_IDLE),
+            writer_pid: crate::sync::atomic::AtomicU32::new(0),
             #[cfg(test)]
             confirm_hold: AtomicU8::new(0),
+            #[cfg(test)]
+            held_cut_from: AtomicU64::new(0),
+            me: crate::sync::OnceLock::new(),
+            #[cfg(test)]
+            confirm_notifies: AtomicU64::new(0),
+            #[cfg(test)]
+            confirm_last_landed: std::sync::atomic::AtomicU32::new(0),
+            #[cfg(test)]
+            confirm_last_landed_writes: AtomicU64::new(0),
         }
+    }
+
+    /// `new`, shared, and knowing its own handle (`me`).
+    fn shared(durable: u64, failed: Arc<AtomicBool>) -> Arc<Self> {
+        let group = Arc::new(Self::new(durable, failed));
+        let _ = group.me.set(Arc::downgrade(&group));
+        group
+    }
+
+    /// Test builds (fastest-budgets, review C14): `confirm_cv` is about to be notified; called
+    /// holding the group's lock.
+    #[cfg(test)]
+    fn confirm_notified(&self) {
+        self.confirm_notifies.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Test builds (fastest-budgets, review 2 L3, review C14): the confirmation writer enters a wait
+    /// of `kind` (`CONFIRM_PARK_*`), having seen every notification sent so far (all are counted
+    /// under the lock it holds).
+    #[cfg(test)]
+    fn confirm_wait_entered(&self, g: &mut GroupState, kind: u8) {
+        g.confirm_parked = kind;
+        g.confirm_seen = self.confirm_notifies.load(Ordering::Relaxed);
+        g.confirm_parks += 1;
     }
 
     /// Every journal byte below `end` is durable in class index `c` (called holding the lock, `g`).
@@ -622,8 +790,8 @@ impl Group {
     }
 
     /// Record a flight's outcome and wake every waiter: on success every byte below `end` is
-    /// durable in `class` and every weaker one, and the flight's confirmation (`confirm`) replaces
-    /// the last one for the confirmation writer. Returns whether the landing was accepted: a flight
+    /// durable in `class` and every weaker one, and the flight's confirmation (`confirm`) is offered
+    /// to the confirmation writer (`offer_confirm`). Returns whether the landing was accepted: a flight
     /// that succeeded on a store fail-stopped meanwhile is refused, and its owner must say so
     /// (engine review 9 #3).
     fn land(&self, end: u64, class: SyncClass, ok: bool, confirm: Option<Confirm>) -> bool {
@@ -636,13 +804,7 @@ impl Group {
                 self.set_durable(&mut g, c, end);
             }
             if let Some(confirm) = confirm {
-                // The writer sleeps without a deadline while it holds nothing it may write: woken
-                // when that changes.
-                let wake = confirm.proved() && g.confirm.as_ref().is_none_or(|(_, c)| !c.proved());
-                replaced = g.confirm.replace((Instant::now(), confirm));
-                if wake {
-                    self.confirm_cv.notify_one();
-                }
+                replaced = self.offer_confirm(&mut g, confirm);
             }
         } else {
             self.failed.store(true, Ordering::Release);
@@ -670,17 +832,94 @@ impl Group {
         self.cv.notify_all();
     }
 
+    /// Hand `confirm` to the confirmation writer, under the group's lock: it replaces the one held
+    /// when it supersedes it (`Confirm::supersedes`). Returns the confirmation let go, for the caller
+    /// to close holding no lock.
+    fn offer_confirm(&self, g: &mut GroupState, confirm: Confirm) -> Option<Confirm> {
+        if g.confirm.as_ref().is_some_and(|(_, held)| !confirm.supersedes(held)) {
+            return Some(confirm);
+        }
+        // Nor one the writer already took to write, held or not (DECISIONS ba515419c3): a re-offer
+        // of the same flight's word, as proved as it was (a held-free upgrade's landing with no
+        // flight since; a proved ordered flight upgraded), was queued again once the slot was empty
+        // and written a second time. Mutant `reoffer_written_word` (test builds only): queued.
+        let floor = self.confirm_done.load(Ordering::Acquire).max(g.confirm_taken);
+        if !confirm.supersedes_key(floor) && !fe_mutant("reoffer_written_word") {
+            return Some(confirm);
+        }
+        // The writer sleeps without a deadline while it holds nothing it may write: woken when that
+        // changes.
+        let wake = confirm.proved() && g.confirm.as_ref().is_none_or(|(_, c)| !c.proved());
+        // Test builds (fastest-budgets, review C08 #1): a new flight's confirmation; a held-free
+        // upgrade re-offering the same flight's word, proved now, keeps its count.
+        #[cfg(test)]
+        {
+            if confirm.word_for_test() != self.confirm_last_landed.load(Ordering::Relaxed) {
+                self.confirm_last_landed.store(confirm.word_for_test(), Ordering::Relaxed);
+                self.confirm_last_landed_writes.store(0, Ordering::Relaxed);
+            }
+        }
+        let replaced = g.confirm.replace((Instant::now(), confirm)).map(|(_, c)| c);
+        if wake {
+            #[cfg(test)]
+            self.confirm_notified();
+            self.confirm_cv.notify_one();
+        }
+        replaced
+    }
+
+    /// Owe a held-free upgrade covering the frees up to `lsn` (`upgrade_due`), past the hard cap
+    /// marked overdue too (`overdue`). Called holding the store mutex. Atomic (engine review 18
+    /// MED 7): an upgrade in the air is never overwritten, so its landing's reset cannot be lost and
+    /// no second one is led for the same frees; a later lsn raises one owed and not yet taken. The
+    /// writer is woken only on the transition into owed, under the group's lock (it checks the word
+    /// holding that lock, then waits): one wake per crossing, where every `mature` past the bound
+    /// took the lock and notified it, on every create, first write and trunk commit. Mutant
+    /// `upgrade_rearms_in_air` (test builds only): stored over one in the air, as before.
+    fn arm_upgrade(&self, lsn: u64, overdue: bool) {
+        let due = &self.upgrade_due;
+        let lsn = lsn.min(UPGRADE_IN_AIR - 1);
+        let woken = if fe_mutant("upgrade_rearms_in_air") {
+            let current = due.load(Ordering::Acquire);
+            due.store(current.max(lsn), Ordering::Release);
+            current == 0
+        } else {
+            due.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                (current != UPGRADE_IN_AIR && current < lsn).then_some(lsn)
+            }) == Ok(0)
+        };
+        if overdue {
+            self.upgrade_overdue.store(true, Ordering::Release);
+        }
+        // Mutant `arm_wakes_nobody` (test builds only; engine review 18 LOW 8's lost wakeup): the
+        // transition notifies no one, so only an observer that re-armed (`slot_is_free`'s `mature`
+        // did, every poll, before this wake was once per crossing) could hide it.
+        if woken && !fe_mutant("arm_wakes_nobody") {
+            let _g = self.lock();
+            #[cfg(test)]
+            self.confirm_notified();
+            self.confirm_cv.notify_all();
+        }
+    }
+
     /// A held-free upgrade's landing (`BranchStore::sync_upgrade`), called holding the store mutex:
     /// every byte below `end` is durable in `class` and every weaker one, unless the store
-    /// fail-stopped meanwhile. It had no frames, so the last flight's confirmation is kept.
-    fn mark_upgraded(&self, end: u64, class: SyncClass) {
+    /// fail-stopped meanwhile. It had no frames, so it does not move the log's last flight;
+    /// `confirm`, that flight's confirmation (engine review 21 MED 6), is offered to the writer.
+    /// Returns the confirmation let go, for the caller to close holding no lock.
+    fn mark_upgraded(&self, end: u64, class: SyncClass, confirm: Option<Confirm>) -> Option<Confirm> {
         let mut g = self.lock();
+        let mut left = confirm;
         if self.accepts() {
             for c in 0..=class_index(class) {
                 self.set_durable(&mut g, c, end);
             }
+            if let Some(confirm) = left.take() {
+                left = self.offer_confirm(&mut g, confirm);
+            }
         }
         self.cv.notify_all();
+        left
     }
 
     fn durable(&self, class: SyncClass) -> u64 {
@@ -689,15 +928,18 @@ impl Group {
 
     /// An ordered flight's outcome (`BranchStore::order_for_trunk`): on success every byte below
     /// `end` is written and ordered; it is durable only once `trunk_wal_synced` says so. A flight
-    /// that carried frames is now the log's last flight, which has no confirmation (barriered, not
-    /// synced), so the earlier flight's queued word is dropped: it can never match the LAST flight
-    /// (engine review 8 #9; mutant `ordered_keeps_confirm`, test builds only: kept, as before). An
-    /// upgrade that carried none ends where the landed bytes end, so the last flight is unchanged
-    /// and its word is kept (engine review 12 MED 1; mutant `ordered_upgrade_drops_confirm`).
-    fn land_ordered(&self, end: u64, ok: bool) {
+    /// that carried frames is now the log's last flight, so the earlier flight's queued word is
+    /// dropped: it can never match the LAST flight (engine review 8 #9; mutant
+    /// `ordered_keeps_confirm`, test builds only: kept, as before). An upgrade that carried none
+    /// ends where the landed bytes end, so the last flight is unchanged and its word is kept
+    /// (engine review 12 MED 1; mutant `ordered_upgrade_drops_confirm`).
+    /// `confirm` is the flight's own when no ordered end frame closes the last flight (engine review
+    /// 21 MEDs 7 and 8; `Flight::write`), unproved until the trunk commit's flush proves it.
+    fn land_ordered_confirmed(&self, end: u64, ok: bool, confirm: Option<Confirm>) {
         let mut g = self.lock();
         g.flushing = false;
         let mut stale = None;
+        let mut refused = None;
         if ok && self.accepts() {
             // Flights are exclusive (`flushing`), so every byte below the Off mark is in a landed
             // flight: this one carried frames exactly when it ends past it.
@@ -705,16 +947,27 @@ impl Group {
             self.set_durable(&mut g, 0, end);
             g.ordered = g.ordered.max(end);
             if carried && !fe_mutant("ordered_keeps_confirm") {
-                stale = g.confirm.take();
+                stale = g.confirm.take().map(|(_, c)| c);
+            }
+            if let Some(confirm) = confirm {
+                refused = self.offer_confirm(&mut g, confirm);
             }
         } else {
             self.failed.store(true, Ordering::Release);
             g.pending_full = None;
+            refused = confirm;
         }
         self.cv.notify_all();
         drop(g);
-        // The dropped confirmation's descriptor is closed holding no lock.
+        // The dropped confirmations' descriptors are closed holding no lock.
         drop(stale);
+        drop(refused);
+    }
+
+    /// `land_ordered_confirmed` with no confirmation (the group's unit tests).
+    #[cfg(test)]
+    fn land_ordered(&self, end: u64, ok: bool) {
+        self.land_ordered_confirmed(end, ok, None);
     }
 
     /// Every byte below `end` is durable in `class` and every weaker one: by a rewrite of the log (a
@@ -754,25 +1007,43 @@ impl Group {
     fn stop_confirms(&self) -> Option<Confirm> {
         let mut g = self.lock();
         g.confirm_stop = true;
+        #[cfg(test)]
+        self.confirm_notified();
         self.confirm_cv.notify_all();
         // The writer may be waiting for a flight on the group's condition variable.
         self.cv.notify_all();
-        g.confirm.take().map(|(_, c)| c)
+        let left = g.confirm.take().map(|(_, c)| c);
+        if let Some(c) = left.as_ref() {
+            g.confirm_taken = g.confirm_taken.max(c.key());
+        }
+        left
     }
 
-    /// Write `confirm`'s word, counted, holding no lock; a failure changes no flight's outcome
-    /// (review 6 #1). Mutant `confirm_error_fails_flight` (test builds only): it fail-stops the store.
+    /// Write `confirm`'s word, counted, holding no lock. Written, it is recorded done
+    /// (`confirm_done`). A failure FAIL-STOPS the store (lead ruling f329b0d2a8, reversing review
+    /// 6 #1's "a failure changes no flight's outcome"), the rule of a failed WAL sync: the word is
+    /// what lets recovery tell damage from a lost write, and nothing names the one that failed.
+    /// Mutants (test builds only): `confirm_done_at_take`, recorded done before the write, as
+    /// before; `confirm_error_goes_on`, a failure only counted, as review 6 #1 had it.
     fn write_confirm(&self, confirm: &Confirm, at_close: bool) {
+        if fe_mutant("confirm_done_at_take") {
+            self.confirm_done.fetch_max(confirm.key(), Ordering::AcqRel);
+        }
         let written = if at_close { confirm.write_at_close() } else { confirm.write() };
         // Counted without the group's lock (engine review 8 #11).
         match written {
             Ok(()) => {
+                #[cfg(test)]
+                if confirm.word_for_test() == self.confirm_last_landed.load(Ordering::Relaxed) {
+                    self.confirm_last_landed_writes.fetch_add(1, Ordering::Relaxed);
+                }
+                self.confirm_done.fetch_max(confirm.key(), Ordering::AcqRel);
                 self.confirms_written.fetch_add(1, Ordering::Relaxed);
             }
             Err(e) => {
                 self.confirm_failures.fetch_add(1, Ordering::Relaxed);
-                tracing::warn!("branch log: a flight's confirmation word was not written: {e}");
-                if fe_mutant("confirm_error_fails_flight") {
+                tracing::error!("branch log: a flight's confirmation word was not written; the store fail-stops: {e}");
+                if !fe_mutant("confirm_error_goes_on") {
                     let mut g = self.lock();
                     self.fail(&mut g);
                 }
@@ -830,14 +1101,31 @@ fn rewrite_class_marked(before: Option<SyncClass>, journal: &Journal) -> SyncCla
 const CONFIRM_QUIET: Duration = Duration::from_millis(5);
 
 fn confirm_quiet() -> Duration {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "measure-word-hold"))]
     {
+        // A measuring binary may also hold it from its environment (`TURSO_MEASURE_WORD_HOLD=1`),
+        // read once; only a build with the feature reads it.
+        #[cfg(feature = "measure-word-hold")]
+        {
+            static FROM_ENV: std::sync::Once = std::sync::Once::new();
+            FROM_ENV.call_once(|| {
+                if std::env::var_os("TURSO_MEASURE_WORD_HOLD").is_some_and(|v| v == "1") {
+                    CONFIRM_QUIET_MS.store(CONFIRM_HELD_MS, Ordering::Release);
+                }
+            });
+        }
         let ms = CONFIRM_QUIET_MS.load(Ordering::Acquire);
         if ms > 0 {
             return Duration::from_millis(ms);
         }
     }
     CONFIRM_QUIET
+}
+
+/// Test builds: `confirm_quiet` (the word-hold feature's test).
+#[cfg(test)]
+pub(crate) fn confirm_quiet_for_test() -> Duration {
+    confirm_quiet()
 }
 
 /// The confirmation writer, one thread per durable store (review 6 #1; listed in the PREREG annex
@@ -850,6 +1138,9 @@ fn confirm_quiet() -> Duration {
 /// (`BranchStore::lead_upgrade`), each one sync holding no flight slot, and returns the frees each
 /// covers under the store mutex (engine review 13 MED 2, review 18 HIGH 1 and #12).
 fn run_confirm_writer(group: Arc<Group>, store: Arc<StoreMutex>) {
+    #[cfg(test)]
+    let _scope = CountScope::enter(&store.counts);
+    let _exit = WriterExit(&group);
     let mut g = group.lock();
     loop {
         if g.confirm_stop {
@@ -869,11 +1160,22 @@ fn run_confirm_writer(group: Arc<Group>, store: Arc<StoreMutex>) {
             g = group.lock();
             continue;
         }
+        // A compaction that syncs, owed by an operation that crossed the threshold (DECISIONS
+        // c9c821dd8d): led here, off every acknowledgement path. It holds the store mutex while it
+        // syncs, so operations arriving meanwhile wait, and are counted (`compaction_waits`).
+        if group.compact_due.load(Ordering::Acquire) == COMPACT_DUE && !group.poisoned() {
+            drop(g);
+            #[cfg(test)]
+            pause_at(Some(&group.confirm_hold), HOLD_COMPACT_DUE);
+            BranchStore::lead_compaction(&store, &group);
+            g = group.lock();
+            continue;
+        }
         let landed = match g.confirm.as_ref() {
             Some((at, c)) if c.proved() && !group.poisoned() => *at,
             _ => {
                 #[cfg(test)]
-                g.confirm_wait_entered();
+                group.confirm_wait_entered(&mut g, CONFIRM_PARK_IDLE);
                 g = group.confirm_cv.wait(g).unwrap_or_else(|e| e.into_inner());
                 #[cfg(test)]
                 g.confirm_wait_left();
@@ -887,7 +1189,7 @@ fn run_confirm_writer(group: Arc<Group>, store: Arc<StoreMutex>) {
         // (test builds only): every 100 us, as before.
         if (g.flushing || g.cutting) && !fe_mutant("confirm_poll_100us") {
             #[cfg(test)]
-            g.confirm_wait_entered();
+            group.confirm_wait_entered(&mut g, CONFIRM_PARK_FLIGHT);
             g = group.cv.wait(g).unwrap_or_else(|e| e.into_inner());
             #[cfg(test)]
             g.confirm_wait_left();
@@ -897,10 +1199,19 @@ fn run_confirm_writer(group: Arc<Group>, store: Arc<StoreMutex>) {
             }
             continue;
         }
-        if idle < confirm_quiet() || g.flushing || g.cutting {
-            let wait = confirm_quiet().saturating_sub(idle).max(Duration::from_micros(100));
+        // Mutant `confirm_ignores_waiters` (test builds only): a caller waiting for durability or
+        // leading a flight does not keep the group busy, as before (`Group::awaiting`).
+        let awaited = group.awaiting.load(Ordering::Acquire) > 0 && !fe_mutant("confirm_ignores_waiters");
+        if idle < confirm_quiet() || g.flushing || g.cutting || awaited {
+            // A caller still awaiting durability: one more quiet period, not a poll (its flight's
+            // landing wakes the writer sooner).
+            let wait = if awaited {
+                confirm_quiet()
+            } else {
+                confirm_quiet().saturating_sub(idle).max(Duration::from_micros(100))
+            };
             #[cfg(test)]
-            g.confirm_wait_entered();
+            group.confirm_wait_entered(&mut g, CONFIRM_PARK_QUIET);
             g = group.confirm_cv.wait_timeout(g, wait).unwrap_or_else(|e| e.into_inner()).0;
             #[cfg(test)]
             g.confirm_wait_left();
@@ -911,6 +1222,7 @@ fn run_confirm_writer(group: Arc<Group>, store: Arc<StoreMutex>) {
             continue;
         }
         let (_, confirm) = g.confirm.take().expect("checked above");
+        g.confirm_taken = g.confirm_taken.max(confirm.key());
         // The word names a flight whose sync has returned, and on unix every replacement of the
         // log is a rename, so a word written while a flight or a rewrite runs reaches the old file
         // at most: the writer takes no flight slot, so no create waits on it, and it wakes no one
@@ -930,6 +1242,84 @@ fn run_confirm_writer(group: Arc<Group>, store: Arc<StoreMutex>) {
         }
         drop(confirm);
         g = group.lock();
+    }
+}
+
+/// Catch-up passes of a background compaction's cut before it copies what is left under the store
+/// mutex (`BranchStore::cut_in_background`; DECISIONS bd0d845f97).
+const COMPACT_CATCH_UPS: usize = 3;
+
+/// Test builds: no catch-up pass, so the cut always takes the counted tail path (the plant of
+/// `compaction_waits`).
+#[cfg(test)]
+pub(crate) static COMPACT_CATCH_UPS_OFF: AtomicBool = AtomicBool::new(false);
+
+/// Test builds: a background compaction stops once its snapshot is installed and synced, before
+/// it cuts the log, as a crash there would leave it (DECISIONS bd0d845f97's recovery rule).
+#[cfg(test)]
+pub(crate) static COMPACT_STOP_BEFORE_CUT: AtomicBool = AtomicBool::new(false);
+
+/// Test builds: no catch-up pass, nothing else changed: what flights wrote after the prep reaches
+/// the last pass, under the mutex.
+#[cfg(test)]
+pub(crate) static COMPACT_NO_CATCH_UP: AtomicBool = AtomicBool::new(false);
+
+fn compact_no_catch_up() -> bool {
+    #[cfg(test)]
+    {
+        COMPACT_NO_CATCH_UP.load(Ordering::Acquire) || COMPACT_CATCH_UPS_OFF.load(Ordering::Acquire)
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
+fn compact_catch_ups_off() -> bool {
+    #[cfg(test)]
+    {
+        COMPACT_CATCH_UPS_OFF.load(Ordering::Acquire)
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
+/// A background compaction's mutex hold that may sync, counted (`StoreMutex::compacting` odd)
+/// from before it locks to after it unlocks.
+struct Compacting<'a>(&'a StoreMutex);
+
+impl<'a> Compacting<'a> {
+    fn begin(store: &'a StoreMutex) -> Self {
+        store.compacting.fetch_add(1, Ordering::AcqRel);
+        Self(store)
+    }
+}
+
+impl Drop for Compacting<'_> {
+    fn drop(&mut self) {
+        self.0.compacting.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+/// A held-free upgrade in the air (`Group::upgrade_due` == `UPGRADE_IN_AIR`), reset to none
+/// when its leader is done, however it is done (`BranchStore::lead_upgrade`).
+struct InAir<'a>(&'a AtomicU64);
+
+impl Drop for InAir<'_> {
+    fn drop(&mut self) {
+        let _ = self.0.compare_exchange(UPGRADE_IN_AIR, 0, Ordering::AcqRel, Ordering::Acquire);
+    }
+}
+
+/// The background writer stopped, a panic included: nothing more is owed to it
+/// (`Group::writer_pid`; DECISIONS c9c821dd8d).
+struct WriterExit<'a>(&'a Group);
+
+impl Drop for WriterExit<'_> {
+    fn drop(&mut self) {
+        self.0.writer_pid.store(0, Ordering::Release);
     }
 }
 
@@ -1037,25 +1427,100 @@ thread_local! {
 /// The store mutex. A thin wrapper: in test builds its guard also marks this thread as holding it,
 /// so every sync issued meanwhile is counted (`syncs_under_store_mutex`; lead review 1 item 7's
 /// instrument — a flush inside the store mutex stalls every operation behind it).
-struct StoreMutex(Mutex<StoreInner>);
+struct StoreMutex {
+    inner: Mutex<StoreInner>,
+    /// Test builds: this store's counters (the per-store counter class, `StoreCounts`).
+    #[cfg(test)]
+    counts: Arc<StoreCounts>,
+    /// Odd while the background compaction holds, or is about to take, this mutex for a step that
+    /// may sync under it (DECISIONS c9c821dd8d, bd0d845f97: only its cut's last pass, `Compacting`,
+    /// and the whole compaction under mutant `compaction_syncs_under_mutex`): set before it locks
+    /// and cleared after it unlocks, so every operation that waited behind such a sync found it odd
+    /// as it arrived.
+    compacting: AtomicU64,
+    /// Lock acquisitions that arrived while `compacting` was odd, or during which it moved:
+    /// operations that waited behind a background compaction's sync under the mutex (an exception
+    /// counter, `BranchStore::exception_counters`). One that arrived in the margins (before the
+    /// writer locked, or after it unlocked) and did not wait is counted too: an overcount, never a
+    /// miss (`StoreMutex::lock`).
+    compaction_waits: AtomicU64,
+}
 
 impl StoreMutex {
     fn new(inner: StoreInner) -> Self {
-        Self(Mutex::new(inner))
+        Self {
+            inner: Mutex::new(inner),
+            compacting: AtomicU64::new(0),
+            compaction_waits: AtomicU64::new(0),
+            #[cfg(test)]
+            counts: Arc::new(StoreCounts::default()),
+        }
     }
 
+    /// Counted as it arrives when `compacting` is odd (so a waiter shows while it waits), and
+    /// otherwise once it holds the mutex if `compacting` moved meanwhile (Codex C25 MED 1): every
+    /// counted hold adds one as it begins and one as it ends, so a hold that began, and took the
+    /// mutex first, after the precheck read it even leaves a different value by then. Mutant
+    /// `compaction_wait_precheck_only` (test builds only): the precheck alone decides, as before.
+    #[track_caller]
     fn lock(&self) -> StoreGuard<'_> {
-        let guard = self.0.lock();
+        let before = self.compacting.load(Ordering::Acquire);
+        if before & 1 == 1 {
+            self.compaction_waits.fetch_add(1, Ordering::Relaxed);
+        }
+        #[cfg(test)]
+        AFTER_PRECHECK.with(|h| {
+            if let Some(hook) = h.borrow_mut().as_mut() {
+                hook();
+            }
+        });
+        let guard = self.lock_uncounted();
+        if before & 1 == 0
+            && self.compacting.load(Ordering::Acquire) != before
+            && !fe_mutant("compaction_wait_precheck_only")
+        {
+            self.compaction_waits.fetch_add(1, Ordering::Relaxed);
+        }
+        guard
+    }
+
+    /// `lock`, not counted as waiting behind a compaction: the background compaction's own. The
+    /// caller's site is kept for the lifecycle audit (`budget_probe::HoldRec`; `#[track_caller]`
+    /// through every wrapper).
+    #[track_caller]
+    fn lock_uncounted(&self) -> StoreGuard<'_> {
+        #[cfg(test)]
+        let site = std::panic::Location::caller();
+        let guard = self.inner.lock();
         #[cfg(test)]
         STORE_HELD.with(|held| held.set(held.get() + 1));
+        #[cfg(test)]
+        scope_push(&self.counts);
+        // Mutant `audit_stray_scope` (test builds only; counters review E1): another store's scope
+        // pushed between this lock and its unlock, so the scope's innermost entry is not this store's
+        // when the hold ends.
+        #[cfg(test)]
+        if fe_mutant("audit_stray_scope") {
+            scope_push(STRAY_COUNTS.get_or_init(|| Arc::new(StoreCounts::default())));
+        }
         // fastest-budgets instrument (test builds): acquisitions, and what is done while held.
         #[cfg(test)]
-        super::budget_probe::store_locked();
-        StoreGuard(guard)
+        super::budget_probe::store_locked_at(site);
+        StoreGuard(
+            guard,
+            #[cfg(test)]
+            &self.counts,
+        )
     }
 }
 
-struct StoreGuard<'a>(crate::sync::MutexGuard<'a, StoreInner>);
+/// Test builds: the stray store of mutant `audit_stray_scope`.
+#[cfg(test)]
+static STRAY_COUNTS: std::sync::OnceLock<Arc<StoreCounts>> = std::sync::OnceLock::new();
+
+/// A held store mutex; in test builds, with the store's own counters (the hold audit's identity
+/// comes from the guard, never from whatever scope is innermost: counters review E1).
+struct StoreGuard<'a>(crate::sync::MutexGuard<'a, StoreInner>, #[cfg(test)] &'a Arc<StoreCounts>);
 
 impl std::ops::Deref for StoreGuard<'_> {
     type Target = StoreInner;
@@ -1074,7 +1539,22 @@ impl std::ops::DerefMut for StoreGuard<'_> {
 impl Drop for StoreGuard<'_> {
     fn drop(&mut self) {
         STORE_HELD.with(|held| held.set(held.get() - 1));
-        super::budget_probe::store_unlocked();
+        // Recorded while the store is still the innermost scope (the hold audit is per store). The
+        // guard's own identity is passed too: the audit counts every outermost hold of an audited
+        // store by it (`AUDIT_SEEN`).
+        let own = self.1;
+        // Counters review 2 MED 3/MED 4: the audit decision is made here, once (AUDIT loaded once),
+        // and every outermost hold of an audited store is counted SEEN here, on the guard's own
+        // gates, outside the probe, so a hold the probe skipped or lost cannot drop out of both.
+        let audited = super::budget_probe::AUDIT.load(Ordering::Relaxed) && own.audited.load(Ordering::Relaxed);
+        if audited && STORE_HELD.with(|held| held.get()) == 0 {
+            super::budget_probe::AUDIT_SEEN.fetch_add(1, Ordering::Relaxed);
+        }
+        super::budget_probe::store_unlocked_of(Some((Arc::as_ptr(own) as usize, audited)));
+        if fe_mutant("audit_stray_scope") {
+            scope_pop();
+        }
+        scope_pop();
     }
 }
 
@@ -1082,6 +1562,13 @@ impl Drop for StoreGuard<'_> {
 thread_local! {
     /// How many store-mutex guards this thread holds (test builds).
     static STORE_HELD: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test hook (Codex C25 MED 1): run on this thread inside `StoreMutex::lock`, after its
+    /// compaction precheck and before it takes the mutex.
+    static AFTER_PRECHECK: std::cell::RefCell<Option<Box<dyn FnMut()>>> = const { std::cell::RefCell::new(None) };
 }
 
 /// Syncs of any file (`io::count_sync`, `io::count_barrier`) issued while the issuing thread held a
@@ -1095,6 +1582,239 @@ pub(crate) fn note_sync() {
     THREAD_SYNCS.with(|n| n.set(n.get() + 1));
     if STORE_HELD.with(|held| held.get()) > 0 {
         SYNCS_UNDER_STORE_MUTEX.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // The held store's: a guard's scope is the innermost while it is held.
+        #[cfg(test)]
+        count_in_scope(|c| &c.syncs_under_store_mutex, 1);
+    }
+}
+
+/// Test builds: ONE store's counters (the per-store counter class, lead ruling d9cf2b609b; the
+/// L2(d) review's LOW 4). The process-wide statics above stay as they were for their old readers;
+/// a budget or test reads these, which another store's work on another thread cannot move.
+/// Attribution: work done while a store's mutex is held, or on one of its own threads (its
+/// confirmation writer and checkpoint jobs), or in one of its calls that writes outside the mutex
+/// (`CountScope`), is that store's; a sync of a file the platform IO opened is the store's whose
+/// database path the file's path is, or begins with followed by `-` (`note_path_sync`), so a trunk
+/// database's and a catalog's are their store's on any thread. A count made in no scope goes to
+/// `UNSCOPED` (a coverage gap, which `every_store_count_has_a_store` refuses).
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct StoreCounts {
+    capture_entered: AtomicU64,
+    capture_arena_handles: AtomicU64,
+    capture_rows_built: AtomicU64,
+    frozen_rows_written: AtomicU64,
+    install_cuts: AtomicU64,
+    install_rewrites: AtomicU64,
+    syncs_under_store_mutex: AtomicU64,
+    /// `[fsync(2), F_FULLFSYNC, F_BARRIERFSYNC, barrier fallbacks]`, as `crate::io::SYNC_COUNTS`.
+    syncs: [AtomicU64; 4],
+    /// The hold audit records this store's holds (`budget_probe::AUDIT_PATH` named its path).
+    audited: std::sync::atomic::AtomicBool,
+}
+
+/// Test builds: the innermost store this thread works for, as an identity (0: none).
+#[cfg(test)]
+pub(crate) fn scope_store_id() -> usize {
+    scope_top().map_or(0, |c| c as *const StoreCounts as usize)
+}
+
+/// Test builds: the innermost store this thread works for is the audited one.
+#[cfg(test)]
+pub(crate) fn scope_is_audited() -> bool {
+    scope_top().is_some_and(|c| c.audited.load(Ordering::Relaxed))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The stores whose work this thread is doing, innermost last (test builds).
+    /// The stores whose work this thread is doing, innermost last, as pointers into their
+    /// `StoreCounts` (each kept alive by its scope's owner: the guard's `StoreMutex`, a
+    /// `CountScope`'s caller), with the depth. A fixed array, so entering a scope allocates nothing:
+    /// a `Vec` here allocated at a thread's first lock, and the threads an open starts (its
+    /// confirmation writer, its name filter's build) then ran longer, which doubled the budgets'
+    /// recovery_open thread_new refusals (raws tn-head1..3, the names in tn-names-head.txt).
+    static SCOPE: std::cell::Cell<(usize, [usize; SCOPE_DEPTH])> = const { std::cell::Cell::new((0, [0; SCOPE_DEPTH])) };
+}
+
+#[cfg(test)]
+const SCOPE_DEPTH: usize = 16;
+
+#[cfg(test)]
+fn scope_push(counts: &Arc<StoreCounts>) {
+    SCOPE.with(|s| {
+        let (n, mut a) = s.get();
+        assert!(n < SCOPE_DEPTH, "store count scopes nested past {SCOPE_DEPTH}");
+        a[n] = Arc::as_ptr(counts) as usize;
+        s.set((n + 1, a));
+    });
+}
+
+#[cfg(test)]
+fn scope_pop() {
+    SCOPE.with(|s| {
+        let (n, a) = s.get();
+        s.set((n.saturating_sub(1), a));
+    });
+}
+
+#[cfg(test)]
+fn scope_top() -> Option<&'static StoreCounts> {
+    let (n, a) = SCOPE.with(std::cell::Cell::get);
+    // SAFETY: an entry is pushed by a scope whose owner keeps its `Arc<StoreCounts>` alive, and is
+    // popped before that owner lets it go (`StoreGuard`, `CountScope`); the reference is used only
+    // within the call that read it.
+    (n > 0).then(|| unsafe { &*(a[n - 1] as *const StoreCounts) })
+}
+
+/// Test builds: counts made in no store's scope (a coverage gap, never expected).
+#[cfg(test)]
+pub(crate) static UNSCOPED: AtomicU64 = AtomicU64::new(0);
+
+/// Test builds: this thread works for the store `counts` belongs to until the guard drops.
+#[cfg(test)]
+pub(crate) struct CountScope;
+
+#[cfg(test)]
+impl CountScope {
+    pub(crate) fn enter(counts: &Arc<StoreCounts>) -> Self {
+        scope_push(counts);
+        CountScope
+    }
+}
+
+#[cfg(test)]
+impl Drop for CountScope {
+    fn drop(&mut self) {
+        scope_pop();
+    }
+}
+
+/// Test builds: add `n` to one counter of the innermost store this thread works for.
+#[cfg(test)]
+fn count_in_scope(field: impl Fn(&StoreCounts) -> &AtomicU64, n: u64) {
+    let counted = scope_top().map(|c| field(c).fetch_add(n, Ordering::Relaxed)).is_some();
+    if !counted {
+        UNSCOPED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Test builds: a branch file's sync (`journal::fsync_file` and its kin), kind as in
+/// `StoreCounts::syncs`: the innermost store's. In no store's scope (a test syncing a bare file,
+/// or a gap), it is this thread's own (`OWN_BARE_SYNCS`) and a gap (`UNSCOPED`).
+#[cfg(test)]
+pub(crate) fn note_branch_sync(kind: usize) {
+    if scope_top().is_none() {
+        OWN_BARE_SYNCS.with(|b| b[kind].set(b[kind].get() + 1));
+    }
+    count_in_scope(|c| &c.syncs[kind], 1);
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The stores this thread opened (test builds): a test's own (`own_sync_counts`).
+    static OWN_STORES: std::cell::RefCell<Vec<Arc<StoreCounts>>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// Syncs this thread made of branch files no store owns, by kind (test builds).
+    static OWN_BARE_SYNCS: [std::cell::Cell<u64>; 4] = const { [const { std::cell::Cell::new(0) }; 4] };
+}
+
+/// Test builds: the syncs of the stores this thread opened (each store's branch files, catalog and
+/// trunk database, on any thread), plus this thread's own syncs of bare files: what a test's own work
+/// synced, never another test's (the per-store counter class, lead ruling d9cf2b609b).
+#[cfg(test)]
+pub(crate) fn own_sync_counts() -> super::SyncCounts {
+    let mut k = [0u64; 4];
+    OWN_STORES.with(|stores| {
+        for c in stores.borrow().iter() {
+            for (i, v) in k.iter_mut().enumerate() {
+                *v += c.syncs[i].load(Ordering::Relaxed);
+            }
+        }
+    });
+    OWN_BARE_SYNCS.with(|b| {
+        for (i, v) in k.iter_mut().enumerate() {
+            *v += b[i].get();
+        }
+    });
+    super::SyncCounts { fsync: k[0], full_fsync: k[1], barrier: k[2], barrier_fallback: k[3] }
+}
+
+/// Test builds: `StoreTestCounts` summed over the stores this thread opened.
+#[cfg(test)]
+pub(crate) fn own_test_counts() -> StoreTestCounts {
+    let mut t = StoreTestCounts::default();
+    OWN_STORES.with(|stores| {
+        for c in stores.borrow().iter() {
+            let get = |a: &AtomicU64| a.load(Ordering::Relaxed);
+            t.capture_entered += get(&c.capture_entered);
+            t.capture_arena_handles += get(&c.capture_arena_handles);
+            t.capture_rows_built += get(&c.capture_rows_built);
+            t.frozen_rows_written += get(&c.frozen_rows_written);
+            t.install_cuts += get(&c.install_cuts);
+            t.install_rewrites += get(&c.install_rewrites);
+            t.syncs_under_store_mutex += get(&c.syncs_under_store_mutex);
+        }
+    });
+    t
+}
+
+#[cfg(test)]
+static PATHS: std::sync::Mutex<Vec<(String, std::sync::Weak<StoreCounts>)>> = std::sync::Mutex::new(Vec::new());
+
+/// Test builds: files under `db_path` (it, and `db_path-*`) are this store's from now on.
+#[cfg(test)]
+fn register_path(db_path: &str, counts: &Arc<StoreCounts>) {
+    let mut paths = PATHS.lock().unwrap_or_else(|e| e.into_inner());
+    paths.retain(|(p, w)| p != db_path && w.strong_count() > 0);
+    // Counters review MED-3: a database opened under a live store's own files (its catalog,
+    // `<db>-branch-cat`, whose own store is nested and volatile) is not a store of its own here: its
+    // files' syncs stay the outer store's.
+    if paths.iter().any(|(p, w)| w.strong_count() > 0 && path_under(db_path, p)) {
+        return;
+    }
+    paths.push((db_path.to_string(), Arc::downgrade(counts)));
+}
+
+/// Test builds: `path` is the file at `db` or one of `db`'s own (`db` followed by `-`).
+#[cfg(test)]
+fn path_under(path: &str, db: &str) -> bool {
+    path == db || path.strip_prefix(db).is_some_and(|r| r.starts_with('-'))
+}
+
+#[cfg(test)]
+impl BranchStore {
+    /// Test builds (counters review HIGH-1): files opened by `path` as given are this store's too.
+    /// The store's own path is the real one (`Database`'s base, symlinks resolved); the database file
+    /// is opened by the path the caller gave, which on macOS differs (/var is /private/var), and its
+    /// syncs were attributed to no store.
+    pub(crate) fn register_path_alias(&self, path: &str) {
+        if !crate::is_memory_like(path) {
+            register_path(path, &self.inner.counts);
+        }
+    }
+}
+
+/// Test builds: a platform-IO file's sync (`io/unix.rs`), kind as in `StoreCounts::syncs`: the
+/// store's whose database path `path` is or begins with followed by `-`. A file no store owns (a
+/// test's own database with no branch store) is nobody's and is not a gap.
+#[cfg(test)]
+pub(crate) fn note_path_sync(path: &str, kind: usize) {
+    let paths = PATHS.lock().unwrap_or_else(|e| e.into_inner());
+    // Counters review MED-4: the LONGEST live registered path the file is under (`d.db-2-wal` is
+    // `d.db-2`'s, not `d.db`'s), skipping dead entries rather than stopping at them.
+    let owner = paths
+        .iter()
+        .filter(|(p, _)| path_under(path, p))
+        .filter_map(|(p, w)| w.upgrade().map(|c| (p.len(), c)))
+        .max_by_key(|(len, _)| *len);
+    match owner {
+        Some((_, c)) => {
+            c.syncs[kind].fetch_add(1, Ordering::Relaxed);
+        }
+        // HIGH-2: a sync no store owns is a gap the guard counts (`UNSCOPED`), not a silence.
+        None => {
+            UNSCOPED.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -1415,7 +2135,7 @@ struct CatState {
     /// Branches whose catalog rows are stale, and which of their rows (`DIRTY_*`): at the next
     /// checkpoint only those are rewritten (fix v3, PREREG A9: a commit rewrites the branch's `cur`
     /// rows and never its `branch` row, so its secondary indexes are not touched).
-    dirty: HashMap<BranchId, u8>,
+    dirty: BTreeMap<BranchId, u8>,
     /// Branches removed since the last checkpoint: deleted from the catalog at the next one, and
     /// never loaded from it again.
     removed: HashSet<BranchId>,
@@ -1539,8 +2259,6 @@ fn expire_batch() -> usize {
     })
 }
 
-/// F-FZ: fuzzy-checkpoint threads kept unjoined before the oldest is joined.
-const FLIGHTS_KEPT: usize = 64;
 
 /// How long a fork's creator, or an open of a new branch, waits for the trunk commit it forks after
 /// to be published before it is `Busy` (`BranchStore::wait_trunk_commit_published`).
@@ -1620,6 +2338,27 @@ pub(crate) const HOLD_DROP_LOOKED_UP: u8 = 11;
 /// review 14 MED 9: a drop that lands in between).
 #[cfg(test)]
 pub(crate) const HOLD_CONNECT_LOOKED_UP: u8 = 12;
+
+/// fastest-engine (test hook `checkpoint_hold`): a fuzzy checkpoint's phase 4 waits here, its
+/// catalog WAL's PASSIVE backfill done and its TRUNCATE not begun (engine review 21 MED 5).
+#[cfg(test)]
+pub(crate) const HOLD_AFTER_WAL_PASSIVE: u8 = 14;
+
+/// fastest-engine (test hook `checkpoint_hold`): a raised D0 store's fuzzy checkpoint waits here,
+/// what its capture covers written and its arena not yet settled (`settle_arena`; engine review 21
+/// MED 8: a trunk commit that decides in this window writes a slot the settle then takes).
+#[cfg(test)]
+pub(crate) const HOLD_BEFORE_SETTLE: u8 = 15;
+/// A fuzzy checkpoint's writer, held before it encodes the rows its capture froze (L2(d)): every
+/// change to a frozen state meanwhile goes through the table's copy-on-write.
+#[cfg(test)]
+pub(crate) const HOLD_BEFORE_ROWS: u8 = 21;
+/// Test builds: compare every fuzzy checkpoint's copy-on-write rows with the capture's own
+/// (`verify_frozen_rows`), as `FE_CAPTURE_VERIFY` does for a whole run; and the differences found.
+#[cfg(test)]
+pub(crate) static CAPTURE_VERIFY_FORCED: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+pub(crate) static CAPTURE_VERIFY_FAILURES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 /// Test builds: the next fuzzy checkpoint's cut (`begin_cut`) panics (review 4 #16).
 #[cfg(test)]
 pub(crate) static CUT_PANICS: AtomicBool = AtomicBool::new(false);
@@ -1660,11 +2399,17 @@ const PENDING_FULL_WAIT: Duration = Duration::from_millis(100);
 #[cfg(test)]
 pub(crate) static PENDING_FULL_WAIT_MS: AtomicU64 = AtomicU64::new(0);
 
-/// Test builds: how long the group must stay idle before the confirmation word of its last flight
-/// is written, in milliseconds when set (0: the default), so a test can hold the word back or have
-/// it written at once (review 6 #1).
-#[cfg(test)]
+/// Test builds, and builds with the default-off `measure-word-hold` feature: how long the group must
+/// stay idle before the confirmation word of its last flight is written, in milliseconds when set
+/// (0: the default), so a test or a measuring binary can hold the word back or have it written at
+/// once (review 6 #1; `super::measure_word_hold`).
+#[cfg(any(test, feature = "measure-word-hold"))]
 pub(crate) static CONFIRM_QUIET_MS: AtomicU64 = AtomicU64::new(0);
+
+/// The quiet period that holds the word for good (the budget tests' `CONFIRM_HELD_MS`): woken by
+/// the first landing only, then asleep with the word pending.
+#[cfg(any(test, feature = "measure-word-hold"))]
+pub(crate) const CONFIRM_HELD_MS: u64 = 1 << 40;
 
 fn pending_full_wait() -> Duration {
     #[cfg(test)]
@@ -1722,7 +2467,7 @@ impl CatState {
             flight: false,
             ckpt: CkptCounters::default(),
             catalog,
-            dirty: HashMap::new(),
+            dirty: BTreeMap::new(),
             removed: HashSet::new(),
             trunk_known: HashSet::new(),
             trunk_cache: HashMap::new(),
@@ -2003,19 +2748,220 @@ struct BranchState {
 /// masks with `gone` the catalog rows of names released since (deleted at the next); every other
 /// name is read from the catalog's `branch_name` table.
 ///
-/// A checkpoint's capture COPIES `fresh` and `gone`, and its install removes only the entries that
-/// are unchanged since (review C-F1, C-F2): until the catalog holds what the capture wrote, the
-/// index still masks and still names what it did, and a capture that is never written (a write
-/// that failed, a thread that did not start) leaves nothing to restore.
+/// A checkpoint's capture FREEZES `fresh` and `gone` (L2(d), O(1) under the mutex: before, it
+/// copied them, 3,115 of a create's 6,288 held allocations when the create started a checkpoint,
+/// raw l90): both are swapped into `frozen` and start empty. Until the catalog holds what the
+/// capture wrote, the index still masks and still names what it did (review C-F1, C-F2): a lookup
+/// reads `gone` and then the frozen `gone`, and the name filter's build seeds `fresh` and the frozen
+/// `fresh`. The install drops `frozen` (its memory freed after the store mutex); a write that failed
+/// merges it back, each entry that nothing since has moved (a name released since is in `gone`, a
+/// frozen fresh name kept only while its branch still holds it).
+///
+/// Ordered maps, not hash maps (L2 slope, budget create_allocates_no_table_of_every_branch_under_the_store_mutex:
+/// a named create rehashed `map`, 65,536 buckets of (Arc<str>, BranchId), 1,638,591 bytes under the
+/// store mutex at 33k branches): a B-tree grows a node at a time and never moves every name.
 #[derive(Default)]
 struct NameIndex {
-    map: HashMap<Arc<str>, BranchId>,
+    map: BTreeMap<Arc<str>, BranchId>,
     filter: NameFilter,
-    fresh: HashMap<Arc<str>, BranchId>,
+    fresh: BTreeMap<Arc<str>, BranchId>,
     /// Each released name, with the release count at its release: an install drops it only if no
     /// later release of the same name moved it.
-    gone: HashMap<Arc<str>, u64>,
+    gone: BTreeMap<Arc<str>, u64>,
     releases: u64,
+    /// The `fresh` and `gone` a capture froze, until its install (see above).
+    frozen: Option<Arc<FrozenNames>>,
+    /// A frozen generation the install let go of, dropped by the install's caller after the store
+    /// mutex (`take_retired_names`), so its maps are freed with no lock held.
+    retired: Option<Arc<FrozenNames>>,
+}
+
+impl NameIndex {
+    /// A capture that is not written (its write failed, or its thread did not start): the frozen
+    /// names go back for the next checkpoint, each entry nothing since has moved: a frozen fresh name
+    /// only while its branch still holds it (released since, it is in `gone` now), a frozen gone name
+    /// unless a later release replaced it. Mutant `frozen_names_dropped_on_failure` (test builds
+    /// only): not merged back.
+    fn unfreeze(&mut self) {
+        let Some(frozen) = self.frozen.take() else {
+            return;
+        };
+        if !fe_mutant("frozen_names_dropped_on_failure") {
+            for (name, id) in &frozen.fresh {
+                if self.map.get(name) == Some(id) && !self.fresh.contains_key(name) {
+                    self.fresh.insert(name.clone(), *id);
+                }
+            }
+            for (name, release) in &frozen.gone {
+                self.gone.entry(name.clone()).or_insert(*release);
+            }
+        }
+        self.retired = Some(frozen);
+    }
+}
+
+/// The names a checkpoint's capture froze (`NameIndex::frozen`): created and released since the
+/// checkpoint before it, written by this one.
+#[derive(Default)]
+struct FrozenNames {
+    fresh: BTreeMap<Arc<str>, BranchId>,
+    gone: BTreeMap<Arc<str>, u64>,
+}
+
+/// Test builds: allocations made inside `NameFilter::note`, by any store (lead ruling 2026-10-15:
+/// a create allocates nothing under the store mutex by construction; the filter's B-tree split a
+/// node in 37-39 of 40 creates, raws l35-diag-alloc).
+#[cfg(test)]
+pub(crate) static FILTER_NOTE_ALLOCS: AtomicU64 = AtomicU64::new(0);
+/// Test builds (budgets-rev-242345 MED-7): the next note into a `Ready` filter owes a growth, past
+/// half full or not (taken by that note).
+#[cfg(test)]
+pub(crate) static FILTER_GROW_NEXT: AtomicBool = AtomicBool::new(false);
+
+/// Test hooks for the name filter's growth (review REVIEW-claude-namefilter H1): the growth's drain
+/// copy fails (`FILTER_DRAIN_FAILS`), and the growth thread pauses at stage `FILTER_PAUSE_AT`
+/// (`FILTER_PAUSED` reads the stage it waits at) until the stage is changed: 3 before the swap, 5
+/// after the drain copy, before its install. A build's thread pauses at 7 in `Building` (before its
+/// scan) and at 6 in `Draining` (before its pending copy; review REVIEW-claude-namefilter-2 MED-3).
+#[cfg(test)]
+pub(crate) static FILTER_DRAIN_FAILS: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+pub(crate) static FILTER_PAUSE_AT: AtomicU8 = AtomicU8::new(0);
+#[cfg(test)]
+pub(crate) static FILTER_PAUSED: AtomicU8 = AtomicU8::new(0);
+
+/// Test builds: the name-filter threads alive now (a build, a growth), counted on the thread from
+/// its first statement to its last (`FilterThreadLive`; review REVIEW-claude-namefilter-2 MED-1: a
+/// thread a close does not join outlives it).
+#[cfg(test)]
+pub(crate) static FILTER_THREADS_LIVE: AtomicU64 = AtomicU64::new(0);
+
+/// One live name-filter thread (`FILTER_THREADS_LIVE`), counted while it is held.
+struct FilterThreadLive;
+
+impl FilterThreadLive {
+    fn enter() -> Self {
+        #[cfg(test)]
+        FILTER_THREADS_LIVE.fetch_add(1, Ordering::AcqRel);
+        FilterThreadLive
+    }
+}
+
+impl Drop for FilterThreadLive {
+    fn drop(&mut self) {
+        #[cfg(test)]
+        FILTER_THREADS_LIVE.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn filter_pause(stage: u8) {
+    #[cfg(test)]
+    if FILTER_PAUSE_AT.load(Ordering::Acquire) == stage {
+        FILTER_PAUSED.store(stage, Ordering::Release);
+        while FILTER_PAUSE_AT.load(Ordering::Acquire) == stage {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+    #[cfg(not(test))]
+    let _ = stage;
+}
+
+fn filter_drain_fails() -> bool {
+    #[cfg(test)]
+    return FILTER_DRAIN_FAILS.load(Ordering::Acquire);
+    #[cfg(not(test))]
+    false
+}
+
+/// A fixed-capacity set of nonzero `u64` keys (open addressing, linear probing): the name filter's
+/// table (lead ruling 2026-10-15). Its slots are allocated once, at construction, so an insert never
+/// allocates; a full table refuses instead of growing, and the filter grows by copying into a
+/// larger table OFF the store mutex (`BranchStore::grow_name_filter`). The slots are atomics so that
+/// copy can read a table the store keeps inserting into under its mutex; an insert claims a slot
+/// with a compare-and-swap, so two inserters (the store, and a copy into a table already
+/// installed) never lose a key. Nothing is ever removed.
+struct FilterTable {
+    slots: Box<[AtomicU64]>,
+    len: AtomicUsize,
+}
+
+impl FilterTable {
+    /// Room for `n` keys at most half full: at least 2n slots, a power of two, at least 1024.
+    fn for_keys(n: usize) -> Self {
+        let cap = n.saturating_mul(2).max(1024).next_power_of_two();
+        Self {
+            slots: (0..cap).map(|_| AtomicU64::new(0)).collect(),
+            len: AtomicUsize::new(0),
+        }
+    }
+
+    fn cap(&self) -> usize {
+        self.slots.len()
+    }
+
+    fn len(&self) -> usize {
+        self.len.load(Ordering::Acquire)
+    }
+
+    /// Past half full: the filter owes a growth.
+    fn wants_room(&self) -> bool {
+        self.len() * 2 > self.cap()
+    }
+
+    /// 0 marks an empty slot, so a hash of 0 is stored as 1 (one more collision, which costs a
+    /// catalog query, as any does).
+    fn key(h: u64) -> u64 {
+        h.max(1)
+    }
+
+    /// Insert `h`; `false` if the table is full: a probe that meets a taken slot once 7/8 of the
+    /// slots are taken refuses (so a probe is bounded). Allocates nothing.
+    fn insert(&self, h: u64) -> bool {
+        // Linux finding (b): one unit of work, so a fill of this table under the store mutex is
+        // counted per hold (`budget_probe::note_held_work`).
+        #[cfg(test)]
+        super::budget_probe::note_held_work(1);
+        let k = Self::key(h);
+        let mask = self.cap() - 1;
+        let mut i = (k as usize) & mask;
+        loop {
+            match self.slots[i].compare_exchange(0, k, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => {
+                    self.len.fetch_add(1, Ordering::AcqRel);
+                    return true;
+                }
+                Err(v) if v == k => return true,
+                Err(_) => {}
+            }
+            if self.len() >= self.cap() / 8 * 7 {
+                return false;
+            }
+            i = (i + 1) & mask;
+        }
+    }
+
+    fn contains(&self, h: u64) -> bool {
+        let k = Self::key(h);
+        let mask = self.cap() - 1;
+        let mut i = (k as usize) & mask;
+        for _ in 0..self.cap() {
+            match self.slots[i].load(Ordering::Acquire) {
+                0 => return false,
+                v if v == k => return true,
+                _ => i = (i + 1) & mask,
+            }
+        }
+        false
+    }
+
+    /// Every key of this table into `to`; `false` if `to` filled. A key inserted here meanwhile
+    /// may be missed: the caller's pending table holds those.
+    fn copy_into(&self, to: &FilterTable) -> bool {
+        self.slots.iter().all(|s| match s.load(Ordering::Acquire) {
+            0 => true,
+            k => to.insert(k),
+        })
+    }
 }
 
 /// A catalog store's name filter (lead review 1 item 2): a keyed hash of every name the store ever
@@ -2023,19 +2969,85 @@ struct NameIndex {
 /// catalog query under the store mutex. Insert-only: a released name stays in it, and costs one
 /// query if it is ever looked up again; a hash collision costs the same. Built off the mutex after
 /// open from the catalog's names (`BranchStore::start_name_filter`) plus every name applied while
-/// the build ran (`pending`); until then, lookups query the catalog as before. Empty and built at
-/// once for a store with no catalog yet.
+/// the build ran; until then, lookups query the catalog as before. Empty and built at once for a
+/// store with no catalog yet.
+///
+/// A create allocates NOTHING here, by construction (lead ruling 2026-10-15; before, a B-tree bulk-
+/// built with full leaves split a node in 37-39 of 40 creates, raws l35-diag-alloc): the tables are
+/// fixed-size (`FilterTable`), a note fills a slot, and a table past half full owes a growth, which
+/// `BranchStore::grow_name_filter` makes off the mutex into a table twice the size.
+///
+/// ONE state (`FilterState`, review REVIEW-claude-namefilter H1, DECISIONS: the class of a half-
+/// updated filter): the tables, and what a note and a lookup do with them, are a single value,
+/// replaced only by one assignment inside one store-mutex hold, and the filter answers "absent" ONLY
+/// in `Ready`. Before, `built`, `pending`, `draining` and `overflowed` were four fields set in
+/// separate holds, and between two of them a lookup read "absent" for a name only a draining table
+/// held. A growth or a build that comes back to a state other than the one it left (an overflow
+/// meanwhile) changes nothing (`Arc::ptr_eq`).
 #[derive(Default)]
 struct NameFilter {
     hasher: std::collections::hash_map::RandomState,
-    built: Option<HashSet<u64, BuildIdHasher>>,
-    pending: Option<HashSet<u64, BuildIdHasher>>,
-    /// Observation (review 3 #7): the most entries one insert moved (a resize), builds installed,
-    /// and catalog scans that failed.
+    state: FilterState,
+    /// Work the next create's caller starts once it has dropped the mutex: a growth (owed in
+    /// `Ready` past half full) or a rebuild (owed once, on entering `Overflowed`).
+    owed: Option<FilterWork>,
+    /// Observation (review 3 #7): the most entries one growth copied (off the mutex, on the
+    /// growth's thread), builds and growths installed, catalog scans that failed, and rebuilds
+    /// started after an overflow.
     moved_max: u64,
+    /// The most entries one note moved, inside the store mutex hold that noted it (review
+    /// REVIEW-claude-namefilter-2 LOW: `moved_max` became the growth's off-mutex copy, so the churn
+    /// claim needed its own counter). 0 by construction; the mutant `name_filter_grows_in_note`
+    /// moves every entry.
+    held_moved_max: u64,
+    /// The names a branch holds, an upper bound (review 3 #7 (a), churn): set to the entries of a
+    /// table a build installs, one more per note, one fewer per release. A table past half full
+    /// with fewer than a quarter of its entries held is rebuilt from the catalog, which holds only
+    /// the names held, rather than grown (`shrinks`): no table keeps every name ever held.
+    live: u64,
+    shrinks: u64,
     builds: u64,
     failed_scans: u64,
+    rebuilds: u64,
 }
+
+/// The name filter's one state (`NameFilter`).
+#[derive(Default)]
+enum FilterState {
+    /// No table: lookups ask the catalog (not built yet, or a failed scan).
+    #[default]
+    Unbuilt,
+    /// The catalog scan of a build runs off the mutex; names noted meanwhile go into `pending`.
+    Building { pending: Arc<FilterTable> },
+    /// The filter answers from `table`.
+    Ready { table: Arc<FilterTable> },
+    /// A growth copies `table` into a larger one off the mutex; notes go into both.
+    Growing { table: Arc<FilterTable>, pending: Arc<FilterTable> },
+    /// A new `table` is installed and `pending` (a build's or a growth's) is being copied into it;
+    /// notes go into `table`.
+    Draining { table: Arc<FilterTable>, pending: Arc<FilterTable> },
+    /// A table refused a key: lookups ask the catalog until the owed rebuild lands.
+    Overflowed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FilterWork {
+    Grow,
+    Rebuild,
+}
+
+/// How one attempt of a name filter's build ended (`BranchStore::build_name_filter`): `Failed` is
+/// retried with backoff, `Ended` (built, overflowed into an owed rebuild, or a state another thread
+/// moved) is not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FilterBuild {
+    Ended,
+    Failed,
+}
+
+/// The attempts a name filter's build makes before it leaves lookups to the catalog: 4 ms doubling
+/// to 1 s between them, about 6 s in all.
+const FILTER_BUILD_ATTEMPTS: u32 = 12;
 
 impl NameFilter {
     fn hash(&self, name: &str) -> u64 {
@@ -2045,50 +3057,110 @@ impl NameFilter {
 
     /// `name` is held by a branch from now on.
     fn note(&mut self, name: &str) {
-        if self.built.is_none() && self.pending.is_none() {
-            return;
-        }
+        #[cfg(test)]
+        let allocs0 = super::budget_probe::thread_allocs().0;
+        self.note_inner(name);
+        #[cfg(test)]
+        FILTER_NOTE_ALLOCS.fetch_add(super::budget_probe::thread_allocs().0 - allocs0, Ordering::Relaxed);
+    }
+
+    fn note_inner(&mut self, name: &str) {
         let h = self.hash(name);
-        if let Some(built) = self.built.as_mut() {
-            if built.len() == built.capacity() {
-                self.moved_max = self.moved_max.max(built.len() as u64);
+        self.live = self.live.saturating_add(1);
+        // Mutant `name_filter_grows_in_note` (test builds only): a table past half full is grown
+        // here, under the store mutex, as a resizing set would.
+        if fe_mutant("name_filter_grows_in_note") {
+            if let FilterState::Ready { table } = &self.state {
+                if table.wants_room() {
+                    let grown = FilterTable::for_keys(table.len() * 2);
+                    table.copy_into(&grown);
+                    self.held_moved_max = self.held_moved_max.max(table.len() as u64);
+                    self.state = FilterState::Ready { table: Arc::new(grown) };
+                }
             }
-            built.insert(h);
         }
-        if let Some(pending) = self.pending.as_mut() {
-            pending.insert(h);
+        let fits = match &self.state {
+            FilterState::Unbuilt | FilterState::Overflowed => true,
+            FilterState::Building { pending } => pending.insert(h),
+            FilterState::Ready { table } => {
+                let fits = table.insert(h);
+                let wants_room = table.wants_room();
+                // Test builds (budgets-rev-242345 MED-7): `FILTER_GROW_NEXT` makes the next note owe a
+                // growth whatever the fill, so the budget suite runs one at a chosen size.
+                #[cfg(test)]
+                let wants_room = wants_room || FILTER_GROW_NEXT.swap(false, Ordering::AcqRel);
+                if fits && wants_room && self.owed.is_none() {
+                    // Mutant `name_filter_never_shrinks` (test builds only): always grown.
+                    if self.live.saturating_mul(4) < table.len() as u64 && !fe_mutant("name_filter_never_shrinks") {
+                        self.live = self.live.saturating_add(1);
+                        self.shrinks += 1;
+                        self.overflow();
+                        return;
+                    }
+                    self.owed = Some(FilterWork::Grow);
+                }
+                fits
+            }
+            // Both, whatever the first answers.
+            FilterState::Growing { table, pending } => table.insert(h) & pending.insert(h),
+            FilterState::Draining { table, .. } => table.insert(h),
+        };
+        if !fits {
+            self.overflow();
         }
     }
 
-    /// No branch ever held `name` (`false` while the filter is not built: ask the catalog).
+    /// A held name was released (`live`). The table keeps its key: a filter only ever answers
+    /// "maybe held" for it, which asks the catalog.
+    fn released(&mut self) {
+        self.live = self.live.saturating_sub(1);
+    }
+
+    /// A table refused a key: stop answering, and owe one rebuild (never a growth per create).
+    fn overflow(&mut self) {
+        self.state = FilterState::Overflowed;
+        self.owed = Some(FilterWork::Rebuild);
+    }
+
+    /// The work owed, taken by the caller, which starts it once it has dropped the mutex.
+    fn take_owed(&mut self) -> Option<FilterWork> {
+        self.owed.take()
+    }
+
+    /// No branch ever held `name`: answered only in `Ready`; every other state asks the catalog.
     fn says_absent(&self, name: &str) -> bool {
-        // fastest-engine mutant `filter_says_absent` (test builds only).
+        // fastest-engine mutant `filter_says_absent` (test builds only): "absent" whenever a table
+        // exists.
         if fe_mutant("filter_says_absent") {
-            return self.built.is_some();
+            return !matches!(self.state, FilterState::Unbuilt | FilterState::Overflowed);
         }
-        self.built.as_ref().is_some_and(|built| !built.contains(&self.hash(name)))
+        match &self.state {
+            FilterState::Ready { table } => !table.contains(self.hash(name)),
+            FilterState::Unbuilt
+            | FilterState::Building { .. }
+            | FilterState::Growing { .. }
+            | FilterState::Draining { .. }
+            | FilterState::Overflowed => false,
+        }
+    }
+
+    /// The table a lookup will answer from once the filter is `Ready`, and the pending one in use.
+    fn tables(&self) -> (Option<&Arc<FilterTable>>, Option<&Arc<FilterTable>>) {
+        match &self.state {
+            FilterState::Unbuilt | FilterState::Overflowed => (None, None),
+            FilterState::Building { pending } => (None, Some(pending)),
+            FilterState::Ready { table } => (Some(table), None),
+            FilterState::Growing { table, pending } | FilterState::Draining { table, pending } => {
+                (Some(table), Some(pending))
+            }
+        }
+    }
+
+    fn entries(&self) -> u64 {
+        self.tables().0.map_or(0, |t| t.len() as u64)
     }
 }
 
-/// The name filter's keys are keyed hashes already: hashed again as themselves.
-#[derive(Default, Clone, Copy)]
-struct IdHasher(u64);
-
-impl std::hash::Hasher for IdHasher {
-    fn finish(&self) -> u64 {
-        self.0
-    }
-    fn write(&mut self, bytes: &[u8]) {
-        for &b in bytes {
-            self.0 = self.0.rotate_left(8) ^ u64::from(b);
-        }
-    }
-    fn write_u64(&mut self, v: u64) {
-        self.0 = v;
-    }
-}
-
-type BuildIdHasher = std::hash::BuildHasherDefault<IdHasher>;
 
 /// The names a branch may have: 1 to 255 bytes, no NUL (fastest-engine M1 item 4). A server's
 /// connection syntax may narrow this; the store refuses nothing narrower.
@@ -2196,11 +3268,80 @@ struct ChildIndex {
     /// (parent, fork epoch) -> (nearest live sibling below, above) when it was removed. Ordered, so
     /// that a spliced-out parent's links are one range (`relink`).
     removed: BTreeMap<(u64, u64), (Option<u64>, Option<u64>)>,
+    /// What a checkpoint's capture froze of `map` and `removed` (L2(d), O(1): swapped in, not
+    /// copied; 262 KB copied at 16k children since the last checkpoint, raw l104). Every query
+    /// reads both generations until the install, which drops the frozen one (its keys are catalog
+    /// rows then, and its links' rows are deleted); a capture that is not written merges it back.
+    frozen: BTreeMap<(u64, u64), BranchId>,
+    frozen_removed: BTreeMap<(u64, u64), (Option<u64>, Option<u64>)>,
+    /// The frozen generation an install let go of, freed after the store mutex.
+    retired: Option<(BTreeMap<(u64, u64), BranchId>, BTreeMap<(u64, u64), (Option<u64>, Option<u64>)>)>,
 }
 
 impl ChildIndex {
     fn insert(&mut self, parent: BranchId, f: u64, child: BranchId) {
         self.map.insert((parent.0, f), child);
+    }
+
+    /// A capture: the live generation becomes the frozen one (O(1)). One flight at a time, so
+    /// nothing is frozen already; if something were, it is merged into the new frozen generation
+    /// rather than lost.
+    fn freeze(&mut self) {
+        let mut map = std::mem::take(&mut self.map);
+        let mut removed = std::mem::take(&mut self.removed);
+        if !self.frozen.is_empty() || !self.frozen_removed.is_empty() {
+            map.append(&mut self.frozen);
+            removed.append(&mut self.frozen_removed);
+        }
+        self.frozen = map;
+        self.frozen_removed = removed;
+    }
+
+    /// The install: the catalog holds the frozen generation now; it is let go of, freed later
+    /// (`take_retired`).
+    fn retire_frozen(&mut self) {
+        let map = std::mem::take(&mut self.frozen);
+        let removed = std::mem::take(&mut self.frozen_removed);
+        self.retired = Some((map, removed));
+    }
+
+    /// A capture that is not written: the frozen generation goes back into the live one (an entry
+    /// added since wins; the epochs are never reused, so no key is in both).
+    fn unfreeze(&mut self) {
+        let mut map = std::mem::take(&mut self.frozen);
+        let mut removed = std::mem::take(&mut self.frozen_removed);
+        map.append(&mut self.map);
+        removed.append(&mut self.removed);
+        self.map = map;
+        self.removed = removed;
+    }
+
+    fn take_retired(&mut self) -> Option<impl Drop> {
+        self.retired.take().map(Box::new)
+    }
+
+    fn contains(&self, k: &(u64, u64)) -> bool {
+        self.map.contains_key(k) || self.frozen.contains_key(k)
+    }
+
+    fn link(&self, k: &(u64, u64)) -> Option<(Option<u64>, Option<u64>)> {
+        self.removed.get(k).or_else(|| self.frozen_removed.get(k)).copied()
+    }
+
+    /// The greatest in-memory key of `p` in `range`, over both generations (and the least).
+    fn mem_last(&self, p: u64, from: u64, to_excl: u64) -> Option<u64> {
+        let a = self.map.range((p, from)..(p, to_excl)).next_back().map(|(&(_, e), _)| e);
+        let b = self.frozen.range((p, from)..(p, to_excl)).next_back().map(|(&(_, e), _)| e);
+        a.max(b)
+    }
+
+    fn mem_first(&self, p: u64, from: u64, to_incl: u64) -> Option<u64> {
+        let a = self.map.range((p, from)..=(p, to_incl)).next().map(|(&(_, e), _)| e);
+        let b = self.frozen.range((p, from)..=(p, to_incl)).next().map(|(&(_, e), _)| e);
+        match (a, b) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
     }
 
     /// Remove the child `parent` forked at `f`, and return its nearest live siblings below and
@@ -2213,7 +3354,7 @@ impl ChildIndex {
         f: u64,
         catalog: bool,
     ) -> Result<(bool, Option<u64>, Option<u64>)> {
-        let listed = self.map.remove(&(parent.0, f)).is_some();
+        let listed = self.map.remove(&(parent.0, f)).is_some() | self.frozen.remove(&(parent.0, f)).is_some();
         if !catalog {
             // An eager store holds every child in `map`: no links are needed, or kept.
             if !listed {
@@ -2222,7 +3363,7 @@ impl ChildIndex {
             return Ok((true, self.below(None, parent, f)?, self.above(None, parent, f)?));
         }
         // Mark it removed before looking for its neighbours, so neither lookup returns it.
-        let fresh = self.removed.insert((parent.0, f), (None, None)).is_none();
+        let fresh = self.removed.insert((parent.0, f), (None, None)).is_none() && !self.frozen_removed.contains_key(&(parent.0, f));
         let lo = self.below(cat.as_deref_mut(), parent, f)?;
         let hi = self.above(cat, parent, f)?;
         self.removed.insert((parent.0, f), (lo, hi));
@@ -2232,9 +3373,9 @@ impl ChildIndex {
     /// Follow the removal links from `e` downward (or upward) to a live child.
     fn resolve(&self, p: u64, mut e: Option<u64>, down: bool) -> Option<u64> {
         while let Some(x) = e {
-            match self.removed.get(&(p, x)) {
+            match self.link(&(p, x)) {
                 None => return Some(x),
-                Some(&(lo, hi)) => e = if down { lo } else { hi },
+                Some((lo, hi)) => e = if down { lo } else { hi },
             }
         }
         None
@@ -2243,7 +3384,7 @@ impl ChildIndex {
     /// The nearest live child of `p` below `f`.
     fn below(&self, cat: Option<&mut Catalog>, parent: BranchId, f: u64) -> Result<Option<u64>> {
         let p = parent.0;
-        let mem = self.map.range((p, 0)..(p, f)).next_back().map(|(&(_, e), _)| e);
+        let mem = self.mem_last(p, 0, f);
         let Some(cat) = cat else {
             return Ok(mem);
         };
@@ -2254,11 +3395,7 @@ impl ChildIndex {
     /// The nearest live child of `p` above `f`.
     fn above(&self, cat: Option<&mut Catalog>, parent: BranchId, f: u64) -> Result<Option<u64>> {
         let p = parent.0;
-        let mem = self
-            .map
-            .range((p, f.saturating_add(1))..=(p, u64::MAX))
-            .next()
-            .map(|(&(_, e), _)| e);
+        let mem = if f == u64::MAX { None } else { self.mem_first(p, f + 1, u64::MAX) };
         let Some(cat) = cat else {
             return Ok(mem);
         };
@@ -2274,7 +3411,7 @@ impl ChildIndex {
     /// one copy remains.)
     fn lowest(&self, cat: Option<&mut Catalog>, parent: BranchId) -> Result<Option<u64>> {
         let p = parent.0;
-        let mem = self.map.range((p, 0)..=(p, u64::MAX)).next().map(|(&(_, e), _)| e);
+        let mem = self.mem_first(p, 0, u64::MAX);
         let Some(cat) = cat else {
             return Ok(mem);
         };
@@ -2289,11 +3426,11 @@ impl ChildIndex {
     /// the last checkpoint re-keyed it here, while the catalog still lists the spliced-out parent
     /// under this key until that checkpoint), else the catalog's.
     fn child_at(&self, cat: Option<&mut Catalog>, parent: BranchId, f: u64) -> Result<Option<BranchId>> {
-        if let Some(&id) = self.map.get(&(parent.0, f)) {
+        if let Some(&id) = self.map.get(&(parent.0, f)).or_else(|| self.frozen.get(&(parent.0, f))) {
             return Ok(Some(id));
         }
         match cat {
-            Some(cat) if !self.removed.contains_key(&(parent.0, f)) => {
+            Some(cat) if self.link(&(parent.0, f)).is_none() => {
                 Ok(cat.child_at(parent.0, f)?.map(BranchId))
             }
             _ => Ok(None),
@@ -2306,17 +3443,16 @@ impl ChildIndex {
     /// since no query names it as a parent again.
     fn relink(&mut self, zombie: BranchId, f: u64, parent: BranchId, zf: u64, child: BranchId) {
         self.map.remove(&(zombie.0, f));
+        self.frozen.remove(&(zombie.0, f));
         self.map.insert((parent.0, zf), child);
-        let links: Vec<(u64, u64)> = self
-            .removed
-            .range((zombie.0, 0)..=(zombie.0, u64::MAX))
-            .map(|(&k, _)| k)
-            .collect();
-        for k in links {
-            self.removed.remove(&k);
+        for links in [&mut self.removed, &mut self.frozen_removed] {
+            let keys: Vec<(u64, u64)> = links.range((zombie.0, 0)..=(zombie.0, u64::MAX)).map(|(&k, _)| k).collect();
+            for k in keys {
+                links.remove(&k);
+            }
         }
         crate::turso_assert!(
-            !self.removed.contains_key(&(parent.0, zf)),
+            self.link(&(parent.0, zf)).is_none(),
             "a removal link names the key a spliced child now holds"
         );
     }
@@ -2328,7 +3464,7 @@ impl ChildIndex {
             return Ok(false);
         }
         let p = parent.0;
-        if self.map.range((p, from)..(p, to)).next().is_some() {
+        if self.map.range((p, from)..(p, to)).next().is_some() || self.frozen.range((p, from)..(p, to)).next().is_some() {
             return Ok(true);
         }
         let Some(cat) = cat else {
@@ -2516,30 +3652,77 @@ impl Lineage {
 
 /// The catalog rows of the dirty branches a capture writes (`checkpoint_capture_mode`): each
 /// resident branch's row, current page map and retained versions, with what changed in it.
-fn capture_rows(branches: &BranchTable<BranchState>, dirty: &HashMap<BranchId, u8>) -> Vec<(CatBranch, u8)> {
+/// A branch state's catalog row (`capture_rows`, and L2(d)'s copy-on-write pre-image).
+fn row_of(id: BranchId, st: &BranchState) -> CatBranch {
+    CatBranch {
+        id: id.0,
+        parent: st.parent.0,
+        fork_epoch: st.fork_epoch,
+        epoch: st.lineage.epoch,
+        released: st.handle == Handle::Released,
+        held_open: st.handle == Handle::Released && st.open,
+        lease: if st.handle == Handle::Released { None } else { st.lease },
+        n_children: st.lineage.n_children,
+        current: st
+            .current
+            .iter()
+            .map(|(&page, o)| (page, o.slot, o.born, o.crc))
+            .collect(),
+        retained: st.lineage.retained_list(),
+        name: None,
+    }
+}
+
+impl super::table::Preimage for BranchState {
+    type Row = CatBranch;
+    fn preimage(&self, id: BranchId) -> CatBranch {
+        row_of(id, self)
+    }
+}
+
+/// Test builds (`FE_CAPTURE_VERIFY`): the rows the copy-on-write gave the writer equal the rows
+/// the capture would have built, the old way, at the capture point. A mutation path that changed a
+/// frozen state without the table's preserve makes them differ: a panic naming the branch.
+#[cfg(test)]
+fn verify_frozen_rows(want: Vec<(CatBranch, u8)>, got: &[(CatBranch, u8)]) -> std::result::Result<(), String> {
+    let norm = |rows: &[(CatBranch, u8)]| {
+        let mut v: Vec<_> = rows
+            .iter()
+            .map(|(b, w)| {
+                let mut b = b.clone();
+                b.current.sort_unstable();
+                b.retained.sort_unstable();
+                (b.id, format!("{b:?}"), *w)
+            })
+            .collect();
+        v.sort();
+        v
+    };
+    let (want, got) = (norm(&want), norm(got));
+    if want != got {
+        let diff: Vec<_> = want.iter().zip(got.iter()).filter(|(a, b)| a != b).take(3).collect();
+        return Err(format!(
+            "FE_CAPTURE_VERIFY: the frozen rows differ from the capture's ({} vs {} rows); first differences: {diff:?}",
+            want.len(),
+            got.len()
+        ));
+    }
+    Ok(())
+}
+
+/// Rows a fuzzy checkpoint's writer encodes per store-mutex hold (L2(d), ASYNC-DESIGN R1.3's
+/// CKPT_BATCH): its rows are encoded in batches, each hold O(64 rows).
+const CKPT_BATCH: usize = 64;
+
+fn capture_rows(branches: &BranchTable<BranchState>, dirty: &BTreeMap<BranchId, u8>) -> Vec<(CatBranch, u8)> {
     let rows: Vec<(CatBranch, u8)> = dirty
         .iter()
-        .filter_map(|(id, &what)| branches.get(id).map(|st| (id, st, what)))
-        .map(|(&id, st, what)| (CatBranch {
-            id: id.0,
-            parent: st.parent.0,
-            fork_epoch: st.fork_epoch,
-            epoch: st.lineage.epoch,
-            released: st.handle == Handle::Released,
-            held_open: st.handle == Handle::Released && st.open,
-            lease: if st.handle == Handle::Released { None } else { st.lease },
-            n_children: st.lineage.n_children,
-            current: st
-                .current
-                .iter()
-                .map(|(&page, o)| (page, o.slot, o.born, o.crc))
-                .collect(),
-            retained: st.lineage.retained_list(),
-            name: None,
-        }, what))
+        .filter_map(|(id, &what)| branches.get(id).map(|st| (row_of(*id, st), what)))
         .collect();
     #[cfg(test)]
-    CAPTURE_ROWS_BUILT.with(|c| c.set(c.get() + rows.len() as u64));
+    CAPTURE_ROWS_BUILT.fetch_add(rows.len() as u64, Ordering::Relaxed);
+    #[cfg(test)]
+    count_in_scope(|c| &c.capture_rows_built, rows.len() as u64);
     rows
 }
 
@@ -2582,9 +3765,22 @@ struct Captured {
     generation: u64,
     /// The logical log position the capture covers (`Journal::mark`).
     log_from: u64,
+    /// The rows the catalog takes: built at the capture (a sharp checkpoint), or, for a fuzzy one,
+    /// frozen in the branch table at the capture and encoded into here by its writer (L2(d),
+    /// `BranchTable::freeze`) before it writes anything.
     rows: Vec<(CatBranch, u8)>,
+    /// Test builds with `FE_CAPTURE_VERIFY` set: every frozen row encoded at the capture too, the
+    /// old way, for the writer to compare with what the copy-on-write gave it (a mutation path that
+    /// skips the table's preserve would make them differ).
+    #[cfg(test)]
+    verify: Option<Vec<(CatBranch, u8)>>,
+    /// Whether the rows are frozen in the branch table, owed to the writer (fuzzy, L2(d)).
+    rows_frozen: bool,
+    /// The catalog's earliest lease after this checkpoint's commit, read by its writer (L2(d):
+    /// not by the install, under the store mutex); `None` for the install to read it.
+    lease_floor_after: Option<Option<u64>>,
     /// The dirty map the capture swapped out: merged back if the write fails.
-    dirty: HashMap<BranchId, u8>,
+    dirty: BTreeMap<BranchId, u8>,
     removed: Vec<BranchId>,
     trunk_new: Vec<(u32, u64, u64, Slot, u32)>,
     trunk_gone: Vec<(u32, u64)>,
@@ -2619,16 +3815,13 @@ struct Captured {
     /// commit, and set when the checkpoint's arena sync or its commit fails (review 4 #1).
     fail_stop: Arc<AtomicBool>,
     meta: Meta,
-    /// `ChildIndex` keys (children forked, and removal links) as of the capture.
-    child_keys: Vec<(u64, u64)>,
-    child_removed: Vec<(u64, u64)>,
+
     /// A handle on the arena file: synced, in `arena_sync`, before the catalog names the slots.
-    arena: Option<std::fs::File>,
+    arena: Option<Arc<std::fs::File>>,
     arena_sync: SyncClass,
     /// fastest-engine M1 item 4: names released since the last checkpoint (rows deleted first),
     /// then names created since (rows written), as swapped out of the index at the capture.
-    names_gone: HashMap<Arc<str>, u64>,
-    names_fresh: HashMap<Arc<str>, BranchId>,
+    names: Arc<FrozenNames>,
     lease_now: u64,
     fail_after_commit: bool,
     /// BranchFailpoint::CheckpointWriteFails, taken at the capture: the write fails before its
@@ -2712,10 +3905,10 @@ fn checkpoint_write(catalog: &mut Catalog, cap: &Captured, hold: Option<&AtomicU
         }
         // fastest-engine M1 item 4: freed names first, so a name released and created again since
         // the last checkpoint ends up naming its new branch.
-        for name in cap.names_gone.keys() {
+        for name in cap.names.gone.keys() {
             catalog.name_del(name)?;
         }
-        for (name, id) in &cap.names_fresh {
+        for (name, id) in &cap.names.fresh {
             catalog.name_put(name, id.0)?;
         }
         if cap.fresh_arena {
@@ -2758,11 +3951,46 @@ fn checkpoint_write(catalog: &mut Catalog, cap: &Captured, hold: Option<&AtomicU
 /// catalog syncs in FullFsync, or any sync off Apple), and goes through this store's at-risk
 /// decision (`Group::drain_failed`; engine review 17 MED 3). Mutant `catalog_sync_failure_logged`
 /// (test builds only): logged only, as before.
-fn truncate_catalog_wal(catalog: &mut Catalog, group: &Group) {
+/// The catalog WAL length from which a fuzzy checkpoint's phase 4 backfills and truncates it
+/// (checkpoint FIX, budget a_checkpoint_flushes_at_most_three_times). That phase cost 4 full flushes
+/// (PASSIVE: the WAL barrier and the database file's sync; TRUNCATE: the truncation's sync and the
+/// next commit's new WAL header), measured by red 39507c379 (artie raw l16-ckpt_3fb66f4ef.txt), and
+/// it ran after EVERY checkpoint. Bounded by size instead, as SQLite's and Turso's own
+/// auto-checkpoints are (1000 pages): the WAL stays under about this much plus one checkpoint's
+/// commit. Test builds: `CATALOG_WAL_TRUNCATE_AT_FORCED` (0: the constant; the tests that hold a
+/// checkpoint inside its truncation force every one with `CatalogWalTruncateAlways`).
+const CATALOG_WAL_TRUNCATE_AT: u64 = 4 << 20;
+
+#[cfg(test)]
+pub(crate) static CATALOG_WAL_TRUNCATE_AT_FORCED: AtomicU64 = AtomicU64::new(0);
+
+fn catalog_wal_truncate_at() -> u64 {
+    #[cfg(test)]
+    {
+        let forced = CATALOG_WAL_TRUNCATE_AT_FORCED.load(Ordering::Acquire);
+        if forced > 0 {
+            return forced;
+        }
+    }
+    CATALOG_WAL_TRUNCATE_AT
+}
+
+/// Whether phase 4 runs: the catalog WAL has reached `catalog_wal_truncate_at()`. Mutant
+/// `catalog_wal_truncated_every_checkpoint` (test builds only): always, as before.
+fn catalog_wal_due(catalog: &Catalog) -> bool {
+    fe_mutant("catalog_wal_truncated_every_checkpoint") || catalog.wal_len() >= catalog_wal_truncate_at()
+}
+
+fn truncate_catalog_wal(catalog: &mut Catalog, group: &Group, hold: Option<&AtomicU8>) {
+    #[cfg(not(test))]
+    let _ = hold;
     let failed_before = catalog.sync_failures();
     if let Err(e) = catalog.wal_passive() {
         tracing::warn!("branch catalog WAL backfill failed: {e}");
     }
+    ckpt_phase("passive");
+    #[cfg(test)]
+    pause_at(hold, HOLD_AFTER_WAL_PASSIVE);
     match catalog.truncate_wal() {
         Ok(r) if r.first().copied().unwrap_or(0) != 0 => {
             tracing::warn!("branch catalog WAL truncation was busy: {r:?}")
@@ -2776,11 +4004,186 @@ fn truncate_catalog_wal(catalog: &mut Catalog, group: &Group) {
     }
 }
 
+/// Test builds (budget a_checkpoint_flushes_at_most_three_times: 20 full flushes over 3 checkpoints,
+/// budget 3 each): the process's sync counters (`super::sync_counts`: fsync, F_FULLFSYNC) at each
+/// phase of a fuzzy checkpoint's thread, so a test can attribute its flushes. Observation only; the
+/// counters are process-wide, so a test reading them runs nothing else meanwhile.
+#[cfg(test)]
+pub(crate) static CKPT_PHASES: std::sync::Mutex<Vec<(&'static str, u64, u64)>> = std::sync::Mutex::new(Vec::new());
+
+/// Test builds (budget a_checkpoint_issues_at_most_two_syscalls_under_the_store_mutex: 52 over 3
+/// checkpoints, budget 2 each): the task's syscall count (`budget_probe::unix_syscalls`, every
+/// thread, and the reading is itself one call) at points inside a checkpoint's two store-mutex holds,
+/// the capture's (`start_flight`) and the install's. Observation only.
+/// Test builds: fuzzy installs that finished a prepared cut, and those that fell back to a rewrite
+/// under the store mutex (no cut was prepared). Observation only.
+#[cfg(test)]
+pub(crate) static INSTALL_CUTS: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+pub(crate) static INSTALL_REWRITES: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+pub(crate) static CKPT_HELD_SYSCALLS: std::sync::Mutex<Vec<(&'static str, u64)>> = std::sync::Mutex::new(Vec::new());
+
+/// Test builds: every thread's CPU time just BEFORE and just AFTER each `ckpt_held` point's syscall
+/// count (`budget_probe::thread_table`; Mach traps only, so the count does not move), so a span
+/// from point i to point j is attributed by exclusion (class (b), DECISIONS 994f7d41e0): its
+/// syscalls are the recording thread's only if no other thread ran between i's "before" table and
+/// j's "after" table. Recorded only while a test arms `CKPT_THREADS_ARMED` (and has reserved the
+/// vector's room), so no other test's held allocations see it.
+#[cfg(test)]
+pub(crate) static CKPT_THREADS_ARMED: AtomicBool = AtomicBool::new(false);
+/// Test builds, armed with `CKPT_THREADS_ARMED`: the backtraces of the allocations and frees of 16
+/// KiB or more between the last install's `install.cut_finished` and `install.installed`.
+#[cfg(test)]
+pub(crate) static CKPT_BIG: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+/// Test builds: the smallest allocation or free `CKPT_BIG` records (16 KiB unless a test lowers it,
+/// as the diagnostic's fire-check does).
+#[cfg(test)]
+pub(crate) static CKPT_BIG_MIN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(16 << 10);
+#[cfg(test)]
+#[allow(clippy::type_complexity)]
+pub(crate) static CKPT_HELD_THREADS: std::sync::Mutex<
+    Vec<(&'static str, [super::budget_probe::ThreadCpu; 48], [super::budget_probe::ThreadCpu; 48])>,
+> = std::sync::Mutex::new(Vec::new());
+
+fn ckpt_held(label: &'static str) {
+    #[cfg(test)]
+    {
+        let armed = CKPT_THREADS_ARMED.load(Ordering::Acquire);
+        let mut before = [super::budget_probe::ThreadCpu::EMPTY; 48];
+        if armed {
+            let _ = super::budget_probe::thread_table(&mut before);
+        }
+        if let Some(n) = super::budget_probe::unix_syscalls() {
+            CKPT_HELD_SYSCALLS.lock().unwrap_or_else(|e| e.into_inner()).push((label, n));
+            if armed {
+                let mut after = [super::budget_probe::ThreadCpu::EMPTY; 48];
+                let _ = super::budget_probe::thread_table(&mut after);
+                CKPT_HELD_THREADS.lock().unwrap_or_else(|e| e.into_inner()).push((label, before, after));
+                // The span from the cut's finish to the install's end: big allocations and frees
+                // on this thread, with backtraces (`CKPT_BIG`), for the span that grows past two
+                // syscalls.
+                if label == "install.cut_finished" {
+                    super::budget_probe::record_big(CKPT_BIG_MIN.load(Ordering::Acquire));
+                } else if label == "install.installed" {
+                    let (_, _, traces) = super::budget_probe::recorded_allocs();
+                    super::budget_probe::record_allocs(false, usize::MAX);
+                    *CKPT_BIG.lock().unwrap_or_else(|e| e.into_inner()) = traces;
+                }
+            }
+        }
+    }
+    #[cfg(not(test))]
+    let _ = label;
+}
+
+fn ckpt_phase(label: &'static str) {
+    #[cfg(test)]
+    {
+        let c = super::sync_counts();
+        CKPT_PHASES.lock().unwrap_or_else(|e| e.into_inner()).push((label, c.fsync, c.full_fsync));
+    }
+    #[cfg(not(test))]
+    let _ = label;
+}
+
 /// F-FZ: the body of a fuzzy checkpoint's thread. Phase 2 holds only the writer; phase 3 only the
 /// store mutex; phase 4 only the writer again. No path takes the writer while waiting for the store
 /// mutex, and the sharp path (which takes the store mutex, then the writer) refuses while a capture
 /// is in flight, so the two cannot deadlock.
 #[allow(clippy::too_many_arguments)]
+/// What a start's result means for the store (`maybe_compact`, `run_owed_start`): a start that
+/// failed (settle, capture or spawn) backs off as a failed write does (review 4 #2): not retried by
+/// every operation until another threshold's worth of log (mutant `start_failure_retried`, test
+/// builds only); one refused for a flight in the air past the hard limit makes the operations wait
+/// for its install.
+fn settle_start(over_hard: &AtomicBool, inner: &mut StoreInner, started: FlightStart) {
+    match started {
+        FlightStart::Failed => {
+            if let Some(cat) = inner.cat.as_mut() {
+                cat.ckpt.start_failures += 1;
+            }
+            if let Some(journal) = inner.journal.as_mut().filter(|_| !fe_mutant("start_failure_retried")) {
+                journal.defer_compaction();
+            }
+        }
+        FlightStart::InFlight if inner.journal.as_ref().is_some_and(|j| j.past_hard_limit()) => {
+            over_hard.store(true, Ordering::Release);
+        }
+        _ => {}
+    }
+}
+
+/// The checkpoint worker's start of an owed fuzzy checkpoint (`BranchStore::start_owed_flight`):
+/// its capture in a store-mutex hold of the worker's own, then, with the mutex let go, the flight
+/// itself on this same thread (it is the worker already). Nothing if the log no longer wants a
+/// checkpoint (a start that failed since backed it off, or one ran).
+fn run_owed_start(ctx: FlightCtx) {
+    #[cfg(test)]
+    let _scope = CountScope::enter(&ctx.inner.counts);
+    let flight = {
+        let mut inner = ctx.inner.lock();
+        if !inner.journal.as_ref().is_some_and(|j| j.wants_compaction()) {
+            return;
+        }
+        let mut job: Option<CkptJob> = None;
+        let started = BranchStore::start_flight_with(&ctx, &mut inner, None, &mut |j| {
+            job = Some(j);
+            Ok(())
+        });
+        settle_start(&ctx.over_hard, &mut inner, started);
+        job
+    };
+    if let Some(job) = flight {
+        job();
+    }
+}
+
+/// The store's parts a fuzzy checkpoint's start and flight use (`BranchStore::flight_ctx`).
+struct FlightCtx {
+    inner: Arc<StoreMutex>,
+    group: Arc<Group>,
+    class: SyncClass,
+    flight_hold: Arc<AtomicU8>,
+    over_hard: Arc<AtomicBool>,
+    truncating: Arc<AtomicBool>,
+    installs: Arc<(std::sync::Mutex<u64>, std::sync::Condvar)>,
+}
+
+/// `BranchStore::mature`, given the store's group and class.
+fn mature_with(group: &Group, store_class: SyncClass, inner: &mut StoreInner) {
+    // Releases durable now no longer need reporting by a stopped store (engine review 7 #3).
+    if !inner.releases_in_air.is_empty() {
+        let durable = group.durable(store_class);
+        while inner.releases_in_air.front().is_some_and(|r| r.lsn <= durable) {
+            inner.releases_in_air.pop_front();
+        }
+    }
+    if inner.pending_free.is_empty() {
+        return;
+    }
+    // Durable in the free class (review 5 #18, engine review 8 #5): the store's, where an
+    // ordered landing reaches durable(Off) and is durable only when the trunk's WAL flush
+    // returns; a raised D0 store's rewrite class. Mutant `free_at_off` (test builds only):
+    // durable(Off), as before review 5 #18.
+    let class = if fe_mutant("free_at_off") { SyncClass::Off } else { inner.free_class() };
+    inner.mature_frees(group.durable(class));
+    // The bound (engine review 8 #5): a raised D0 store that then runs D0 alone would hold
+    // its frees for ever. Past `hold_bound()` held slots one upgrade flight in the free class
+    // is owed: one sync per bound's worth of frees, led by the store's background writer, off
+    // every acknowledgement path (engine review 13 MED 2), and armed only when none is in the
+    // air (mutant `upgrade_rearms_in_air`, test builds only: re-armed while one is). Past the
+    // hard cap the next freeing operation leads it too. Mutant `hold_unbounded` (test builds
+    // only).
+    if class != store_class && inner.pending_free_slots > hold_bound() && !fe_mutant("hold_unbounded") {
+        if let Some(&(lsn, _)) = inner.pending_free.back() {
+            let overdue = inner.pending_free_slots > hold_bound().saturating_mul(UPGRADE_HARD_CAP);
+            group.arm_upgrade(lsn, overdue);
+        }
+    }
+}
+
 fn run_flight(
     inner: Arc<StoreMutex>,
     group: Arc<Group>,
@@ -2791,8 +4194,49 @@ fn run_flight(
     truncating: Arc<AtomicBool>,
     installs: Arc<(std::sync::Mutex<u64>, std::sync::Condvar)>,
 ) {
+    #[cfg(test)]
+    let _scope = CountScope::enter(&inner.counts);
     let ns = |t: Instant| u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX);
     let t = Instant::now();
+    ckpt_phase("start");
+    // L2(d): the rows the capture froze, encoded first, CKPT_BATCH per store-mutex hold, each as of
+    // the capture (a state changed since was encoded by the table the moment before it changed;
+    // `BranchTable::freeze`). Short, so the copy-on-write window is too.
+    let mut cap = cap;
+    if cap.rows_frozen {
+        #[cfg(test)]
+        pause_at(Some(&*hold), HOLD_BEFORE_ROWS);
+        // The writer's vector, sized once (never under the store mutex) and grown here between
+        // batches if the table encoded pre-images beyond it.
+        let mut rows = Vec::with_capacity(cap.shape_rows as usize);
+        loop {
+            if rows.capacity() - rows.len() < CKPT_BATCH {
+                rows.reserve(CKPT_BATCH);
+            }
+            let mut guard = inner.lock();
+            if guard.branches.encode_frozen(CKPT_BATCH, &mut rows) {
+                break;
+            }
+        }
+        #[cfg(test)]
+        if let Some(want) = cap.verify.take() {
+            if let Err(e) = verify_frozen_rows(want, &rows) {
+                // Recorded for the test that forced the check; a whole run under FE_CAPTURE_VERIFY
+                // stops at once, so no later test can pass over it.
+                eprintln!("{e}");
+                CAPTURE_VERIFY_FAILURES.lock().unwrap_or_else(|p| p.into_inner()).push(e);
+                if std::env::var_os("FE_CAPTURE_VERIFY").is_some() {
+                    std::process::abort();
+                }
+            }
+        }
+        #[cfg(test)]
+        FROZEN_ROWS_WRITTEN.fetch_add(rows.len() as u64, Ordering::Relaxed);
+        #[cfg(test)]
+        count_in_scope(|c| &c.frozen_rows_written, rows.len() as u64);
+        cap.rows = rows;
+    }
+    ckpt_phase("rows");
     // A panic in the writer must still reach the install (with an error), or `flight` would stay
     // set: no checkpoint would start again and the read snapshot would stay pinned.
     let written = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -2803,7 +4247,8 @@ fn run_flight(
         // is up. Mutant `commit_unsettled` (test builds only): the catalog commits at once. In a
         // raised D0 store the arena is then synced alone (`settle_arena`; engine review 9 #8). The
         // test hook pauses the step that syncs the slots, once taken (`HOLD_FLIGHT_TAKEN`): that
-        // arena sync, or else the flight this wait leads.
+        // arena sync, or else the flight this wait leads; and before that arena sync is taken
+        // (`HOLD_BEFORE_SETTLE`).
         if !fe_mutant("commit_unsettled") {
             #[cfg(test)]
             let syncs = thread_syncs();
@@ -2816,6 +4261,8 @@ fn run_flight(
             )
             .and_then(|()| {
                 if cap.settle_arena {
+                    #[cfg(test)]
+                    pause_at(Some(&*hold), HOLD_BEFORE_SETTLE);
                     BranchStore::settle_ordered(&group, cap.deferred_lsn)
                         .and_then(|()| BranchStore::settle_arena(&inner, &group, &hold, cap.fail_arena_sync))
                 } else {
@@ -2830,13 +4277,20 @@ fn run_flight(
                 return (Err(e), 0);
             }
         }
+        ckpt_phase("settled");
         let mut w = writer.lock();
         let r0 = w.counters.rows_written;
         let written = checkpoint_write(&mut w, &cap, Some(&*hold));
+        ckpt_phase("written");
         if written.is_err() {
             w.rollback();
         }
-        (written, w.counters.rows_written - r0)
+        // The catalog's earliest lease, read here on the writer's connection, which sees its own
+        // commit, rather than at the install under the store mutex (a catalog statement there,
+        // raw l104). Nothing else writes the catalog between the commit and the install. A failed
+        // read leaves it to the install, as before.
+        let floor = written.as_ref().ok().and_then(|()| w.lease_min().ok());
+        (written.map(|()| floor), w.counters.rows_written - r0)
     }))
     .unwrap_or_else(|_| {
         writer.lock().rollback();
@@ -2848,7 +4302,9 @@ fn run_flight(
         )
     });
     let (written, rows_written) = written;
-    let mut cap = cap;
+    let written = written.map(|floor| {
+        cap.lease_floor_after = floor;
+    });
     cap.shape_rows_written = rows_written;
     let write_ns = ns(t);
     if written.is_ok() {
@@ -2869,8 +4325,10 @@ fn run_flight(
                 None
             })
     });
+    ckpt_phase("cut");
     let installed = {
         let mut guard = inner.lock();
+        ckpt_held("install.locked");
         // The install cuts the log: no group flight may be writing it (fastest-engine M1 item 2),
         // and none starts while this holds the store mutex.
         drop(group.quiesce());
@@ -2879,7 +4337,13 @@ fn run_flight(
         // the one read now, which a raised flight since may have strengthened (engine review 15 MED
         // 2). Mutant `fuzzy_committed_class_at_install` (test builds only): read now.
         let (deferred_lsn, committed_class, committed) = (cap.deferred_lsn, cap.arena_sync, written.is_ok());
+        ckpt_held("install.quiesced");
         let installed = guard.checkpoint_install(cap, written, cut.as_ref().and_then(|c| c.take()));
+        ckpt_held("install.installed");
+        // The cut's retired handles are closed after the store mutex (`Journal::take_retired`).
+        let retired = guard.journal.as_mut().and_then(Journal::take_retired);
+        // And the names and child keys the install let go of, freed after it too (L2(d)).
+        let retired_names = (guard.names.retired.take(), guard.children.take_retired());
         if let Some(journal) = guard.journal.as_ref() {
             // The catalog's commit made everything the capture covers durable in the class it
             // synced in, even if the cut failed after it: a raised D0 store's held frees up to the
@@ -2912,32 +4376,100 @@ fn run_flight(
             cat.ckpt.hold(hold_ns);
             cat.ckpt.flight_ns += write_ns;
         }
+        ckpt_held("install.marked");
         // Set under the store mutex, so no capture can slip in before the truncation.
         truncating.store(installed.is_ok(), Ordering::Release);
         over_hard.store(false, Ordering::Release);
         let (count, signal) = &*installs;
         *count.lock().unwrap_or_else(|e| e.into_inner()) += 1;
         signal.notify_all();
-        installed
+        (installed, (retired, retired_names))
     };
+    let (installed, (retired, retired_names)) = installed;
+    // Holding no lock now: the old log's handles close here, and the frozen names are freed.
+    drop(retired);
+    drop(retired_names);
     // Flights go on, into the new log.
     drop(cut);
+    ckpt_phase("installed");
     // Phase 4 takes only the writer, never the store mutex again: `start_flight` may join this
     // thread while holding the store mutex. (Its time is not counted in `flight_ns`.)
     match installed {
+        Ok(()) if !catalog_wal_due(&writer.lock()) => {
+            truncating.store(false, Ordering::Release);
+            // The phase's end, skipped (the instrument's last point either way).
+            ckpt_phase("truncated");
+        }
         Ok(()) => {
             #[cfg(test)]
             pause_at(Some(&*hold), HOLD_BEFORE_WAL_TRUNCATE);
             // A panic here must not leave `truncating` set: no checkpoint would start again.
             let truncated = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                truncate_catalog_wal(&mut writer.lock(), &group)
+                truncate_catalog_wal(&mut writer.lock(), &group, Some(&*hold))
             }));
             truncating.store(false, Ordering::Release);
+            ckpt_phase("truncated");
             if truncated.is_err() {
                 tracing::warn!("the branch catalog WAL truncation panicked");
             }
         }
         Err(e) => tracing::warn!("branch catalog fuzzy checkpoint failed: {e}"),
+    }
+}
+
+type CkptJob = Box<dyn FnOnce() + Send>;
+
+/// The fuzzy checkpoints' persistent thread (`BranchStore::dispatch_flight`): runs each checkpoint
+/// handed to it in turn (only one is ever in flight), counting it finished even if it panicked, and
+/// exits when its channel closes (the store's `Drop`). Counted a persistent store thread for the
+/// budgets' probe while it is parked, as the confirmation writer is, and a live one while it runs
+/// a checkpoint.
+struct CkptWorker {
+    pid: u32,
+    tx: std::sync::mpsc::Sender<CkptJob>,
+    handle: crate::thread::JoinHandle<()>,
+}
+
+impl CkptWorker {
+    fn start(jobs: Arc<(std::sync::Mutex<(u64, u64)>, std::sync::Condvar)>) -> std::io::Result<Self> {
+        let (tx, rx) = std::sync::mpsc::channel::<CkptJob>();
+        #[cfg(test)]
+        super::budget_probe::persistent_started();
+        let spawned = crate::thread::Builder::new().name("branch-checkpoint".to_string()).spawn(move || {
+            // budgets-port-adversary MED-1: a window owns this thread by its registration (test builds).
+            #[cfg(test)]
+            let _owned = super::budget_probe::register_owned_thread("branch-checkpoint");
+            while let Ok(job) = rx.recv() {
+                // While it runs a checkpoint the worker is NOT parked: the budgets' probe counts it
+                // a live thread then, as it counted the per-checkpoint thread this replaced, so a
+                // measured window still waits out the checkpoint (budgets' ckpt cells: "at least
+                // three checkpoints installed (0)" at 4fbc6de65 without this).
+                #[cfg(test)]
+                super::budget_probe::persistent_ended();
+                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(job)).is_err() {
+                    tracing::warn!("a branch catalog checkpoint panicked");
+                }
+                #[cfg(test)]
+                super::budget_probe::persistent_started();
+                Self::finished(&jobs);
+            }
+            #[cfg(test)]
+            super::budget_probe::persistent_ended();
+        });
+        match spawned {
+            Ok(handle) => Ok(Self { pid: std::process::id(), tx, handle }),
+            Err(e) => {
+                #[cfg(test)]
+                super::budget_probe::persistent_ended();
+                Err(e)
+            }
+        }
+    }
+
+    /// One checkpoint handed out is over (run, panicked, or never handed over).
+    fn finished(jobs: &(std::sync::Mutex<(u64, u64)>, std::sync::Condvar)) {
+        jobs.0.lock().unwrap_or_else(|e| e.into_inner()).1 += 1;
+        jobs.1.notify_all();
     }
 }
 
@@ -3047,6 +4579,19 @@ impl Drop for Backpressure<'_> {
     }
 }
 
+/// A trunk commit's barrier that relied on the commit's own WAL F_FULLFSYNC (`ordered`; engine
+/// review 18 MED 3): it does not wait in back-pressure for a fuzzy checkpoint's install. That
+/// checkpoint can be waiting in `settle_ordered` for exactly this commit's flush (`pending_full`),
+/// which comes only after the barrier returns: the two waited on each other until the settle bound
+/// broke it, the checkpoint failed Busy and the commit stalled under the WAL write lock. The log
+/// past the hard limit is waited out by the next operation instead. Mutant
+/// `ordered_commit_backpressured` (test builds only): it waits, as before.
+fn skip_backpressure(backpressure: Backpressure<'_>, ordered: bool) {
+    if ordered && !fe_mutant("ordered_commit_backpressured") {
+        std::mem::forget(backpressure);
+    }
+}
+
 /// r13-compose's runtime ablation knobs (PREREG A2.0 step 7: I1, I2, I10): `R13_FW1=off` lists by the
 /// scan and catalog query under the mutex at every listing (the store before F-W1), `R13_FW2=off`
 /// makes a checkpoint walk every resident state for reserved slots (before F-W2), and
@@ -3096,17 +4641,68 @@ fn guard_mutant(which: &str) -> bool {
     !cfg!(debug_assertions) && mutant(&format!("r13_guard_{which}_debug"))
 }
 
+/// Test builds: the counters a test reads for ONE store (the per-store counter class, lead ruling
+/// d9cf2b609b): `StoreCounts` read once.
 #[cfg(test)]
-thread_local! {
-    /// A4.G's G-b red: captures entered on this thread (a guard that stopped before the capture
-    /// leaves it unchanged).
-    pub(crate) static CAPTURE_ENTERED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-    /// Review 6 #3: captures on this thread that took an arena handle of their own, to sync the
-    /// arena outside the group's flights.
-    pub(crate) static CAPTURE_ARENA_HANDLES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-    /// Engine review 8 #2: catalog rows captures on this thread built.
-    pub(crate) static CAPTURE_ROWS_BUILT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct StoreTestCounts {
+    pub(crate) capture_entered: u64,
+    pub(crate) capture_arena_handles: u64,
+    pub(crate) capture_rows_built: u64,
+    pub(crate) frozen_rows_written: u64,
+    pub(crate) install_cuts: u64,
+    pub(crate) install_rewrites: u64,
+    pub(crate) syncs_under_store_mutex: u64,
 }
+
+#[cfg(test)]
+impl BranchStore {
+    pub(crate) fn test_counts(&self) -> StoreTestCounts {
+        let c = &self.inner.counts;
+        let get = |a: &AtomicU64| a.load(Ordering::Relaxed);
+        StoreTestCounts {
+            capture_entered: get(&c.capture_entered),
+            capture_arena_handles: get(&c.capture_arena_handles),
+            capture_rows_built: get(&c.capture_rows_built),
+            frozen_rows_written: get(&c.frozen_rows_written),
+            install_cuts: get(&c.install_cuts),
+            install_rewrites: get(&c.install_rewrites),
+            syncs_under_store_mutex: get(&c.syncs_under_store_mutex),
+        }
+    }
+
+    /// Test builds: this store's identity, as `scope_store_id` gives it.
+    pub(crate) fn store_id_for_test(&self) -> usize {
+        Arc::as_ptr(&self.inner.counts) as usize
+    }
+
+    /// Test builds: this store's syncs (its branch files, its catalog's, its trunk database's).
+    pub(crate) fn sync_counts(&self) -> super::SyncCounts {
+        let s = &self.inner.counts.syncs;
+        let get = |i: usize| s[i].load(Ordering::Relaxed);
+        super::SyncCounts { fsync: get(0), full_fsync: get(1), barrier: get(2), barrier_fallback: get(3) }
+    }
+}
+
+/// Test builds: captures entered, by ANY thread (A4.G's G-b red: a guard that stopped before the
+/// capture leaves it unchanged). FLAGGED instrument change (L2(d) slice 3): these were this
+/// thread's counts; a create's checkpoint is now captured on the checkpoint worker's thread
+/// (`run_owed_start`), so a test that drove it saw none. The tests that read them are serial.
+#[cfg(test)]
+pub(crate) static CAPTURE_ENTERED: AtomicU64 = AtomicU64::new(0);
+/// Review 6 #3: captures that took an arena handle of their own, to sync the arena outside the
+/// group's flights (any thread, as above).
+#[cfg(test)]
+pub(crate) static CAPTURE_ARENA_HANDLES: AtomicU64 = AtomicU64::new(0);
+/// Engine review 8 #2: catalog rows captures built (any thread, as above).
+#[cfg(test)]
+pub(crate) static CAPTURE_ROWS_BUILT: AtomicU64 = AtomicU64::new(0);
+
+/// Test builds: catalog rows fuzzy checkpoints' writers took from the copy-on-write (L2(d): a fuzzy
+/// capture builds none, `BranchTable::freeze`; its rows are encoded on the writer's thread and by
+/// the table, so they are counted here, by any thread).
+#[cfg(test)]
+pub(crate) static FROZEN_ROWS_WRITTEN: AtomicU64 = AtomicU64::new(0);
 
 /// r13-compose's registered mutants (PREREG §5, A6): `R13_MUTANT` names one deliberate defect, so
 /// each red test can be shown to fail on its mutant from the same test binary. Unset, every mutant is
@@ -3130,6 +4726,38 @@ pub(crate) fn fe_mutant(name: &str) -> bool {
         let _ = name;
         false
     }
+}
+
+// Test builds (L2 slice, budget create_allocates_at_most_once_under_the_store_mutex): while armed
+// (`HELD_TRACE` holds a Vec with spare capacity), each `held_trace(label)` records this thread's
+// allocations under a store mutex so far, so a test can attribute a create's held allocations to
+// its steps. Pushing never allocates: the Vec is reserved before it is armed, and a full one stops
+// recording. Observation only.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static HELD_TRACE: std::cell::RefCell<Option<Vec<(&'static str, u64)>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[inline]
+fn held_trace(label: &'static str) {
+    #[cfg(test)]
+    HELD_TRACE.with(|t| {
+        if let Some(v) = t.borrow_mut().as_mut() {
+            if v.len() < v.capacity() {
+                v.push((label, super::budget_probe::thread_allocs().2));
+            }
+        }
+    });
+    #[cfg(not(test))]
+    let _ = label;
+}
+
+/// A branch page's reservation (`BranchStore::first_write_branch`): its slot and, for a file arena,
+/// where the commit writes it, so `commit_pages` can write it before it takes the store mutex.
+#[derive(Clone)]
+pub(crate) struct Reserved {
+    slot: Slot,
+    io: Option<(Arc<std::fs::File>, u64)>,
 }
 
 /// fastest-engine C1 (the SIGKILL crash harness, PREREG v1 §8): a named code point a crash test
@@ -3268,9 +4896,11 @@ impl BranchStore {
         Self {
             inner: Arc::new(StoreMutex::new(StoreInner::fresh(None, SyncClass::Off, None))),
             prewarm: PrewarmStats::default(),
-            flights: Mutex::new(Vec::new()),
+            ckpt_worker: Mutex::new(None),
+            start_due: AtomicBool::new(false),
+            flight_jobs: Arc::new((std::sync::Mutex::new((0, 0)), std::sync::Condvar::new())),
             confirm_writer: Mutex::new(None),
-            name_filter_build: Mutex::new(None),
+            name_filter_build: Mutex::new(Vec::new()),
             name_filter_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             flight_hold: Arc::new(AtomicU8::new(0)),
             over_hard: Arc::new(AtomicBool::new(false)),
@@ -3286,11 +4916,14 @@ impl BranchStore {
             resolve_calls: AtomicU64::new(0),
             arena_reads: AtomicU64::new(0),
             holds: ForkHoldCounters::new(),
-            group: Arc::new(Group::new(0, Arc::new(AtomicBool::new(false)))),
+            group: Group::shared(0, Arc::new(AtomicBool::new(false))),
             class: SyncClass::Off,
             #[cfg(test)]
             trunk_commit_hold: Arc::new(AtomicU8::new(0)),
             sync_failures: AtomicU64::new(0),
+            #[cfg(test)]
+            commit_yield: AtomicBool::new(false),
+            drain_parent: crate::sync::OnceLock::new(),
             #[cfg(test)]
             publish_wait_ms: AtomicU64::new(0),
             trunk_same_device: AtomicBool::new(false),
@@ -3352,6 +4985,21 @@ impl BranchStore {
         fuzzy: bool,
         db_path: &str,
     ) -> Result<Self> {
+        // Test builds: the store's counters exist from here, so its recovery's syncs are its own.
+        #[cfg(test)]
+        let counts = Arc::new(StoreCounts::default());
+        #[cfg(test)]
+        let _scope = CountScope::enter(&counts);
+        #[cfg(test)]
+        OWN_STORES.with(|s| s.borrow_mut().push(counts.clone()));
+        #[cfg(test)]
+        if !crate::is_memory_like(db_path) {
+            register_path(db_path, &counts);
+        }
+        #[cfg(test)]
+        if super::budget_probe::AUDIT_PATH.lock().unwrap_or_else(|e| e.into_inner()).as_deref() == Some(db_path) {
+            counts.audited.store(true, Ordering::Relaxed);
+        }
         let format = super::journal::format_version(splice);
         // S-12 (r13-compose, A4.G: stands): the splice arm and fuzzy checkpoints are refused
         // together at construction, as fl_refusal does for its switch pairs (8976dc691): a splice's
@@ -3548,11 +5196,14 @@ impl BranchStore {
         let opened_lsn = inner.journal.as_ref().map_or(0, |j| j.lsn() - j.pending_len());
         let mut store = Self {
             fuzzy,
-            group: Arc::new(Group::new(opened_lsn, inner.fail_stop.clone())),
+            group: Group::shared(opened_lsn, inner.fail_stop.clone()),
             class: inner.sync,
             #[cfg(test)]
             trunk_commit_hold: Arc::new(AtomicU8::new(0)),
             sync_failures: AtomicU64::new(0),
+            #[cfg(test)]
+            commit_yield: AtomicBool::new(false),
+            drain_parent: crate::sync::OnceLock::new(),
             #[cfg(test)]
             publish_wait_ms: AtomicU64::new(0),
             trunk_same_device: AtomicBool::new(false),
@@ -3563,11 +5214,21 @@ impl BranchStore {
             trunk_children: AtomicUsize::new(inner.trunk.lineage.n_children as usize),
             trunk_commits: AtomicU64::new(0),
             gate_closed: (std::sync::Mutex::new(()), std::sync::Condvar::new()),
-            inner: Arc::new(StoreMutex::new(inner)),
+            inner: Arc::new({
+                #[allow(unused_mut)]
+                let mut m = StoreMutex::new(inner);
+                #[cfg(test)]
+                {
+                    m.counts = counts.clone();
+                }
+                m
+            }),
             prewarm: warmed,
-            flights: Mutex::new(Vec::new()),
+            ckpt_worker: Mutex::new(None),
+            start_due: AtomicBool::new(false),
+            flight_jobs: Arc::new((std::sync::Mutex::new((0, 0)), std::sync::Condvar::new())),
             confirm_writer: Mutex::new(None),
-            name_filter_build: Mutex::new(None),
+            name_filter_build: Mutex::new(Vec::new()),
             name_filter_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             flight_hold: Arc::new(AtomicU8::new(0)),
             over_hard: Arc::new(AtomicBool::new(false)),
@@ -3581,6 +5242,12 @@ impl BranchStore {
             arena_reads: AtomicU64::new(0),
             holds: ForkHoldCounters::new(),
         };
+        // A catalog the open recovered: its failed syncs reach this store's at-risk decision as
+        // they happen (engine review 21 MED 5; a catalog created later is linked at its creation,
+        // `ensure_backing`).
+        if let Some(cat) = store.inner.lock().cat.as_ref() {
+            cat.catalog.link_drain_parent(Self::group_handle(&store.group));
+        }
         if store.inner.lock().files.is_some() {
             store.start_confirm_writer();
         }
@@ -3666,6 +5333,9 @@ impl BranchStore {
         inner.cat = Some(cat);
         let t = Instant::now();
         let mut touched: HashMap<Slot, bool> = HashMap::new();
+        // budgets-rev-242345 LOW-5: the whole replay's work, measured apart (test builds).
+        #[cfg(test)]
+        let _site = super::budget_probe::SiteWork::start(super::budget_probe::WorkSite::Recovery);
         for (pos, record) in records.iter().enumerate() {
             let pos = pos as u64;
             match record {
@@ -3715,6 +5385,9 @@ impl BranchStore {
         stats.load_ns += ns(t);
         let mut ignored = Vec::new();
         let t = Instant::now();
+        // budgets-rev-242345 LOW-5: the whole replay's work, measured apart (test builds).
+        #[cfg(test)]
+        let _site = super::budget_probe::SiteWork::start(super::budget_probe::WorkSite::Recovery);
         for record in records {
             kill_point("recover.replay");
             inner.replay(record, &mut ignored)?;
@@ -3780,7 +5453,7 @@ impl BranchStore {
         };
         stats.log_bytes = scanned.log_bytes();
         let arena_file = scanned.open_arena(meta.is_some_and(|m| m.in_use > 0 || m.states > 0))?;
-        let meta = meta.unwrap_or(Meta {
+        let meta = meta.unwrap_or_else(|| Meta {
             page_size: scanned.page_size() as u32,
             ..Meta::default()
         });
@@ -4082,7 +5755,7 @@ impl BranchStore {
     /// Buffer `records` for an early-released operation and return the log sequence number the
     /// caller must wait for (`wait_durable`) once it has released every lock, before acknowledging
     /// the operation. Nothing is flushed here; 0 when volatile (always durable).
-    fn buffer_records(&self, inner: &mut StoreInner, records: &[Record]) -> Result<u64> {
+    fn buffer_records<'r>(&self, inner: &mut StoreInner, records: impl IntoIterator<Item = &'r Record>) -> Result<u64> {
         let StoreInner {
             journal, failpoint, ..
         } = inner;
@@ -4199,6 +5872,10 @@ impl BranchStore {
         lsn: u64,
         class: SyncClass,
     ) -> Result<()> {
+        // Mutant `store_counts_unscoped_lead` (test builds only): the leader's write, outside the
+        // mutex, counted in no store's scope (`every_store_count_has_a_store`'s fire-check).
+        #[cfg(test)]
+        let _scope = (!fe_mutant("store_counts_unscoped_lead")).then(|| CountScope::enter(&store.counts));
         #[cfg(not(test))]
         let _ = hold;
         // Mutant M-c (PREREG v1 amendment 36): the operation is acknowledged before its records
@@ -4206,6 +5883,15 @@ impl BranchStore {
         if lsn == 0 || fe_mutant("ack_before_pwrite") {
             return Ok(());
         }
+        // Counted in `Group::awaiting` until it returns, on every path.
+        struct Awaiting<'a>(&'a Group);
+        impl Drop for Awaiting<'_> {
+            fn drop(&mut self) {
+                self.0.awaiting.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+        group.awaiting.fetch_add(1, Ordering::AcqRel);
+        let _awaiting = Awaiting(group);
         let need = class_index(class);
         let mut first = true;
         // Whether the flight this would lead syncs, so must not be taken while a checkpoint syncs
@@ -4267,6 +5953,7 @@ impl BranchStore {
                     guard: store.lock(),
                     since: Instant::now(),
                 };
+                held_trace("lead.locked");
                 let mut g = group.lock();
                 if g.durable[need] >= lsn {
                     #[cfg(test)]
@@ -4290,7 +5977,9 @@ impl BranchStore {
                 }
                 // Written already in a weaker class: only an upgrade can make it durable in `class`.
                 let upgrade = g.durable[0] >= lsn;
-                match Self::take_flight(&mut inner, class, upgrade) {
+                let taken = Self::take_flight(&mut inner, class, upgrade);
+                held_trace("lead.taken");
+                match taken {
                     Ok(Some(flight)) if !flight.is_empty() => {
                         g.flushing = true;
                         g.flights += 1;
@@ -4336,8 +6025,13 @@ impl BranchStore {
     /// may still be told they failed, and the catalog must not hold their records before that
     /// (review 4 #1). While such a flush is still to come (`pending_full`), this waits for it and
     /// leads nothing: it lands, or it fails and fail-stops the store, which refuses the commit. An
-    /// ordered flight whose flush will not come (its commit ended without one) is left to the
-    /// waiters it covers, which lead their own flush. The wait is bounded as a rider's is
+    /// ordered flight whose flush will not come (its commit ended without one, `pending_full`
+    /// cleared) is not waited for. SCOPE (engine review 18 LOW 11): "the waiters it covers lead their
+    /// own flush" holds in D1 and D2 only; in D0 they need nothing, so the catalog may then commit,
+    /// and likewise when this checkpoint's capture ran between a trunk commit's `begin_trunk_commit`
+    /// and its barrier, a pre-image before that commit's outcome is decided. The pre-image is the
+    /// page the trunk still holds, so a commit that then fails leaves the catalog naming a correct
+    /// copy; nothing a caller was told is contradicted. The wait is bounded as a rider's is
     /// (`pending_full_wait`): the trunk commit can itself be waiting on this checkpoint's install
     /// (`Backpressure`, after its barrier), so past the bound the checkpoint fails, which releases
     /// that wait, and a later one retries. Mutant `settle_ignores_ordered` (test builds only): no
@@ -4356,7 +6050,13 @@ impl BranchStore {
             if g.durable[full] >= lsn.min(g.ordered) || g.pending_full.is_none() {
                 return Ok(());
             }
-            let Some(left) = pending_full_wait().checked_sub(started.elapsed()) else {
+            // Mutant `settle_ordered_busy_at_once` (test builds only; engine review 18 MED 4): Busy
+            // without waiting, which the bound alone could not tell from a wait.
+            let Some(left) = pending_full_wait()
+                .checked_sub(started.elapsed())
+                .filter(|_| !fe_mutant("settle_ordered_busy_at_once"))
+            else {
+                g.settle_timeouts += 1;
                 return Err(LimboError::Busy);
             };
             #[cfg(test)]
@@ -4434,44 +6134,7 @@ impl BranchStore {
 
     /// Return the deferred frees a flight has covered (called under the store mutex).
     fn mature(&self, inner: &mut StoreInner) {
-        // Releases durable now no longer need reporting by a stopped store (engine review 7 #3).
-        if !inner.releases_in_air.is_empty() {
-            let durable = self.group.durable(self.class);
-            while inner.releases_in_air.front().is_some_and(|r| r.lsn <= durable) {
-                inner.releases_in_air.pop_front();
-            }
-        }
-        if inner.pending_free.is_empty() {
-            return;
-        }
-        // Durable in the free class (review 5 #18, engine review 8 #5): the store's, where an
-        // ordered landing reaches durable(Off) and is durable only when the trunk's WAL flush
-        // returns; a raised D0 store's rewrite class. Mutant `free_at_off` (test builds only):
-        // durable(Off), as before review 5 #18.
-        let class = if fe_mutant("free_at_off") { SyncClass::Off } else { inner.free_class() };
-        inner.mature_frees(self.group.durable(class));
-        // The bound (engine review 8 #5): a raised D0 store that then runs D0 alone would hold
-        // its frees for ever. Past `hold_bound()` held slots one upgrade flight in the free class
-        // is owed: one sync per bound's worth of frees, led by the store's background writer, off
-        // every acknowledgement path (engine review 13 MED 2), and armed only when none is in the
-        // air (mutant `upgrade_rearms_in_air`, test builds only: re-armed while one is). Past the
-        // hard cap the next freeing operation leads it too. Mutant `hold_unbounded` (test builds
-        // only).
-        if class != self.class && inner.pending_free_slots > hold_bound() && !fe_mutant("hold_unbounded") {
-            if let Some(&(lsn, _)) = inner.pending_free.back() {
-                let g = self.group.lock();
-                let due = &self.group.upgrade_due;
-                let current = due.load(Ordering::Acquire);
-                if current != UPGRADE_IN_AIR || fe_mutant("upgrade_rearms_in_air") {
-                    due.store(current.max(lsn).min(UPGRADE_IN_AIR - 1), Ordering::Release);
-                }
-                if inner.pending_free_slots > hold_bound().saturating_mul(UPGRADE_HARD_CAP) {
-                    self.group.upgrade_overdue.store(true, Ordering::Release);
-                }
-                self.group.confirm_cv.notify_all();
-                drop(g);
-            }
-        }
+        mature_with(&self.group, self.class, inner);
     }
 
     /// Free what an operation that logged its Release through `log_all` freed (an expiry pass, a
@@ -4502,7 +6165,9 @@ impl BranchStore {
     /// logged here. Mutant `upgrade_takes_flight_slot` (test builds only): an ordinary flight in
     /// the free class, taking what is buffered and holding the flight slot, as before engine
     /// review 18 HIGH 1.
-    fn lead_upgrade(store: &StoreMutex, group: &Group) {
+    fn lead_upgrade(store: &StoreMutex, group: &Group) -> bool {
+        #[cfg(test)]
+        let _scope = CountScope::enter(&store.counts);
         let due = group.upgrade_due.load(Ordering::Acquire);
         if due == 0
             || due == UPGRADE_IN_AIR
@@ -4511,8 +6176,11 @@ impl BranchStore {
                 .compare_exchange(due, UPGRADE_IN_AIR, Ordering::AcqRel, Ordering::Acquire)
                 .is_err()
         {
-            return;
+            return false;
         }
+        // Reset from in the air however this returns, a panic included (engine review 18 MED 5's
+        // LOW): left set, no upgrade would ever be armed again and the held frees grow unbounded.
+        let in_air = InAir(&group.upgrade_due);
         // Test builds: the store's confirmation hook (`HOLD_FLIGHT_TAKEN`; engine review 18 HIGH 1).
         #[cfg(test)]
         let hold = Some(&group.confirm_hold);
@@ -4537,9 +6205,26 @@ impl BranchStore {
         if let Err(e) = led {
             tracing::warn!("branch store: the upgrade for held frees failed: {e}");
         }
-        let _ = group
-            .upgrade_due
-            .compare_exchange(UPGRADE_IN_AIR, 0, Ordering::AcqRel, Ordering::Acquire);
+        drop(in_air);
+        // Engine review 18 MED 7: frees made while it was in the air (after its take) were not
+        // armed (`arm_upgrade` leaves one in the air alone), so with more than the bound still held
+        // the next one is owed now, by the writer that will lead it, rather than at some later
+        // operation's `mature`. Only while the oldest held free is written (a sync can cover it):
+        // one still buffered is armed by the operation whose flight writes it, so no upgrade is led
+        // that can free nothing. Mutant `writer_upgrades_once` (test builds only): none, as before.
+        if !group.poisoned() && !fe_mutant("writer_upgrades_once") {
+            let inner = store.lock();
+            let written = group.durable(SyncClass::Off);
+            if inner.free_class() != inner.sync
+                && inner.pending_free_slots > hold_bound()
+                && inner.pending_free.front().is_some_and(|&(lsn, _)| lsn <= written)
+            {
+                if let Some(&(lsn, _)) = inner.pending_free.back() {
+                    group.arm_upgrade(lsn, inner.pending_free_slots > hold_bound().saturating_mul(UPGRADE_HARD_CAP));
+                }
+            }
+        }
+        true
     }
 
     /// The held-free upgrade's sync (engine review 18 HIGH 1, review 19 MED 5, review 21 MEDs 2-4
@@ -4552,9 +6237,11 @@ impl BranchStore {
     /// (the rewrite replaced the log it synced, and made durable itself what it kept). Only the
     /// first raise of the header's class makes it `exclusive`: it then holds the flight slot, once
     /// per store. On success it marks every byte written at its take durable in the free class read
-    /// then, under the store mutex and only over the same log, and returns the frees that covers.
-    /// Nothing is taken when what it was armed for (`due`) or everything written is durable in that
-    /// class already (a FULL trunk commit's flush covered it; engine review 21 LOW 16). A failed sync
+    /// then, under the store mutex and only over the same log, and returns the frees that covers;
+    /// when no flight was taken since, it also hands the confirmation writer the confirmation of the
+    /// log's last flight, which it made durable (engine review 21 MED 6). Nothing is taken when
+    /// what it was armed for (`due`) or everything written is durable in that class already (a
+    /// FULL trunk commit's flush covered it; engine review 21 LOW 16). A failed sync
     /// fail-stops the store, as a failed flight does (failpoint `UpgradeSyncFails`). `hold` is the
     /// test hook it pauses at once taken (`HOLD_FLIGHT_TAKEN`). Kill points `upgrade.taken` and
     /// `upgrade.landed`.
@@ -4596,12 +6283,14 @@ impl BranchStore {
             let (Some(journal), Some(arena)) = (journal.as_mut(), arena.as_mut()) else {
                 return Ok(());
             };
-            match journal.take_upgrade(arena, class) {
+            match journal.take_upgrade(arena, class, end) {
                 Ok(mut upgrade) => {
                     upgrade.fail = fail;
                     g.upgrading = true;
                     if upgrade.exclusive {
+                        // The C15 ruling's exception (b), counted: flights wait for this one.
                         g.flushing = true;
+                        g.header_raise_exclusive += 1;
                     }
                     g.upgrades += 1;
                     break (upgrade, end);
@@ -4616,27 +6305,45 @@ impl BranchStore {
         #[cfg(test)]
         pause_at(hold, HOLD_FLIGHT_TAKEN);
         let (class, at, rewrites, exclusive) = (upgrade.class, upgrade.at, upgrade.rewrites, upgrade.exclusive);
-        let synced = upgrade.sync();
+        let (synced, mut confirm) = split_confirm(upgrade.sync());
         group.end_upgrade(exclusive, synced.is_ok());
         synced?;
         let mut inner = store.lock();
-        let same_log = inner
+        let landed = inner
             .journal
             .as_mut()
-            .is_some_and(|journal| journal.upgrade_landed(at, rewrites));
-        if same_log {
-            group.mark_upgraded(end, class);
+            .and_then(|journal| journal.upgrade_landed(at, rewrites));
+        if let Some(last) = landed {
+            // The upgrade's confirmation names the flight that was last at its take: offered only
+            // if no flight was taken since (engine review 21 MED 6). Mutant
+            // `held_free_upgrade_confirms_nothing` (test builds only): none, as before.
+            let offered = if last && !fe_mutant("held_free_upgrade_confirms_nothing") {
+                confirm.take()
+            } else {
+                None
+            };
+            confirm = group.mark_upgraded(end, class, offered).or(confirm);
         }
         kill_point("upgrade.landed");
         inner.mature_frees(group.durable(class));
+        drop(inner);
+        // A confirmation not kept is closed holding no lock.
+        drop(confirm);
         Ok(())
     }
 
     /// A freeing operation, after its own wait: lead the owed upgrade if the held frees passed
-    /// the hard cap (`Group::upgrade_overdue`; the background writer fell behind).
+    /// the hard cap (`Group::upgrade_overdue`; the background writer fell behind). Counted when
+    /// this operation led it (`hardcap_upgrades`; the C15 ruling's exception (a)), whether or not
+    /// it then found anything left to sync: an overcount, never a miss.
     fn upgrade_if_overdue(&self) {
-        if self.group.upgrade_overdue.swap(false, Ordering::AcqRel) {
-            Self::lead_upgrade(&self.inner, &self.group);
+        // A plain load first (engine review 18 MED 5): every commit and delete in every class came
+        // here, and an unconditional swap was a read-modify-write of the group's shared line each.
+        if self.group.upgrade_overdue.load(Ordering::Acquire)
+            && self.group.upgrade_overdue.swap(false, Ordering::AcqRel)
+            && Self::lead_upgrade(&self.inner, &self.group)
+        {
+            self.group.lock().hardcap_upgrades += 1;
         }
     }
 
@@ -4886,6 +6593,40 @@ impl BranchStore {
             return;
         }
         if inner.cat.is_none() || !self.fuzzy {
+            // A compaction that syncs (a D1 or D2 store's, a raised D0 store's) leaves this
+            // operation's acknowledgement path (DECISIONS c9c821dd8d): a snapshot store's is owed
+            // to the background writer, which this wakes once. Past the hard limit (the writer
+            // fell behind), with no writer running (it could not start; a fork(2) child), and in
+            // a sharp catalog store it still runs here, and is counted (`inline_compaction_syncs`).
+            // Mutant `compaction_on_ack_path` (test builds only): here always, as before.
+            // A D0 snapshot store's compaction syncs nothing, but it encodes a snapshot of every
+            // branch: O(N) allocation and time in the operation's own hold (budget
+            // create_allocates_no_table_of_every_branch_under_the_store_mutex: 2.2 MB at 33k
+            // branches). It is owed to the writer too. Mutant `d0_compaction_inline` (test builds
+            // only): run here, as before.
+            let syncs = inner.journal.as_ref().is_some_and(|j| j.rewrite_class().syncs());
+            if syncs || !fe_mutant("d0_compaction_inline") {
+                let past_hard = inner.journal.as_ref().is_some_and(Journal::past_hard_limit);
+                if inner.cat.is_none() && !past_hard && self.writer_runs() && !fe_mutant("compaction_on_ack_path") {
+                    if self
+                        .group
+                        .compact_due
+                        .compare_exchange(COMPACT_IDLE, COMPACT_DUE, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                    {
+                        // Under the group's lock, which the writer holds while it checks the flag
+                        // and then waits: the wake cannot fall between the two.
+                        let _g = self.group.lock();
+                        #[cfg(test)]
+                        self.group.confirm_notified();
+                        self.group.confirm_cv.notify_one();
+                    }
+                    return;
+                }
+                if syncs {
+                    self.group.lock().inline_compaction_syncs += 1;
+                }
+            }
             if let Err(e) = self.compact(inner, false) {
                 tracing::warn!("branch store compaction failed: {e}");
                 if let Some(journal) = inner.journal.as_mut() {
@@ -4899,24 +6640,38 @@ impl BranchStore {
         // cleared by the install under the same mutex, so it is never left set with no flight.
         // (During a WAL truncation no checkpoint starts and none waits: the log can pass twice the
         // threshold by what that truncation's time appends.)
-        match self.start_flight(inner) {
-            // A start that failed (settle, capture or spawn) backs off as a failed write does
-            // (review 4 #2): not retried, under this mutex, by every operation until another
-            // threshold's worth of log. Mutant `start_failure_retried` (test builds only).
-            FlightStart::Failed => {
-                if let Some(cat) = inner.cat.as_mut() {
-                    cat.ckpt.start_failures += 1;
+        // L2(d) (ASYNC-DESIGN R1.3, superseding §6.2's start here): the operation that crossed
+        // the threshold starts no checkpoint inside its own hold; it owes one, and once it has let
+        // the mutex go the checkpoint worker starts it (`start_owed_flight`, `run_owed_start`),
+        // in a hold of its own. Before, one create in 16,384 paid the capture in its hold (raws
+        // l82, l92). Mutant `flight_start_inline` (test builds only): started here, as before.
+        if !fe_mutant("flight_start_inline") {
+            if inner.cat.as_ref().is_some_and(|c| c.flight) {
+                if inner.journal.as_ref().is_some_and(|j| j.past_hard_limit()) {
+                    self.over_hard.store(true, Ordering::Release);
                 }
-                if let Some(journal) = inner.journal.as_mut().filter(|_| !fe_mutant("start_failure_retried")) {
-                    journal.defer_compaction();
-                }
+                return;
             }
-            FlightStart::InFlight
-                if inner.journal.as_ref().is_some_and(|j| j.past_hard_limit()) =>
-            {
-                self.over_hard.store(true, Ordering::Release);
-            }
-            _ => {}
+            self.start_due.store(true, Ordering::Release);
+            return;
+        }
+        held_trace("compact.flight_starting");
+        let started = self.start_flight(inner);
+        held_trace("compact.flight_start_returned");
+        settle_start(&self.over_hard, inner, started);
+    }
+
+    /// The checkpoint an operation owed (`maybe_compact`), started by the checkpoint worker once
+    /// that operation has let the store mutex go: called after the unlock, by every operation that
+    /// can owe one. Nothing is done unless one is owed.
+    fn start_owed_flight(&self) {
+        if !self.start_due.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        let ctx = self.flight_ctx();
+        if let Err(e) = self.dispatch_flight(Box::new(move || run_owed_start(ctx))) {
+            // No worker: the next operation over the threshold owes it again.
+            tracing::warn!("branch catalog checkpoint not started (no worker): {e}");
         }
     }
 
@@ -4924,6 +6679,34 @@ impl BranchStore {
     /// first, at most `SETTLE_BATCH` branches per call, and the checkpoint waits for the next call
     /// while any remain. Returns whether a checkpoint started, or why not.
     fn start_flight(&self, inner: &mut StoreInner) -> FlightStart {
+        let ctx = self.flight_ctx();
+        Self::start_flight_with(&ctx, inner, Some(self), &mut |job| self.dispatch_flight(job))
+    }
+
+    /// What a fuzzy checkpoint's start needs of its store (L2(d)): Arc clones only, so the
+    /// checkpoint worker can run the start itself, off every operation's hold
+    /// (`start_owed_flight`; ASYNC-DESIGN R1.3, superseding §6.2's start in `maybe_compact`).
+    fn flight_ctx(&self) -> FlightCtx {
+        FlightCtx {
+            inner: self.inner.clone(),
+            group: self.group.clone(),
+            class: self.class,
+            flight_hold: self.flight_hold.clone(),
+            over_hard: self.over_hard.clone(),
+            truncating: self.truncating.clone(),
+            installs: self.installs.clone(),
+        }
+    }
+
+    /// `start_flight` given its context: `store` for the one mutant that needs the whole store
+    /// (`settle_at_capture`; `None` on the worker), and `dispatch` to send the flight's job.
+    fn start_flight_with(
+        ctx: &FlightCtx,
+        inner: &mut StoreInner,
+        store: Option<&BranchStore>,
+        dispatch: &mut dyn FnMut(CkptJob) -> std::io::Result<()>,
+    ) -> FlightStart {
+        ckpt_held("capture.begin");
         match inner.cat.as_ref() {
             None => return FlightStart::NotCatalog,
             Some(c) if c.flight => return FlightStart::InFlight,
@@ -4932,7 +6715,7 @@ impl BranchStore {
         if inner.poisoned() {
             return FlightStart::Poisoned;
         }
-        if self.truncating.load(Ordering::Acquire) {
+        if ctx.truncating.load(Ordering::Acquire) {
             return FlightStart::Truncating;
         }
         // G-b (r13-compose A4.G): every fuzzy path reaches here; a splice-arm store is refused and
@@ -4963,27 +6746,28 @@ impl BranchStore {
         // free in the catalog and taken out of memory only at the install (`Captured::deferred`).
         // Mutant `settle_at_capture` (test builds only): the flush under the mutex, as before.
         if fe_mutant("settle_at_capture") {
-            if let Err(e) = self.settle_durable(inner) {
+            if let Err(e) = store.map_or(Ok(()), |store| store.settle_durable(inner)) {
                 tracing::warn!("branch catalog checkpoint not started: {e}");
                 return FlightStart::Failed;
             }
         }
-        self.mature(inner);
+        mature_with(&ctx.group, ctx.class, inner);
         // Mutant `capture_waits_bounded` (test builds only; review 7 #7's flagged-edit judge): the
         // capture waits, at most 3 s, for a flight in the air: a bounded wait a deadline-only
         // check lets pass.
         #[cfg(test)]
         if fe_mutant("capture_waits_bounded") {
-            let g = self.group.lock();
+            let g = ctx.group.lock();
             if g.flushing {
                 note_wait();
-                let _ = self.group.cv.wait_timeout(g, Duration::from_secs(3));
+                let _ = ctx.group.cv.wait_timeout(g, Duration::from_secs(3));
             }
         }
         let t = Instant::now();
         let q0 = inner.cat.as_ref().map_or(0, |c| c.catalog.counters.queries);
         // Read only for mutant `checkpoint_own_arena_sync`: a fuzzy capture takes no arena handle.
-        let flight_in_air = fe_mutant("checkpoint_own_arena_sync") && self.group.lock().flushing;
+        let flight_in_air = fe_mutant("checkpoint_own_arena_sync") && ctx.group.lock().flushing;
+        ckpt_held("capture.matured");
         let cap = match inner.checkpoint_capture_mode(false, true, flight_in_air) {
             Ok(cap) => cap,
             Err(e) => {
@@ -4991,35 +6775,34 @@ impl BranchStore {
                 return FlightStart::Failed;
             }
         };
+        ckpt_held("capture.captured");
         let cat = inner.cat.as_mut().expect("captured above");
         cat.ckpt.hold(ns(t));
         cat.ckpt.stmts_locked += cat.catalog.counters.queries - q0;
         let writer = cat.writer.clone();
-        let dirty = cap.dirty.clone();
-        let shared = self.inner.clone();
-        let group = self.group.clone();
-        let hold = self.flight_hold.clone();
-        let over_hard = self.over_hard.clone();
-        let truncating = self.truncating.clone();
-        let installs = self.installs.clone();
-        let mut flights = self.flights.lock();
-        if flights.len() >= FLIGHTS_KEPT {
-            // Past its install long ago (only one checkpoint is ever in flight), so this join
-            // waits for nothing.
-            let _ = flights.remove(0).join();
-        }
+        // The capture travels in a slot the job empties, so a dispatch that fails gives it back to
+        // undo with (L2(d): before, its dirty map was cloned under the mutex for that undo, 3,126
+        // of a create's 6,288 held allocations when the create started a checkpoint, raw l90).
+        let slot: Arc<std::sync::Mutex<Option<Box<Captured>>>> = Arc::new(std::sync::Mutex::new(Some(cap)));
+        let job_slot = slot.clone();
+        let shared = ctx.inner.clone();
+        let group = ctx.group.clone();
+        let hold = ctx.flight_hold.clone();
+        let over_hard = ctx.over_hard.clone();
+        let truncating = ctx.truncating.clone();
+        let installs = ctx.installs.clone();
         let spawned = if inner.failpoint.take_if(|f| *f == BranchFailpoint::SpawnFails).is_some() {
             Err(std::io::Error::other("failpoint: the checkpoint thread was not spawned"))
         } else {
-            crate::thread::Builder::new()
-                .name("branch-checkpoint".to_string())
-                .spawn(move || {
+            dispatch(Box::new(move || {
+                let cap = job_slot.lock().unwrap_or_else(|e| e.into_inner()).take();
+                if let Some(cap) = cap {
                     run_flight(shared, group, writer, cap, hold, over_hard, truncating, installs)
-                })
+                }
+            }))
         };
         match spawned {
-            Ok(handle) => {
-                flights.push(handle);
+            Ok(()) => {
                 if let Some(cat) = inner.cat.as_mut() {
                     cat.ckpt.flights += 1;
                 }
@@ -5030,12 +6813,16 @@ impl BranchStore {
                 // commits (recovery cuts only at a committed one): undo the capture (the thread's
                 // closure, and the capture with it, are gone).
                 tracing::warn!("branch catalog checkpoint thread not started: {e}");
+                let cap = slot.lock().unwrap_or_else(|e| e.into_inner()).take();
                 let cat = inner.cat.as_mut().expect("captured above");
                 cat.catalog.end_read_snapshot();
                 cat.flight = false;
-                for (id, what) in dirty {
-                    *cat.dirty.entry(id).or_insert(0) |= what;
+                if let Some(cap) = cap {
+                    for (id, what) in cap.dirty {
+                        *cat.dirty.entry(id).or_insert(0) |= what;
+                    }
                 }
+                inner.unfreeze_capture();
                 FlightStart::Failed
             }
         }
@@ -5048,9 +6835,14 @@ impl BranchStore {
         let store = self.inner.clone();
         #[cfg(test)]
         super::budget_probe::persistent_started();
+        // Before the spawn, so a writer that stops at once leaves it 0 (`WriterExit`).
+        self.group.writer_pid.store(std::process::id(), Ordering::Release);
         match crate::thread::Builder::new()
             .name("branch-confirm".to_string())
             .spawn(move || {
+                // budgets-port-adversary MED-1: owned by registration (test builds).
+                #[cfg(test)]
+                let _owned = super::budget_probe::register_owned_thread("branch-confirm");
                 run_confirm_writer(group, store);
                 #[cfg(test)]
                 super::budget_probe::persistent_ended();
@@ -5058,6 +6850,7 @@ impl BranchStore {
         {
             Ok(handle) => *self.confirm_writer.lock() = Some((std::process::id(), handle)),
             Err(e) => {
+                self.group.writer_pid.store(0, Ordering::Release);
                 #[cfg(test)]
                 super::budget_probe::persistent_ended();
                 tracing::warn!("branch log confirmation writer not started: {e}")
@@ -5084,14 +6877,65 @@ impl BranchStore {
         }
     }
 
-    /// Wait for every fuzzy checkpoint thread started so far (F-FZ). Called without the store
-    /// mutex: a thread in flight takes it for its install.
-    fn join_flights(&self) {
-        let handles = std::mem::take(&mut *self.flights.lock());
-        for handle in handles {
-            if handle.join().is_err() {
-                tracing::warn!("a branch catalog checkpoint thread panicked");
+    /// Hand a fuzzy checkpoint to the persistent worker, starting it first if this process has
+    /// none (checkpoint FIX, budget a_checkpoint_issues_at_most_two_syscalls_under_the_store_mutex:
+    /// a thread spawn per checkpoint was about ten syscalls inside the starting operation's
+    /// store-mutex hold; a send wakes a parked worker with one). A fork(2) child has no worker of
+    /// its parent's, and starts its own. A worker that died is replaced once. Mutant
+    /// `checkpoint_thread_per_flight` (test builds only): a new thread for every one, as before.
+    fn dispatch_flight(&self, job: CkptJob) -> std::io::Result<()> {
+        if fe_mutant("checkpoint_thread_per_flight") {
+            let jobs = self.flight_jobs.clone();
+            jobs.0.lock().unwrap_or_else(|e| e.into_inner()).0 += 1;
+            let handle = crate::thread::Builder::new().name("branch-checkpoint".to_string()).spawn(move || {
+                #[cfg(test)]
+                let _owned = super::budget_probe::register_owned_thread("branch-checkpoint");
+                job();
+                CkptWorker::finished(&jobs);
+            });
+            return handle.map(drop).inspect_err(|_| CkptWorker::finished(&self.flight_jobs));
+        }
+        let mut worker = self.ckpt_worker.lock();
+        let pid = std::process::id();
+        if worker.as_ref().is_some_and(|w| w.pid != pid) {
+            // The parent's thread does not exist in this process: never joined, never sent to.
+            std::mem::forget(worker.take());
+        }
+        self.flight_jobs.0.lock().unwrap_or_else(|e| e.into_inner()).0 += 1;
+        let mut job = job;
+        for _ in 0..2 {
+            if worker.is_none() {
+                match CkptWorker::start(self.flight_jobs.clone()) {
+                    Ok(w) => *worker = Some(w),
+                    Err(e) => {
+                        CkptWorker::finished(&self.flight_jobs);
+                        return Err(e);
+                    }
+                }
             }
+            match worker.as_ref().expect("started above").tx.send(job) {
+                Ok(()) => return Ok(()),
+                Err(std::sync::mpsc::SendError(back)) => {
+                    // It exited: joined, and replaced.
+                    if let Some(w) = worker.take() {
+                        let _ = w.handle.join();
+                    }
+                    job = back;
+                }
+            }
+        }
+        CkptWorker::finished(&self.flight_jobs);
+        Err(std::io::Error::other("the branch catalog checkpoint worker could not be started"))
+    }
+
+    /// Wait for every fuzzy checkpoint handed out so far to finish (F-FZ). Called without the
+    /// store mutex: one in flight takes it for its install.
+    fn join_flights(&self) {
+        let (m, cv) = &*self.flight_jobs;
+        let mut jobs = m.lock().unwrap_or_else(|e| e.into_inner());
+        let target = jobs.0;
+        while jobs.1 < target {
+            jobs = cv.wait(jobs).unwrap_or_else(|e| e.into_inner());
         }
     }
 
@@ -5132,10 +6976,19 @@ impl BranchStore {
             self.unsynced.store(false, Ordering::Release);
             return Ok(());
         }
+        Self::compact_snapshot(inner, &self.group, fail_after_rename)?;
+        self.unsynced.store(false, Ordering::Release);
+        Ok(())
+    }
+
+    /// A snapshot store's compaction (`compact`): the log replaced by a snapshot of the state.
+    /// Called holding the store mutex, by an operation or by the background writer
+    /// (`lead_compaction`).
+    fn compact_snapshot(inner: &mut StoreInner, group: &Group, fail_after_rename: bool) -> Result<()> {
         // No flight may be writing the log this truncates. The snapshot carries every applied
         // operation, the early-released ones still buffered included, so once it is durable so are
         // they.
-        drop(self.group.quiesce());
+        drop(group.quiesce());
         let snapshot = inner.snapshot();
         let StoreInner {
             journal,
@@ -5148,12 +7001,255 @@ impl BranchStore {
         };
         let class = rewritten_class(journal);
         journal.compact(&snapshot, arena, fail_after_rename)?;
-        self.group.mark_durable(journal.lsn(), rewrite_class_marked(Some(class), journal));
+        group.mark_durable(journal.lsn(), rewrite_class_marked(Some(class), journal));
         // The snapshot carries the clock, and it replaced every buffered stamp.
         lease.queued(snapshot.lease_now_ms);
         lease.flushed();
-        self.unsynced.store(false, Ordering::Release);
         Ok(())
+    }
+
+    /// The compaction an operation owed to the background writer (`Group::compact_due`; DECISIONS
+    /// c9c821dd8d), led by it off every acknowledgement path (`compact_in_background`). A failure
+    /// backs off as an operation's does (`defer_compaction`). Mutant `compaction_syncs_under_mutex`
+    /// (test builds only): the whole compaction under the store mutex, as at c9c821dd8d, with every
+    /// operation arriving meanwhile counted (`compaction_waits`).
+    fn lead_compaction(store: &StoreMutex, group: &Group) {
+        #[cfg(test)]
+        let _scope = CountScope::enter(&store.counts);
+        if group
+            .compact_due
+            .compare_exchange(COMPACT_DUE, COMPACT_RUNNING, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let led = if fe_mutant("compaction_syncs_under_mutex") {
+            store.compacting.fetch_add(1, Ordering::AcqRel);
+            let mut inner = store.lock_uncounted();
+            #[cfg(test)]
+            pause_at(Some(&group.confirm_hold), HOLD_COMPACT_TAKEN);
+            let led = if inner.cat.is_none() && inner.journal.as_ref().is_some_and(Journal::wants_compaction) {
+                Self::compact_snapshot(&mut inner, group, false)
+            } else {
+                Ok(())
+            };
+            drop(inner);
+            store.compacting.fetch_add(1, Ordering::AcqRel);
+            led
+        } else {
+            Self::compact_in_background(store, group)
+        };
+        if let Err(e) = led {
+            tracing::warn!("branch store compaction failed: {e}");
+            if let Some(journal) = store.lock().journal.as_mut() {
+                journal.defer_compaction();
+            }
+        }
+        group.compact_due.store(COMPACT_IDLE, Ordering::Release);
+    }
+
+    /// A snapshot store's syncing compaction with no sync under the store mutex (DECISIONS
+    /// bd0d845f97), the held-free upgrade's shape: what it syncs is taken under the mutex, synced
+    /// holding no lock, and landed under the mutex only over the log it was taken from (the
+    /// journal's rewrites count, nonce and generation). Operations go on throughout, their group
+    /// flights included.
+    ///
+    /// 1. Capture (mutex): the state's snapshot, a `Record::Checkpoint` marker of the next
+    ///    generation buffered after it, the arena's handle (`Journal::begin_bg_compaction`).
+    /// 2. The marker written (holding no lock; a flight is led if none does it).
+    /// 3. The arena and the snapshot's temp file synced (no lock).
+    /// 4. The snapshot renamed in (mutex, if the log is unchanged); from here a crash leaves an
+    ///    older log whose records past the marker recovery replays over the snapshot.
+    /// 5. Its directory synced (no lock); everything below the marker is then durable in the class.
+    /// 6. The log cut to what follows the marker: copied and synced into a temp log holding no
+    ///    lock (`prepare_cut`), caught up likewise with what flights wrote meanwhile
+    ///    (`extend_cut`, up to `COMPACT_CATCH_UPS` passes), then renamed in under the mutex
+    ///    (`finish_cut`) once nothing is left to copy. Only if flights still landed after the last
+    ///    pass is that tail copied and synced under the mutex: counted (`compaction_waits`).
+    ///
+    /// Test hooks (`Group::confirm_hold`): `HOLD_COMPACT_TAKEN` after step 2, and
+    /// `HOLD_COMPACT_TAIL` inside the counted tail's mutex hold.
+    fn compact_in_background(store: &StoreMutex, group: &Group) -> Result<()> {
+        #[cfg(test)]
+        let hold = Some(&group.confirm_hold);
+        let bg = {
+            let mut inner = store.lock();
+            if inner.cat.is_some() || !inner.journal.as_ref().is_some_and(Journal::wants_compaction) {
+                return Ok(());
+            }
+            let snapshot = inner.snapshot();
+            let StoreInner { journal, arena, .. } = &mut *inner;
+            let (Some(journal), Some(arena)) = (journal.as_mut(), arena.as_ref()) else {
+                return Ok(());
+            };
+            journal.begin_bg_compaction(&snapshot, arena)?
+        };
+        #[cfg(test)]
+        {
+            group.lock().background_compactions += 1;
+        }
+        let landed = (|| -> Result<()> {
+            Self::wait_durable_on(store, group, None, bg.lsn(), SyncClass::Off)?;
+            #[cfg(test)]
+            pause_at(hold, HOLD_COMPACT_TAKEN);
+            bg.sync_snapshot()?;
+            let installed = match store.lock().journal.as_mut() {
+                Some(journal) => journal.install_bg_snapshot(&bg)?,
+                None => false,
+            };
+            if !installed {
+                return Ok(());
+            }
+            bg.sync_dir()?;
+            group.mark_committed(bg.lsn(), bg.class());
+            #[cfg(test)]
+            {
+                group.held_cut_from.store(bg.from(), Ordering::Release);
+                pause_at(hold, HOLD_COMPACT_INSTALLED);
+            }
+            // Test builds: stop here, as a crash between the snapshot's rename and the log's cut
+            // would (`COMPACT_STOP_BEFORE_CUT`).
+            #[cfg(test)]
+            if COMPACT_STOP_BEFORE_CUT.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            Self::cut_in_background(store, group, &bg)
+        })();
+        bg.discard();
+        landed
+    }
+
+    /// Step 6 of `compact_in_background`: the log cut to what follows the marker.
+    fn cut_in_background(store: &StoreMutex, group: &Group, bg: &super::journal::BgCompaction) -> Result<()> {
+        #[cfg(test)]
+        let hold = Some(&group.confirm_hold);
+        let (from, generation) = (bg.from(), bg.generation());
+        let source = {
+            let inner = Self::lock_quiesced(store, group)?;
+            let Some(journal) = inner.journal.as_ref() else {
+                return Ok(());
+            };
+            match journal.bg_cut_source(bg)? {
+                Some(source) => source,
+                None => return Ok(()),
+            }
+        };
+        let mut prep = Journal::prepare_cut(source, from, generation)?;
+        #[cfg(test)]
+        pause_at(hold, HOLD_COMPACT_PREPARED);
+        let passes = if compact_no_catch_up() { 0 } else { COMPACT_CATCH_UPS };
+        // The last pass copies under the mutex whatever is left. When that copy must be synced (a
+        // flight left in it claimed a sync), the hold is counted from before it locks to after it
+        // unlocks (`Compacting`, declared before `inner`, so dropped after it): the pass locks
+        // again counted. Under `COMPACT_CATCH_UPS_OFF` (the plant) it is counted every time.
+        let mut counted: Option<Compacting<'_>> = None;
+        let mut pass = 0;
+        loop {
+            let last = pass >= passes;
+            if last && compact_catch_ups_off() && counted.is_none() {
+                counted = Some(Compacting::begin(store));
+            }
+            let mut inner = Self::lock_quiesced(store, group)?;
+            let Some(journal) = inner.journal.as_mut() else {
+                break;
+            };
+            if !journal.cut_usable(&prep, from, generation) {
+                break;
+            }
+            let to = journal.log_len();
+            if to > prep.upto() && !last {
+                let fail = journal.take_replacement_sync_failure();
+                drop(inner);
+                Journal::extend_cut(&mut prep, to, fail)?;
+                pass += 1;
+                continue;
+            }
+            if counted.is_none() && journal.cut_tail_syncs(&prep)? {
+                drop(inner);
+                counted = Some(Compacting::begin(store));
+                continue;
+            }
+            #[cfg(test)]
+            if counted.is_some() {
+                pause_at(hold, HOLD_COMPACT_TAIL);
+            }
+            journal.finish_cut(prep, from, generation)?;
+            journal.set_snapshot_len(bg.snapshot_len());
+            // What the flights after the marker wrote is durable only in their own class: the cut's
+            // rename waits for the next flight's directory sync, as a catalog store's install's.
+            let written = journal.lsn() - journal.pending_len();
+            let class = journal.sync_class();
+            group.mark_durable(written, class);
+            let durable = group.durable(inner.free_class());
+            inner.mature_frees(durable);
+            let retired = inner.journal.as_mut().and_then(Journal::take_retired);
+            drop(inner);
+            // The old log's handles close holding no lock.
+            drop(retired);
+            drop(counted);
+            return Ok(());
+        }
+        // The log changed under the cut: the snapshot stays installed, the older log is replayed
+        // past its marker, and the next compaction cuts it.
+        Ok(())
+    }
+
+    /// The store mutex with no group flight in the air (a cut's copy must end a flight): waited for
+    /// holding no lock, then re-checked under it. Fails once the store is fail-stopped.
+    #[track_caller]
+    fn lock_quiesced<'a>(store: &'a StoreMutex, group: &Group) -> Result<StoreGuard<'a>> {
+        loop {
+            {
+                let mut g = group.lock();
+                while g.flushing {
+                    if group.poisoned() {
+                        return Err(group_poisoned());
+                    }
+                    g = group.wait(g);
+                }
+            }
+            let inner = store.lock_uncounted();
+            if group.poisoned() {
+                return Err(group_poisoned());
+            }
+            if !group.lock().flushing {
+                return Ok(inner);
+            }
+        }
+    }
+
+    /// Whether this process's background writer runs (`start_confirm_writer`): not when it could
+    /// not start, not in a fork(2) child, not once the store closed.
+    fn writer_runs(&self) -> bool {
+        self.group.writer_pid.load(Ordering::Acquire) == std::process::id()
+    }
+
+    /// The counted exceptions to "no create, connect, first write, delete or trunk commit waits on
+    /// background work" (DECISIONS c9c821dd8d and the C15 ruling, 2026-10-15T04:15:07Z): `[held-free
+    /// upgrades led by a freeing operation past the hard cap, held-free upgrades that took the
+    /// flight slot to raise the header's class, compactions that synced inline on an operation,
+    /// operations that waited behind a background compaction]`. Each must not move inside a
+    /// credited window: a cell whose window moves one is labelled and not credited.
+    pub(crate) fn exception_counters(&self) -> [u64; 4] {
+        let g = self.group.lock();
+        [
+            g.hardcap_upgrades,
+            g.header_raise_exclusive,
+            g.inline_compaction_syncs,
+            self.inner.compaction_waits.load(Ordering::Relaxed),
+        ]
+    }
+
+    /// Fuzzy checkpoints that failed Busy at the settle bound (engine review 18 MED 4; observation
+    /// only).
+    pub(crate) fn settle_timeouts(&self) -> u64 {
+        self.group.lock().settle_timeouts
+    }
+
+    /// Test builds: compactions the background writer led (DECISIONS c9c821dd8d; observation only).
+    #[cfg(test)]
+    pub(crate) fn background_compactions(&self) -> u64 {
+        self.group.lock().background_compactions
     }
 
     /// The commit gate's count, for a lock-free trunk fork to read before it takes its WAL read
@@ -5241,7 +7337,9 @@ impl BranchStore {
         // F-FZ back-pressure: dropped after the guard below.
         let _backpressure = Backpressure(self);
         let mut inner = self.lock_counted();
+        held_trace("fork.locked");
         self.mature(&mut inner);
+        held_trace("fork.matured");
         let restart = inner.arena.as_ref().is_some_and(|a| a.page_size() != page_size);
         if restart {
             // `ensure_backing` may start an empty store over (a compaction or checkpoint that
@@ -5258,7 +7356,9 @@ impl BranchStore {
                 self.group.mark_durable(journal.lsn(), rewrite_class_marked(restart_class, journal));
             }
         }
+        held_trace("fork.backed");
         let (_, now) = self.expire(&mut inner, Stamp::Queue)?;
+        held_trace("fork.expired");
         // After the expiry pass, which can reap the trunk's last child: a lock-free fork must never
         // be the first one.
         let mut schema = schema;
@@ -5292,20 +7392,27 @@ impl BranchStore {
             }
         }
         let id = BranchId(inner.next_id);
-        let (records, lease) = inner.fork_records(id, BranchId::TRUNK, now, name);
+        held_trace("fork.named");
+        // One allocation for a name, shared by its record and the name index.
+        let name_arc: Option<Arc<str>> = name.map(Arc::from);
+        let (records, lease) = inner.fork_records(id, BranchId::TRUNK, now, name_arc.as_ref());
+        held_trace("fork.records");
         if let Some((_, stamped)) = lease {
             inner.lease.queued(stamped);
         }
         // Early release (fastest-engine M1 item 2): buffered, applied, and made durable by the
         // caller's `wait_durable` once it holds no lock.
-        let lsn = self.buffer_records(&mut inner, &records)?;
+        let lsn = self.buffer_records(&mut inner, records.iter().flatten())?;
+        held_trace("fork.buffered");
         let handle = if name.is_some() { Handle::Detached } else { Handle::Attached };
-        if let Err(e) = inner.apply_fork(BranchId::TRUNK, id, schema, handle, name.map(Arc::from)) {
+        if let Err(e) = inner.apply_fork(BranchId::TRUNK, id, schema, handle, name_arc) {
             return Err(inner.fatal(e));
         }
+        held_trace("fork.applied");
         inner.apply_fork_lease(id, lease);
         inner.note_fork_lsn(id, lsn);
         self.sync_trunk_children(&inner);
+        held_trace("fork.children_synced");
         kill_point("fork.applied");
         let work = &mut inner.work;
         work.trunk_forks += 1;
@@ -5315,7 +7422,13 @@ impl BranchStore {
             work.trunk_forks_locked += 1;
         }
         self.sync_lease_flag(&inner);
+        held_trace("fork.lease_synced");
         self.maybe_compact(&mut inner);
+        held_trace("fork.done");
+        let work = inner.names.filter.take_owed();
+        drop(inner);
+        self.start_owed_flight();
+        self.start_filter_work(work);
         Ok(TrunkFork::Forked { id, lsn, after })
     }
 
@@ -5381,19 +7494,24 @@ impl BranchStore {
             }
         }
         let id = BranchId(inner.next_id);
-        let (records, lease) = inner.fork_records(id, parent, now, name);
+        let name_arc: Option<Arc<str>> = name.map(Arc::from);
+        let (records, lease) = inner.fork_records(id, parent, now, name_arc.as_ref());
         if let Some((_, stamped)) = lease {
             inner.lease.queued(stamped);
         }
-        let lsn = self.buffer_records(&mut inner, &records)?;
+        let lsn = self.buffer_records(&mut inner, records.iter().flatten())?;
         let handle = if name.is_some() { Handle::Detached } else { Handle::Attached };
-        if let Err(e) = inner.apply_fork(parent, id, schema, handle, name.map(Arc::from)) {
+        if let Err(e) = inner.apply_fork(parent, id, schema, handle, name_arc) {
             return Err(inner.fatal(e));
         }
         inner.apply_fork_lease(id, lease);
         inner.note_fork_lsn(id, lsn);
         self.sync_lease_flag(&inner);
         self.maybe_compact(&mut inner);
+        let work = inner.names.filter.take_owed();
+        drop(inner);
+        self.start_owed_flight();
+        self.start_filter_work(work);
         Ok((id, lsn))
     }
 
@@ -5447,6 +7565,20 @@ impl BranchStore {
     /// was abandoned, and frees the branch if it was released meanwhile.
     pub(crate) fn close(&self, id: BranchId) {
         let mut inner = self.inner.lock();
+        // Fire-check plants of the class (e) hold audit (lead order 2026-10-15; test builds only):
+        // one syscall (`audit_plant_syscall_disconnect`), or one allocation
+        // (`audit_plant_alloc_disconnect`), in this hold, which is clean today. The audit must go
+        // red naming this site.
+        #[cfg(test)]
+        {
+            if fe_mutant("audit_plant_syscall_disconnect") {
+                // getppid(2) traps into the kernel (getpid does not: the shim excludes it).
+                std::hint::black_box(unsafe { libc::getppid() });
+            }
+            if fe_mutant("audit_plant_alloc_disconnect") {
+                std::hint::black_box(Box::new(0u64));
+            }
+        }
         let mut freed = Vec::new();
         // A released branch is collected (and possibly spliced) here, outside any other logged
         // operation, so the close is logged: replay collects it at this same point (F7 durable
@@ -5515,9 +7647,11 @@ impl BranchStore {
         pause_at(Some(&*self.trunk_commit_hold), HOLD_CONNECT_LOOKED_UP);
     }
 
-    /// Whether branch `id` is gone or released (`Handle::is_released`): what a drop that landed
-    /// after `connect_named`'s lookup leaves (engine review 14 MED 9). Called on the connect's
-    /// error path only. A failed lookup counts as not gone, so the connect's own error stands.
+    /// Test builds, mutant `connect_race_maps_released` only (engine review 20 item 4): whether
+    /// branch `id` is gone or released in memory (`Handle::is_released`), which `connect_named`'s
+    /// error path read before: it neither waits for the Release to be durable nor applies the
+    /// fail-stop rule. A failed lookup counts as not gone.
+    #[cfg(test)]
     pub(crate) fn is_gone_or_released(&self, id: BranchId) -> bool {
         let mut inner = self.inner.lock();
         match inner.ensure(id) {
@@ -5633,6 +7767,7 @@ impl BranchStore {
         self.maybe_compact(&mut inner);
         let class = inner.sync;
         drop(inner);
+        self.start_owed_flight();
         kill_point("release.applied");
         #[cfg(test)]
         pause_at(Some(&*self.trunk_commit_hold), HOLD_RELEASE_BUFFERED);
@@ -5942,8 +8077,9 @@ impl BranchStore {
     }
 
     /// The copy decision for a branch's first write to `page` in a transaction: reserve the fresh
-    /// slot the commit will write the page into. Nothing is published until then.
-    pub(crate) fn first_write_branch(&self, id: BranchId, page: u32) -> Result<()> {
+    /// slot the commit will write the page into. Nothing is published until then. Returns the
+    /// reservation, for the commit to write holding no lock (`Reserved`).
+    pub(crate) fn first_write_branch(&self, id: BranchId, page: u32) -> Result<Reserved> {
         let mut inner = self.inner.lock();
         // Covered deferred frees first, so this reservation can reuse them (group commit).
         self.mature(&mut inner);
@@ -5966,12 +8102,15 @@ impl BranchStore {
                 id.0
             )));
         }
-        if let std::collections::hash_map::Entry::Vacant(e) = st.pending.entry(page) {
-            e.insert(arena.alloc());
-            // F-W2: this branch may hold a reserved slot at the next checkpoint.
-            pending_holders.insert(id);
-        }
-        Ok(())
+        let slot = match st.pending.entry(page) {
+            std::collections::hash_map::Entry::Vacant(e) => {
+                // F-W2: this branch may hold a reserved slot at the next checkpoint.
+                pending_holders.insert(id);
+                *e.insert(arena.alloc())
+            }
+            std::collections::hash_map::Entry::Occupied(e) => *e.get(),
+        };
+        Ok(Reserved { slot, io: arena.slot_io(slot) })
     }
 
     /// The copy decisions of one trunk commit, taken at its serialization point: after its frames
@@ -6129,6 +8268,15 @@ impl BranchStore {
     /// (it always stops, as before engine review 9 #5 in D2).
     pub(crate) fn trunk_wal_sync_failed(&self, drains: bool) {
         self.sync_failures.fetch_add(1, Ordering::AcqRel);
+        // A branch catalog's own store forwards the failure, as it happens, to the store whose
+        // catalog it is (engine review 21 MED 5): decided there now, not after that store's phase
+        // 4 returned (`truncate_catalog_wal`), when a flight that landed in between would hide the
+        // loss. Mutant `catalog_sync_failure_decided_late` (test builds only): not forwarded.
+        if let Some(parent) = self.drain_parent.get().and_then(crate::sync::Weak::upgrade) {
+            if !fe_mutant("catalog_sync_failure_decided_late") {
+                parent.drain_failed(drains, |_| true);
+            }
+        }
         if fe_mutant("no_wal_fail_stop") {
             return;
         }
@@ -6161,6 +8309,18 @@ impl BranchStore {
     /// The failed syncs of this store's trunk files reported to it (`trunk_wal_sync_failed`).
     pub(crate) fn sync_failures(&self) -> u64 {
         self.sync_failures.load(Ordering::Acquire)
+    }
+
+    /// Make this store (a branch catalog's own) forward its failed syncs, as they happen, to
+    /// `parent`, the group of the store whose catalog it is (engine review 21 MED 5). Once.
+    pub(crate) fn link_drain_parent(&self, parent: crate::sync::Weak<Group>) {
+        let _ = self.drain_parent.set(parent);
+    }
+
+    /// This store's group's own handle, for its catalog to forward failed syncs to
+    /// (`Catalog::link_drain_parent`).
+    pub(crate) fn group_handle(group: &Group) -> Option<crate::sync::Weak<Group>> {
+        group.me.get().cloned()
     }
 
     pub(crate) fn end_trunk_commit(&self) {
@@ -6295,8 +8455,9 @@ impl BranchStore {
         {
             return Ok(false);
         }
-        // F-FZ back-pressure: dropped after the guard below.
-        let _backpressure = Backpressure(self);
+        // F-FZ back-pressure: dropped after the guard below, except after an ORDERED barrier (see
+        // `skip_backpressure`).
+        let backpressure = Backpressure(self);
         let mut inner = self.inner.lock();
         self.barrier_locks.fetch_add(1, Ordering::Relaxed);
         // Re-read under the lock: `begin_trunk_commit` sets it while holding it.
@@ -6315,7 +8476,7 @@ impl BranchStore {
         };
         if unsynced && *failpoint == Some(BranchFailpoint::BarrierBeforeRecords) {
             *failpoint = None;
-            *orphans = journal.pending_slots.clone();
+            orphans.clone_from(&journal.pending_slots);
             journal.poison();
             return Err(LimboError::InternalError(
                 "failpoint: the trunk commit's branch barrier stopped before its records"
@@ -6342,6 +8503,14 @@ impl BranchStore {
                 // A stamp only queued: carried by this flush (review N3).
                 stamp_due = true;
             }
+        }
+        // The failpoint `BarrierFlightFails` (engine review 21 MED 14), armed only when this barrier
+        // will lead or ride a flight, so it is spent by exactly that flight.
+        if *failpoint == Some(BranchFailpoint::BarrierFlightFails)
+            && (stamp_due || self.group.durable(class) < required)
+        {
+            *failpoint = None;
+            journal.fail_next_write();
         }
         if unsynced {
             journal.raise_pending_class(class);
@@ -6372,9 +8541,11 @@ impl BranchStore {
                 self.unsynced.store(false, Ordering::Release);
                 self.maybe_compact(&mut inner);
                 drop(inner);
+                self.start_owed_flight();
                 kill_point("trunk.barrier_done");
                 #[cfg(test)]
                 pause_at(Some(&*self.trunk_commit_hold), HOLD_TRUNK_BARRIER_DONE);
+                skip_backpressure(backpressure, ordered);
                 Ok(ordered)
             }
             // Only stamps were at stake: a trunk commit does not fail because its stamp could not
@@ -6382,6 +8553,8 @@ impl BranchStore {
             // flight poisoned the store, as every failed flush does.
             Err(e) if self.group.durable(class) >= required => {
                 tracing::warn!("branch lease clock not stamped at a trunk commit: {e}");
+                drop(inner);
+                skip_backpressure(backpressure, ordered);
                 Ok(ordered)
             }
             Err(e) => Err(e),
@@ -6419,6 +8592,8 @@ impl BranchStore {
     /// (`trunk_wal_synced`). Called by that commit, holding the WAL write lock, so it is the only
     /// trunk commit in flight; the flight it leads is marked pending until its WAL is synced.
     fn order_for_trunk(&self, lsn: u64) -> Result<()> {
+        #[cfg(test)]
+        let _scope = CountScope::enter(&self.inner.counts);
         let full = class_index(SyncClass::FullFsync);
         // An ordered flight barriers the arena: not taken while a checkpoint syncs it (engine
         // review 9 #8). Mutant `arena_sync_ungated`.
@@ -6468,9 +8643,10 @@ impl BranchStore {
                 }
             };
             let end = flight.end_lsn;
-            // An ordered flight is barriered, not synced: it has no confirmation.
-            let (written, _) = split_confirm(flight.write());
-            self.group.land_ordered(end, written.is_ok());
+            // An ordered flight is barriered, not synced: a confirmation it has is unproved until
+            // this commit's WAL flush returns (`trunk_wal_synced`).
+            let (written, confirm) = split_confirm(flight.write());
+            self.group.land_ordered_confirmed(end, written.is_ok(), confirm);
             written?;
         }
     }
@@ -6506,7 +8682,12 @@ impl BranchStore {
     }
 
     /// The trunk commit's WAL F_FULLFSYNC returned: every journal byte below `frontier` (read by
-    /// `order_riders` before it was issued) is durable in every class.
+    /// `order_riders` before it was issued) is durable in every class. That flush drained the device
+    /// after the log's last flight below `frontier` was synced or barriered, so the confirmation the
+    /// writer holds for it, unproved (a plain fsync on Apple, or an ordered flight that no ordered
+    /// end frame closes), is proved now and the writer woken (engine review 21 MEDs 7 and 8): until
+    /// then only a clean close wrote it, and after a kill open's slot check dropped the flight on a
+    /// damaged slot. Mutant `trunk_flush_promotes_nothing` (test builds only): as before.
     pub(crate) fn trunk_wal_synced(&self, frontier: u64) {
         if frontier == 0 {
             return;
@@ -6515,6 +8696,13 @@ impl BranchStore {
         if self.group.accepts() {
             for c in 0..=class_index(SyncClass::FullFsync) {
                 self.group.set_durable(&mut g, c, frontier);
+            }
+            let proved = !fe_mutant("trunk_flush_promotes_nothing")
+                && g.confirm.as_mut().is_some_and(|(_, c)| c.prove_below(frontier));
+            if proved {
+                #[cfg(test)]
+                self.group.confirm_notified();
+                self.group.confirm_cv.notify_one();
             }
         }
         if g.pending_full.is_some_and(|p| p <= frontier) {
@@ -6529,6 +8717,36 @@ impl BranchStore {
     /// A commit whose wait fails leaves the branch in doubt: refused from then on (lead review 1
     /// item 11).
     pub(crate) fn commit_pages(&self, id: BranchId, pages: &[PageRef]) -> Result<()> {
+        self.commit_pages_reserved(id, pages, &HashMap::new())
+    }
+
+    /// `commit_pages`, with the connection's reservations (`BranchBinding::reserved`): when every
+    /// page has a file-arena reservation, the pages are written into their slots BEFORE the store
+    /// mutex is taken (L2 slice, budget first_write_issues_no_syscall_under_the_store_mutex: the
+    /// slot pwrite was a syscall under it). Safe: a reservation is this writer's until its commit
+    /// or abort, both on this connection, so nothing frees or reuses the slot meanwhile; the arena
+    /// is marked dirty in the same hold that buffers the Commit record, so the flight that carries
+    /// the record syncs the slots first, as before. Mutant `commit_slots_under_mutex` (test builds
+    /// only): written under the mutex, as before.
+    pub(crate) fn commit_pages_reserved(&self, id: BranchId, pages: &[PageRef], reserved: &HashMap<u32, Reserved>) -> Result<()> {
+        let prewritten = !pages.is_empty()
+            && !fe_mutant("commit_slots_under_mutex")
+            && !self.group.poisoned()
+            && pages
+                .iter()
+                .all(|p| reserved.get(&(p.get().id as u32)).is_some_and(|r| r.io.is_some()));
+        // Made before the mutex too: no allocation under it for the entries.
+        let mut entries: Vec<(u32, Slot, u32)> = Vec::with_capacity(pages.len());
+        if prewritten {
+            for page in pages {
+                let no = page.get().id as u32;
+                let r = &reserved[&no];
+                let (file, offset) = r.io.as_ref().expect("checked above");
+                let bytes = page.get_contents().as_slice();
+                super::journal::write_at(file, bytes, *offset)?;
+                entries.push((no, r.slot, crc32c::crc32c(bytes)));
+            }
+        }
         // F-FZ back-pressure: dropped after the guard below.
         let _backpressure = Backpressure(self);
         let mut inner = self.inner.lock();
@@ -6552,8 +8770,7 @@ impl BranchStore {
                 return Err(reaped(id));
             }
             let arena = arena.as_mut().expect("a branch exists, so the arena does");
-            let mut entries = Vec::with_capacity(pages.len());
-            for page in pages {
+            for (i, page) in pages.iter().enumerate() {
                 let no = page.get().id as u32;
                 let slot = st.pending.remove(&no).ok_or_else(|| {
                     LimboError::InternalError(format!(
@@ -6561,9 +8778,23 @@ impl BranchStore {
                         id.0
                     ))
                 })?;
-                let bytes = page.get_contents().as_slice();
-                arena.write_slot(slot, bytes)?;
-                entries.push((no, slot, crc32c::crc32c(bytes)));
+                if prewritten {
+                    if entries[i].1 != slot {
+                        return Err(LimboError::InternalError(format!(
+                            "branch {} page {no}: written into slot {} off the mutex, reserved {slot}",
+                            id.0, entries[i].1
+                        )));
+                    }
+                } else {
+                    let bytes = page.get_contents().as_slice();
+                    arena.write_slot(slot, bytes)?;
+                    entries.push((no, slot, crc32c::crc32c(bytes)));
+                }
+            }
+            if prewritten {
+                // The slots were written off the mutex: the flight that carries this record syncs
+                // them (rule 1), as a write_slot under it marked them.
+                arena.mark_unsynced();
             }
             // A reservation whose page is not dirty at commit was never written: free it.
             for (_, slot) in st.pending.drain() {
@@ -6616,6 +8847,7 @@ impl BranchStore {
         self.maybe_compact(&mut inner);
         let class = inner.sync;
         drop(inner);
+        self.start_owed_flight();
         kill_point("commit.applied");
         let durable = self.wait_durable(lsn, class);
         // fastest-engine mutant `commit_doubt_ignored` (test builds only).
@@ -6863,8 +9095,8 @@ impl BranchStore {
         let inner = self.inner.lock();
         let f = &inner.names.filter;
         (
-            f.built.is_some(),
-            f.built.as_ref().map_or(0, |b| b.len() as u64),
+            f.tables().0.is_some(),
+            f.entries(),
             f.moved_max,
             f.builds,
             f.failed_scans,
@@ -6925,6 +9157,89 @@ impl BranchStore {
         self.inner.lock().journal.as_ref().map_or(SyncClass::Off, Journal::synced_base)
     }
 
+    /// Test builds (engine review 18 MED 7): whether `slot` is free in the arena or the catalog,
+    /// PASSIVELY: unlike `slot_is_free` it neither matures held frees nor applies parked commits, so
+    /// an observer polling it cannot arm or wake the upgrade it is waiting for (review 18 LOW 8).
+    #[cfg(test)]
+    pub(crate) fn slot_is_free_passive_for_test(&self, slot: u32) -> bool {
+        let mut inner = self.inner.lock();
+        let StoreInner { arena, cat, .. } = &mut *inner;
+        if arena.as_ref().is_some_and(|a| a.is_free(slot)) {
+            return true;
+        }
+        cat.as_mut().is_some_and(|cat| {
+            !cat.taken.contains(&slot)
+                && cat.free_cursor.is_none_or(|c| slot > c)
+                && cat.catalog.free_has(slot).unwrap_or(false)
+        })
+    }
+
+    /// Test builds (engine review 18 MED 7): notifications of the background writer's condition
+    /// variable so far (fastest-budgets' `confirm_notifies`).
+    #[cfg(test)]
+    pub(crate) fn confirm_notifies_for_test(&self) -> u64 {
+        self.group.confirm_notifies.load(Ordering::Relaxed)
+    }
+
+    /// Test builds (L2 slice, budget create_allocates_no_table_of_every_branch_under_the_store_mutex):
+    /// the per-branch tables a create can grow under the store mutex, as (name, capacity, bytes a
+    /// regrowth to that capacity allocates, estimated as capacity x (entry + 1 control byte); the
+    /// branch table: its chunks, each allocated whole).
+    #[cfg(test)]
+    pub(crate) fn per_branch_tables_for_test(&self) -> Vec<(&'static str, usize, usize)> {
+        fn map<K, V, S>(name: &'static str, m: &HashMap<K, V, S>) -> (&'static str, usize, usize) {
+            (name, m.capacity(), m.capacity() * (std::mem::size_of::<(K, V)>() + 1))
+        }
+        fn set<K, S>(name: &'static str, m: &HashSet<K, S>) -> (&'static str, usize, usize) {
+            (name, m.capacity(), m.capacity() * (std::mem::size_of::<K>() + 1))
+        }
+        let inner = self.inner.lock_uncounted();
+        let chunk = std::mem::size_of::<Option<(BranchId, BranchState)>>() * super::table::CHUNK;
+        let mut out = vec![
+            ("branches.chunks", inner.branches.chunks_for_test(), chunk),
+            map("parked", &inner.parked),
+            set("pending_holders", &inner.pending_holders),
+            // Ordered maps: no regrowth (L2 slope, red 5aa62c9e7).
+            ("names.map", inner.names.map.len(), 0),
+            ("names.fresh", inner.names.fresh.len(), 0),
+            ("names.gone", inner.names.gone.len(), 0),
+            ("names.frozen_fresh", inner.names.frozen.as_ref().map_or(0, |f| f.fresh.len()), 0),
+            ("names.frozen_gone", inner.names.frozen.as_ref().map_or(0, |f| f.gone.len()), 0),
+        ];
+        // The name filter's tables at their real bytes (8 per slot; lead condition, review MED-2: the
+        // 0-byte listing of 4cb167221 blinded the regrowth test). They are grown by
+        // `grow_name_filter` on its own thread, off the mutex, which the regrowth test attributes
+        // by the create's own held allocations.
+        let (table, pending) = inner.names.filter.tables();
+        if let Some(t) = table {
+            out.push(("names.filter.table", t.cap(), t.cap() * 8));
+        }
+        if let Some(p) = pending {
+            out.push(("names.filter.pending", p.cap(), p.cap() * 8));
+        }
+        if let Some(cat) = inner.cat.as_ref() {
+            // An ordered map: no regrowth, nodes of a few entries each (L2 slope, red e2b119cb6).
+            out.push(("cat.dirty", cat.dirty.len(), 0));
+            out.push(set("cat.removed", &cat.removed));
+        }
+        out
+    }
+
+    /// Test builds (lead ruling f329b0d2a8): the group's `confirm_done` key.
+    #[cfg(test)]
+    pub(crate) fn confirm_done_for_test(&self) -> u64 {
+        self.group.confirm_done.load(Ordering::Acquire)
+    }
+
+    /// Test builds (C15 ruling, exception (b)'s plant): the log header's raised-class field is
+    /// stale, so the next write that takes it rewrites it (`Journal::stale_header_for_test`).
+    #[cfg(test)]
+    pub(crate) fn stale_log_header_for_test(&self) {
+        if let Some(journal) = self.inner.lock().journal.as_mut() {
+            journal.stale_header_for_test();
+        }
+    }
+
     /// Test builds: whether a slot was written since the arena's last sync (engine review 21 MED
     /// 4: a premise that an upgrade has the arena to sync).
     #[cfg(test)]
@@ -6972,107 +9287,386 @@ impl BranchStore {
     }
 
     pub(crate) fn wait_name_filter(&self) {
-        if let Some(build) = self.name_filter_build.lock().take() {
-            let _ = build.join();
+        // Review REVIEW-claude-namefilter M2: a fork(2) child inherits the handle of a thread it
+        // does not have; it is joined only by the process that spawned it.
+        // Every thread, including one a create started while an earlier one was being joined
+        // (review REVIEW-claude-namefilter-2 MED-1): taken until none is left.
+        loop {
+            let handles = std::mem::take(&mut *self.name_filter_build.lock());
+            if handles.is_empty() {
+                return;
+            }
+            for (pid, handle) in handles {
+                if pid == std::process::id() {
+                    let _ = handle.join();
+                } else {
+                    // A fork(2) child: the thread is the parent's. Dropping its handle would detach
+                    // a thread this process does not have; forget it.
+                    std::mem::forget(handle);
+                }
+            }
         }
     }
 
-    /// Build a catalog store's name filter (`NameFilter`) after open, off the store mutex: the
-    /// names in the catalog, read on a connection of its own, plus every name applied while the
-    /// read ran — those held now (the resident and since-checkpoint names, seeded here under the
-    /// mutex) and those created from now on (`NameFilter::note`). A failed read leaves the filter
-    /// unbuilt: lookups keep asking the catalog.
+    /// Start the work the filter owes (`NameFilter::take_owed`), with the store mutex let go.
+    fn start_filter_work(&self, work: Option<FilterWork>) {
+        match work {
+            Some(FilterWork::Grow) => self.grow_name_filter(),
+            Some(FilterWork::Rebuild) => {
+                self.inner.lock().names.filter.rebuilds += 1;
+                self.start_name_filter();
+            }
+            None => {}
+        }
+    }
+
+    fn keep_filter_thread(&self, handle: crate::thread::JoinHandle<()>) {
+        let mut threads = self.name_filter_build.lock();
+        // Finished threads are joined as new ones come (they hold nothing), so the list stays short.
+        let mut i = 0;
+        while i < threads.len() {
+            if threads[i].0 == std::process::id() && threads[i].1.is_finished() {
+                let (_, done) = threads.swap_remove(i);
+                let _ = done.join();
+            } else {
+                i += 1;
+            }
+        }
+        // Mutant `name_filter_one_handle_slot` (test builds only): one slot, as before review MED-1;
+        // the handle it held is dropped, which detaches that thread.
+        if fe_mutant("name_filter_one_handle_slot") {
+            threads.clear();
+        }
+        threads.push((std::process::id(), handle));
+    }
+
+    /// Build a catalog store's name filter (`NameFilter`), after open or as an overflow's rebuild,
+    /// all of it on a thread of its own (review REVIEW-claude-namefilter-2 MED-2 and M4: the
+    /// rebuild's catalog connection and its seed of every resident name ran under the store mutex
+    /// on a create's thread). The caller only spawns the thread. The filter holds the names in the
+    /// catalog, read on a connection of its own, plus every name applied while the read ran: the
+    /// names created since the last checkpoint (`names.fresh`), seeded under the mutex, and those
+    /// noted from then on into the `Building` state's pending table. A resident name not in `fresh`
+    /// is in the catalog already (a checkpoint's install takes a name out of `fresh` only once the
+    /// catalog holds it, `NameIndex`), and the scan's read begins after the seed's hold, so the seed
+    /// is `fresh` alone: O(names since the last checkpoint), no allocation, no syscall, no statement.
+    /// A build that fails (the connection, the seed, the scan) is retried with backoff
+    /// (`FILTER_BUILD_ATTEMPTS`; the review's LOW: a failed rebuild was never retried, and every
+    /// create after it asked the catalog under the mutex); until one lands, lookups ask the catalog.
     fn start_name_filter(&self) {
-        let reader = {
-            let mut inner = self.inner.lock();
-            let StoreInner { cat, names, sync, .. } = &mut *inner;
-            let Some(cat) = cat.as_ref() else {
-                return;
-            };
-            if names.filter.built.is_some() {
-                return;
-            }
-            let reader = match cat.catalog.writer(*sync) {
-                Ok(reader) => reader,
-                Err(e) => {
-                    tracing::warn!("branch name filter not built: {e}");
-                    return;
-                }
-            };
-            let mut pending: HashSet<u64, BuildIdHasher> = HashSet::default();
-            for name in names.map.keys().chain(names.fresh.keys()) {
-                pending.insert(names.filter.hash(name));
-            }
-            names.filter.pending = Some(pending);
-            reader
-        };
-        let hasher = self.inner.lock().names.filter.hasher.clone();
+        if self.inner.lock().cat.is_none() {
+            return;
+        }
         #[cfg(test)]
         let fail_scan = NAME_SCAN_FAILS.swap(false, std::sync::atomic::Ordering::AcqRel);
         #[cfg(not(test))]
         let fail_scan = false;
         let shared = self.inner.clone();
         let stop = self.name_filter_stop.clone();
-        let spawned = crate::thread::Builder::new()
-            .name("branch-name-filter".to_string())
-            .spawn(move || {
-                use std::hash::BuildHasher;
-                pause_name_scan();
-                let mut reader = reader;
-                let scanned = if fail_scan {
-                    Err(LimboError::InternalError("failpoint: the name scan failed".to_string()))
-                } else {
-                    reader.name_hashes(|name| hasher.hash_one(name), &stop)
-                };
-                // The set of the scanned names is built here, off the store mutex: its one table of
-                // up to 2N buckets and its N inserts were the O(N) background hold (LEAP L4's build
-                // guard: 147,464 B held at 10^4 branches, 1,179,656 B at 10^5, the table to the
-                // byte). Under the mutex only the names applied while the scan ran join it, and it
-                // is installed. Mutant `name_filter_built_under_mutex` (test builds only): the
-                // scanned names are inserted under the mutex, as before.
-                let under = fe_mutant("name_filter_built_under_mutex");
-                let mut scanned = scanned.map(|hashes| {
-                    if under {
-                        (HashSet::default(), hashes)
-                    } else {
-                        (hashes.into_iter().collect::<HashSet<u64, BuildIdHasher>>(), Vec::new())
-                    }
-                });
-                // Room for the names applied meanwhile is made off the mutex too, so joining them
-                // never grows the table under it (a resize moves all N entries).
-                let mut inner = loop {
-                    let inner = shared.lock();
-                    let joining = inner.names.filter.pending.as_ref().map_or(0, HashSet::len);
-                    match scanned.as_mut() {
-                        Ok((built, _)) if !under && built.capacity() - built.len() < joining => {
-                            drop(inner);
-                            built.reserve(joining);
+        let spawned = crate::thread::Builder::new().name("branch-name-filter".to_string()).spawn(move || {
+            let _live = FilterThreadLive::enter();
+            let mut fail_scan = fail_scan;
+            // Mutant `name_filter_build_no_retry` (test builds only): one attempt, as before.
+            let attempts = if fe_mutant("name_filter_build_no_retry") { 1 } else { FILTER_BUILD_ATTEMPTS };
+            for attempt in 0..attempts {
+                if attempt > 0 {
+                    // 4, 8, 16 ... ms, at most 1 s, waking for the store's close.
+                    let mut left = Duration::from_millis(4u64 << attempt.min(8)).min(Duration::from_secs(1));
+                    while !left.is_zero() {
+                        if stop.load(Ordering::Acquire) {
+                            return;
                         }
-                        _ => break inner,
-                    }
-                };
-                let filter = &mut inner.names.filter;
-                let pending = filter.pending.take().unwrap_or_default();
-                match scanned {
-                    Ok((mut built, unbuilt)) => {
-                        built.extend(unbuilt);
-                        built.extend(pending);
-                        filter.built = Some(built);
-                        filter.builds += 1;
-                    }
-                    Err(e) => {
-                        filter.failed_scans += 1;
-                        tracing::debug!("branch name filter not built: {e}")
+                        let step = left.min(Duration::from_millis(5));
+                        crate::thread::sleep(step);
+                        left -= step;
                     }
                 }
-            });
+                if stop.load(Ordering::Acquire) {
+                    return;
+                }
+                match Self::build_name_filter(&shared, &stop, std::mem::take(&mut fail_scan)) {
+                    FilterBuild::Ended => return,
+                    FilterBuild::Failed => {}
+                }
+            }
+            tracing::warn!("branch name filter not built after {FILTER_BUILD_ATTEMPTS} attempts: lookups ask the catalog");
+        });
         match spawned {
-            Ok(handle) => *self.name_filter_build.lock() = Some(handle),
+            Ok(handle) => self.keep_filter_thread(handle),
+            Err(e) => tracing::warn!("branch name filter thread not started: {e}"),
+        }
+    }
+
+    /// One attempt of a name filter's build (`start_name_filter`), on the filter's thread.
+    fn build_name_filter(shared: &Arc<StoreMutex>, stop: &Arc<std::sync::atomic::AtomicBool>, fail_scan: bool) -> FilterBuild {
+        // O(1) under the mutex: the state checked, the catalog's database and the hasher cloned.
+        let (db, sync, fresh, hasher) = {
+            let inner = shared.lock();
+            let Some(cat) = inner.cat.as_ref() else {
+                return FilterBuild::Ended;
+            };
+            if !matches!(inner.names.filter.state, FilterState::Unbuilt | FilterState::Overflowed) {
+                return FilterBuild::Ended;
+            }
+            let frozen = inner.names.frozen.as_ref().map_or(0, |f| f.fresh.len());
+            (cat.catalog.database(), inner.sync, inner.names.fresh.len() + frozen, inner.names.filter.hasher.clone())
+        };
+        // Room for the names created since the checkpoint and as many again created while the scan
+        // runs; the connection, its pragmas and prepares. Both with the mutex let go.
+        let pending = Arc::new(FilterTable::for_keys(fresh.saturating_mul(2).max(8192)));
+        let mut reader = match super::catalog::Catalog::writer_of(db, sync) {
+            Ok(reader) => reader,
             Err(e) => {
-                tracing::warn!("branch name filter thread not started: {e}");
-                self.inner.lock().names.filter.pending = None;
+                tracing::warn!("branch name filter not built: {e}");
+                return FilterBuild::Failed;
+            }
+        };
+        {
+            let mut inner = shared.lock();
+            // budgets-rev-242345 LOW-5: this seed hold's work, measured apart (test builds).
+            #[cfg(test)]
+            let _site = super::budget_probe::SiteWork::start(super::budget_probe::WorkSite::Seed);
+            let names = &mut inner.names;
+            if !matches!(names.filter.state, FilterState::Unbuilt | FilterState::Overflowed) {
+                return FilterBuild::Ended;
+            }
+            // The names created since the last checkpoint, frozen by a capture in flight or not
+            // (`NameIndex`): neither is in the catalog the scan reads yet.
+            let mut fits = true;
+            let frozen = names.frozen.as_ref().map(|f| f.fresh.keys()).into_iter().flatten();
+            for name in names.fresh.keys().chain(frozen) {
+                fits &= pending.insert(names.filter.hash(name));
+            }
+            if !fits {
+                tracing::warn!("branch name filter not built: its pending table filled at the seed");
+                return FilterBuild::Failed;
+            }
+            names.filter.state = FilterState::Building { pending: pending.clone() };
+        }
+        filter_pause(7);
+        use std::hash::BuildHasher;
+        pause_name_scan();
+        let scanned = if fail_scan {
+            Err(LimboError::InternalError("failpoint: the name scan failed".to_string()))
+        } else {
+            reader.name_hashes(|name| hasher.hash_one(name), stop)
+        };
+        drop(reader);
+        // The table of the scanned names is built here, off the store mutex: its N inserts
+        // were the O(N) background hold (LEAP L4's build guard: 147,464 B held at 10^4
+        // branches, 1,179,656 B at 10^5). Sized for the scanned names AND the pending ones,
+        // half as many again (24-48 bytes per name: `for_keys` is a power of two of at least
+        // 2n slots). Mutant `name_filter_built_under_mutex` (test builds only): the scanned
+        // names are inserted under the mutex, as before.
+        let under = fe_mutant("name_filter_built_under_mutex");
+        let scanned = scanned.map(|hashes| {
+            let n = hashes.len().saturating_add(pending.len());
+            let table = FilterTable::for_keys(n.saturating_add(n / 2));
+            if under {
+                (table, hashes)
+            } else {
+                let fits = hashes.iter().all(|h| table.insert(*h));
+                (table, if fits { Vec::new() } else { hashes })
+            }
+        });
+        // The table's Arc is made here, with the mutex let go (the review's LOW: `Arc::new`
+        // under the mutex at the install).
+        let scanned = scanned.map(|(table, unbuilt)| (Arc::new(table), unbuilt));
+        let table = {
+            let mut inner = shared.lock();
+            // budgets-rev-242345 LOW-4: this install hold's work, measured apart (test builds).
+            #[cfg(test)]
+            let _site = super::budget_probe::SiteWork::start(super::budget_probe::WorkSite::Install);
+            let f = &mut inner.names.filter;
+            if !matches!(&f.state, FilterState::Building { pending: p } if Arc::ptr_eq(p, &pending)) {
+                return FilterBuild::Ended;
+            }
+            match scanned {
+                Ok((table, unbuilt)) => {
+                    if !unbuilt.iter().all(|h| table.insert(*h)) {
+                        f.overflow();
+                        return FilterBuild::Ended;
+                    }
+                    // Mutant `name_filter_install_work_one_in_10000` (test builds only; budgets-rev-242345
+                    // LOW-4): an O(N) term in the install hold, one insert per 10,000 scanned names, smaller
+                    // than the fixed 16-unit hold that the per-hold maximum reads.
+                    if fe_mutant("name_filter_install_work_one_in_10000") {
+                        for i in 0..table.len() / 10_000 {
+                            let _ = table.insert(0x9e37_79b9_7f4a_7c15 ^ i as u64);
+                        }
+                    }
+                    f.live = (table.len() + pending.len()) as u64;
+                    f.state = FilterState::Draining { table: table.clone(), pending: pending.clone() };
+                    f.builds += 1;
+                    table
+                }
+                Err(e) => {
+                    f.failed_scans += 1;
+                    f.state = FilterState::Unbuilt;
+                    tracing::debug!("branch name filter not built: {e}");
+                    return FilterBuild::Failed;
+                }
+            }
+        };
+        filter_pause(6);
+        // Mutant `name_filter_build_skips_pending` (test builds only): the build installs
+        // Ready without copying its pending table, the build-side race the oracle must catch.
+        if fe_mutant("name_filter_build_skips_pending") {
+            let mut inner = shared.lock();
+            let f = &mut inner.names.filter;
+            if matches!(&f.state, FilterState::Draining { table: t, .. } if Arc::ptr_eq(t, &table)) {
+                f.state = FilterState::Ready { table: table.clone() };
+            }
+            return FilterBuild::Ended;
+        }
+        let copied = pending.copy_into(&table);
+        let mut inner = shared.lock();
+        let f = &mut inner.names.filter;
+        if matches!(&f.state, FilterState::Draining { table: t, pending: p } if Arc::ptr_eq(t, &table) && Arc::ptr_eq(p, &pending)) {
+            if copied {
+                f.state = FilterState::Ready { table: table.clone() };
+            } else {
+                f.overflow();
             }
         }
+        FilterBuild::Ended
+    }
+
+    /// Grow the name filter off the store mutex (`NameFilter`, lead ruling 2026-10-15), owed by the
+    /// create whose note left its `Ready` table past half full and started once that create has let
+    /// the mutex go. On a thread of its own: a table twice the size and a pending table are
+    /// allocated here; `Ready` becomes `Growing` (notes go to both); the old table and then the
+    /// pending one are copied into the new; `Growing` becomes `Draining` with the new table; the
+    /// pending one is copied again (what was noted between the copy and the swap); `Draining`
+    /// becomes `Ready`. Each change is one assignment in one hold, made only if the state is still
+    /// the one this growth left (an overflow meanwhile ends it); a copy that fails overflows the
+    /// filter in the same hold that would have installed it (review H1). The tables are freed here,
+    /// after the last unlock. Hooks (test builds): `filter_pause` stages 1-5, `filter_drain_fails`.
+    /// Mutant `name_filter_swap_skips_pending` (test builds only): `Growing` becomes `Ready` with the
+    /// new table and no pending copy, the planted race the concurrency oracle must catch.
+    fn grow_name_filter(&self) {
+        let shared = self.inner.clone();
+        let spawned = crate::thread::Builder::new().name("branch-name-filter".to_string()).spawn(move || {
+            let _live = FilterThreadLive::enter();
+            let old = match &shared.lock().names.filter.state {
+                FilterState::Ready { table } => table.clone(),
+                _ => return,
+            };
+            let grown = FilterTable::for_keys(old.cap());
+            let pending = Arc::new(FilterTable::for_keys(old.cap() / 2));
+            {
+                let mut inner = shared.lock();
+                let f = &mut inner.names.filter;
+                if !matches!(&f.state, FilterState::Ready { table } if Arc::ptr_eq(table, &old)) {
+                    return;
+                }
+                f.state = FilterState::Growing { table: old.clone(), pending: pending.clone() };
+            }
+            filter_pause(1);
+            let mut copied = old.copy_into(&grown);
+            filter_pause(2);
+            let skip = fe_mutant("name_filter_swap_skips_pending");
+            if !skip {
+                copied = copied && pending.copy_into(&grown);
+            }
+            let grown = Arc::new(grown);
+            filter_pause(3);
+            {
+                let mut inner = shared.lock();
+                // budgets-rev-242345 LOW-5: the growth's swap hold's work, measured apart (test builds).
+                #[cfg(test)]
+                let _site = super::budget_probe::SiteWork::start(super::budget_probe::WorkSite::Growth);
+                // Mutant `name_filter_growth_work_one_in_10000` (test builds only; budgets-rev-242345 MED-7):
+                // an O(N) term in both growth holds, one unit per 10,000 names in the old table.
+                #[cfg(test)]
+                if fe_mutant("name_filter_growth_work_one_in_10000") {
+                    super::budget_probe::note_held_work((old.len() / 10_000) as u64);
+                }
+                let f = &mut inner.names.filter;
+                if !matches!(&f.state, FilterState::Growing { table, pending: p } if Arc::ptr_eq(table, &old) && Arc::ptr_eq(p, &pending)) {
+                    return;
+                }
+                if !copied {
+                    f.overflow();
+                    return;
+                }
+                f.state = if skip {
+                    FilterState::Ready { table: grown.clone() }
+                } else {
+                    FilterState::Draining { table: grown.clone(), pending: pending.clone() }
+                };
+                f.builds += 1;
+                f.moved_max = f.moved_max.max(old.len() as u64);
+                if skip {
+                    return;
+                }
+            }
+            filter_pause(4);
+            // The failpoint stops the copy before it starts, as a copy refused at the name does.
+            let copied = !filter_drain_fails() && pending.copy_into(&grown);
+            filter_pause(5);
+            let mut inner = shared.lock();
+            // budgets-rev-242345 LOW-5: the growth's drain install hold, measured apart (test builds).
+            #[cfg(test)]
+            let _site = super::budget_probe::SiteWork::start(super::budget_probe::WorkSite::Growth);
+            #[cfg(test)]
+            if fe_mutant("name_filter_growth_work_one_in_10000") {
+                super::budget_probe::note_held_work((old.len() / 10_000) as u64);
+            }
+            let f = &mut inner.names.filter;
+            if matches!(&f.state, FilterState::Draining { table, pending: p } if Arc::ptr_eq(table, &grown) && Arc::ptr_eq(p, &pending)) {
+                if copied {
+                    f.state = FilterState::Ready { table: grown.clone() };
+                } else {
+                    f.overflow();
+                }
+            }
+        });
+        match spawned {
+            Ok(handle) => self.keep_filter_thread(handle),
+            Err(e) => tracing::warn!("branch name filter growth not started: {e}"),
+        }
+    }
+
+    /// Test builds: the name filter's state's name, and the rebuilds started after an overflow.
+    #[cfg(test)]
+    pub(crate) fn name_filter_state_for_test(&self) -> (&'static str, u64) {
+        let inner = self.inner.lock();
+        let f = &inner.names.filter;
+        let name = match f.state {
+            FilterState::Unbuilt => "Unbuilt",
+            FilterState::Building { .. } => "Building",
+            FilterState::Ready { .. } => "Ready",
+            FilterState::Growing { .. } => "Growing",
+            FilterState::Draining { .. } => "Draining",
+            FilterState::Overflowed => "Overflowed",
+        };
+        (name, f.rebuilds)
+    }
+
+    /// Test builds: the most entries one note moved inside its store-mutex hold (`held_moved_max`).
+    #[cfg(test)]
+    pub(crate) fn name_filter_held_moves_for_test(&self) -> u64 {
+        self.inner.lock().names.filter.held_moved_max
+    }
+
+    /// Test builds: the next named create starts a growth of a `Ready` name filter now, as one
+    /// past half full would (the 10^6 audit arm's growth phase: a natural growth there needs about
+    /// 10^6 more creates, each a D2 F_FULLFSYNC, raw l96).
+    #[cfg(test)]
+    pub(crate) fn force_name_filter_growth_for_test(&self) {
+        let mut inner = self.inner.lock();
+        let f = &mut inner.names.filter;
+        if matches!(f.state, FilterState::Ready { .. }) && f.owed.is_none() {
+            f.owed = Some(FilterWork::Grow);
+        }
+    }
+
+    /// Test builds: the name filter's own answer for `name` ("absent, ask no catalog"), the step
+    /// `name_lookup` takes after the resident names (`names.map`) miss.
+    #[cfg(test)]
+    pub(crate) fn name_filter_says_absent_for_test(&self, name: &str) -> bool {
+        self.inner.lock().names.filter.says_absent(name)
     }
 
     pub(crate) fn catalog_counters(&self) -> (u64, u64, u64, u64) {
@@ -7126,6 +9720,7 @@ impl BranchStore {
     }
 
     /// Lock the store mutex on a fork path, timing the hold (see [`Counted`]).
+    #[track_caller]
     fn lock_counted(&self) -> Counted<impl std::ops::DerefMut<Target = StoreInner> + '_> {
         let guard = self.inner.lock();
         Counted {
@@ -7294,12 +9889,24 @@ impl BranchStore {
                 self.join_flights();
                 return Ok(installed() > before);
             }
-            // One in flight covers state older than this call: wait for it, then start our own.
-            self.join_flights();
+            // One in flight covers state older than this call: wait for its install, then start our
+            // own; never past the deadline (Codex C15 MED 2: the join here waited for the flight
+            // however long it took, before the clock was read). A flight that ends without an
+            // install (it failed) leaves the next start free: the wait is a pause, not a join.
+            // Mutant `checkpoint_now_joins_unbounded` (test builds only): the join, as before.
+            if fe_mutant("checkpoint_now_joins_unbounded") {
+                self.join_flights();
+            }
             let Some(left) = deadline.checked_sub(started.elapsed()) else {
                 return Ok(false);
             };
-            crate::thread::sleep(pause.min(left));
+            let (lock, cv) = &*self.installs;
+            let count = lock.lock().unwrap_or_else(|e| e.into_inner());
+            if *count == before {
+                #[cfg(test)]
+                note_wait();
+                drop(cv.wait_timeout(count, pause.min(left)).unwrap_or_else(|e| e.into_inner()));
+            }
             pause = (pause * 2).min(Duration::from_millis(50));
         }
     }
@@ -7336,17 +9943,50 @@ impl BranchStore {
         self.group.lock().confirm_wakeups
     }
 
-    /// Test builds (fastest-budgets, review 2 L3): whether this store's confirmation writer is in
-    /// one of its waits, whether a proved word is pending, and the waits it has entered; `None` while
-    /// anyone holds the group's lock (a measuring thread spins on this: blocking on the lock would add
-    /// a syscall to its window). The writer sets the flag before it waits and clears it as the wait
-    /// returns, holding the lock, so while it reads true here the writer has finished its work and is
-    /// in the wait. BLIND SPOT: if the condition variable releases the lock in userspace before its
-    /// wait syscall, that one syscall can land just after a reader saw the flag.
+    /// Test builds (fastest-budgets, review C08 #1): the words written since the last landing that
+    /// left a confirmation, of that flight itself (the idle tail's, at a burst's end).
     #[cfg(test)]
-    pub(crate) fn confirm_park_for_test(&self) -> Option<(bool, bool, u64)> {
+    pub(crate) fn confirm_tail_words_for_test(&self) -> u64 {
+        self.group.confirm_last_landed_writes.load(Ordering::Relaxed)
+    }
+
+    /// Test builds (fastest-budgets, review 2 L3, review C14): which wait this store's confirmation
+    /// writer is in (`CONFIRM_PARK_*`, 0 for none), whether it has seen every notification of
+    /// `confirm_cv` sent since it entered that wait, whether a proved word is pending, and the waits
+    /// it has entered; `None` while anyone holds the group's lock (a measuring thread spins on this
+    /// rather than block on the lock). The writer sets the wait and its seen count as it enters the
+    /// wait and clears the wait as it returns, holding the lock, and every notification is counted
+    /// under the lock, so here a wait read with everything seen is one the writer entered after the
+    /// last notification: nothing it was sent is still to be processed. A notified wait (C14's
+    /// schedule: notified, not yet woken) reads as not seen. BLIND SPOTS: if the condition variable
+    /// releases the lock in userspace before its wait syscall, that syscall can land just after a
+    /// reader saw the wait (the suite's later thread-state spin covers it on Apple); and this
+    /// try-lock, though it never blocks, can make a writer that contends for the lock meanwhile
+    /// need waking at its unlock.
+    #[cfg(test)]
+    pub(crate) fn confirm_park_for_test(&self) -> Option<(u8, bool, bool, u64)> {
         let g = self.group.state.try_lock().ok()?;
-        Some((g.confirm_parked, g.confirm.as_ref().is_some_and(|(_, c)| c.proved()), g.confirm_parks))
+        let seen = g.confirm_seen == self.group.confirm_notifies.load(Ordering::Relaxed);
+        Some((g.confirm_parked, seen, g.confirm.as_ref().is_some_and(|(_, c)| c.proved()), g.confirm_parks))
+    }
+
+    /// Test builds: the next trunk commit yields once inside its pager commit, before its
+    /// copy-decision pass (`commit_yield`; engine review 19 MED 3).
+    #[cfg(test)]
+    pub(crate) fn arm_commit_yield_for_test(&self) {
+        self.commit_yield.store(true, Ordering::Release);
+    }
+
+    /// Test builds: whether the armed commit yield is still to be taken.
+    #[cfg(test)]
+    pub(crate) fn commit_yield_armed_for_test(&self) -> bool {
+        self.commit_yield.load(Ordering::Acquire)
+    }
+
+    /// Test builds: take the armed commit yield, once (`Pager::commit_wal`).
+    #[cfg(test)]
+    pub(crate) fn take_commit_yield_for_test(&self) -> bool {
+        self.commit_yield.swap(false, Ordering::AcqRel)
     }
 
     /// Test builds: hold this store's confirmation writer at `stage` (`HOLD_CONFIRM_WRITE`; 0
@@ -7359,6 +9999,13 @@ impl BranchStore {
     #[cfg(test)]
     pub(crate) fn confirm_held_for_test(&self) -> u8 {
         self.group.confirm_hold.load(Ordering::Acquire)
+    }
+
+    /// Test builds: the cut offset of the background compaction last held at
+    /// `HOLD_COMPACT_INSTALLED` (`Group::held_cut_from`).
+    #[cfg(test)]
+    pub(crate) fn held_cut_from_for_test(&self) -> u64 {
+        self.group.held_cut_from.load(Ordering::Acquire)
     }
 
     /// Confirmation words written into the log's header, and those whose write failed (review 6 #1;
@@ -7374,6 +10021,13 @@ impl BranchStore {
     #[cfg(test)]
     pub(crate) fn log_lsn_for_test(&self) -> u64 {
         self.inner.lock().journal.as_ref().map_or(0, |j| j.lsn())
+    }
+
+    /// Test builds: whether a compaction is owed to the background writer or being led by it
+    /// (`Group::compact_due`; DECISIONS c9c821dd8d). Takes no store mutex.
+    #[cfg(test)]
+    pub(crate) fn compaction_owed_for_test(&self) -> bool {
+        self.group.compact_due.load(Ordering::Acquire) != COMPACT_IDLE
     }
 
     /// The log file's written length, what the compaction threshold and its back-off measure
@@ -7402,6 +10056,8 @@ impl BranchStore {
         for (id, what) in cap.dirty {
             *cat.dirty.entry(id).or_insert(0) |= what;
         }
+        // And its frozen names and rows (L2(d)), as any capture that is not written.
+        inner.unfreeze_capture();
         Ok(())
     }
 
@@ -7459,10 +10115,23 @@ impl Drop for BranchStore {
     /// (A crash loses the time since the last stamp, which extends leases and never shortens one.)
     /// A fuzzy checkpoint in flight is finished first: its thread holds the store's files.
     fn drop(&mut self) {
+        #[cfg(test)]
+        let _scope = CountScope::enter(&self.inner.counts.clone());
         self.flight_hold.store(0, Ordering::Release);
         #[cfg(test)]
         self.group.confirm_hold.store(0, Ordering::Release);
         self.join_flights();
+        // The worker stops once its channel closes; joined only in the process that started it.
+        if let Some(w) = self.ckpt_worker.lock().take() {
+            if w.pid == std::process::id() {
+                drop(w.tx);
+                if w.handle.join().is_err() {
+                    tracing::warn!("the branch catalog checkpoint worker panicked");
+                }
+            } else {
+                std::mem::forget(w);
+            }
+        }
         // The name filter's build holds the store's files too: stopped, then joined.
         self.name_filter_stop.store(true, Ordering::Release);
         self.wait_name_filter();
@@ -7504,17 +10173,18 @@ fn name_taken(name: &str) -> LimboError {
 /// 14 LOW 13): each is the `InvalidArgument` it was before 620e69a81, with its old text, so
 /// `named_branch_refusals_are_typed` can be shown to fail on every assertion it makes.
 pub(crate) fn untyped_branch_error(e: LimboError) -> LimboError {
-    if !fe_mutant("untyped_branch_errors") {
-        return e;
-    }
+    // Per kind too (engine review 20 LOW 20: the all-kinds mutant failed its test at the first
+    // assertion, NameTaken, so the other two were never shown to fail): mutants
+    // `untyped_branch_errors_no_such`, `_name_taken` and `_in_use` untype one kind each.
+    let all = fe_mutant("untyped_branch_errors");
     match e {
-        LimboError::NoSuchBranch(name) => {
+        LimboError::NoSuchBranch(name) if all || fe_mutant("untyped_branch_errors_no_such") => {
             LimboError::InvalidArgument(format!("no branch is named {name:?}"))
         }
-        LimboError::NameTaken(name) => LimboError::InvalidArgument(format!(
-            "branch name {name:?} already names an unreleased branch"
-        )),
-        LimboError::BranchInUse { id, .. } => LimboError::InvalidArgument(format!(
+        LimboError::NameTaken(name) if all || fe_mutant("untyped_branch_errors_name_taken") => {
+            LimboError::InvalidArgument(format!("branch name {name:?} already names an unreleased branch"))
+        }
+        LimboError::BranchInUse { id, .. } if all || fe_mutant("untyped_branch_errors_in_use") => LimboError::InvalidArgument(format!(
             "branch {id} already has an open connection; a branch serves one connection at a \
              time, because a second one's page cache would silently miss the first one's commits"
         )),
@@ -7699,6 +10369,10 @@ impl StoreInner {
         if self.branches.len() > cap {
             let excess = self.branches.len() - cap;
             let parked = &self.parked;
+            // A state whose row a fuzzy checkpoint still owes stays resident until its writer has
+            // encoded it (L2(d), `BranchTable::freeze`).
+            let table = &self.branches;
+            let frozen_owed = |id: &BranchId| table.frozen_owes(id);
             let mut yielded = 0u64;
             let scanned = std::cell::Cell::new(0u64);
             let victims: Vec<BranchId> = self
@@ -7707,6 +10381,7 @@ impl StoreInner {
                 .inspect(|_| yielded += 1)
                 .filter(|(id, st)| {
                     !cat.dirty.contains_key(*id)
+                        && !frozen_owed(id)
                         && !parked.contains_key(*id)
                         && matches!(st.handle, Handle::Detached | Handle::Released)
                         && !st.open
@@ -7764,12 +10439,14 @@ impl StoreInner {
         child: BranchId,
         parent: BranchId,
         now: u64,
-        name: Option<&str>,
-    ) -> (Vec<Record>, Option<(u64, u64)>) {
+        name: Option<&Arc<str>>,
+    ) -> ([Option<Record>; 2], Option<(u64, u64)>) {
         // Mutant M-d (PREREG v1 amendment 36): the fork record written without its parent (as the
         // trunk's child, whatever the parent was).
         let logged_parent = if fe_mutant("fork_without_parent") { 0 } else { parent.0 };
-        let mut records = vec![match name {
+        // In place, no Vec (budget create_allocates_at_most_once_under_the_store_mutex): a fork
+        // logs its record and at most a lease.
+        let mut records = [Some(match name {
             None => Record::Fork {
                 child: child.0,
                 parent: logged_parent,
@@ -7777,15 +10454,15 @@ impl StoreInner {
             Some(name) => Record::ForkNamed {
                 child: child.0,
                 parent: logged_parent,
-                name: name.to_string(),
+                name: name.clone(),
             },
-        }];
+        }), None];
         let lease = self
             .default_lease
             .filter(|_| name.is_none())
             .map(|ttl| (now.saturating_add(millis(ttl)), now));
         if let Some((deadline_ms, now_ms)) = lease {
-            records.push(Record::Lease {
+            records[1] = Some(Record::Lease {
                 branch: child.0,
                 deadline_ms,
                 now_ms,
@@ -7848,6 +10525,12 @@ impl StoreInner {
                 return Ok(Some(id));
             }
             if self.names.gone.contains_key(name) {
+                return Ok(None);
+            }
+            // A release the capture froze masks the catalog's row until the install, as `gone`
+            // does (see `NameIndex`). Mutant `names_taken_at_capture` (test builds only): as before
+            // review C-F1, a capture's names are out of the index's reach.
+            if !fe_mutant("names_taken_at_capture") && self.names.frozen.as_ref().is_some_and(|f| f.gone.contains_key(name)) {
                 return Ok(None);
             }
             // Never held by any branch: no catalog query (lead review 1 item 2).
@@ -8231,6 +10914,19 @@ impl StoreInner {
     }
 
     /// Part of `id`'s catalog state (`DIRTY_*`) is stale: rewrite it at the next checkpoint.
+    /// A capture that will not be written (its dispatch failed, or a test undid it): its frozen
+    /// names and rows go back (L2(d), `NameIndex::unfreeze`, `BranchTable::unfreeze`).
+    fn unfreeze_capture(&mut self) {
+        self.names.unfreeze();
+        self.children.unfreeze();
+        let back = self.branches.unfreeze(|row| BranchId(row.id));
+        if let Some(cat) = self.cat.as_mut() {
+            for (id, what) in back {
+                *cat.dirty.entry(id).or_insert(0) |= what;
+            }
+        }
+    }
+
     fn mark_dirty(&mut self, id: BranchId, what: u8) {
         if let Some(cat) = self.cat.as_mut() {
             if !id.is_trunk() {
@@ -8360,6 +11056,9 @@ impl StoreInner {
                 // refused any other store and before the arena is truncated.
                 if self.catalog_mode && self.cat.is_none() {
                     let mut catalog = Catalog::open(&files.cat, self.sync)?;
+                    // Its failed syncs reach this store's at-risk decision as they happen
+                    // (engine review 21 MED 5).
+                    catalog.link_drain_parent(BranchStore::group_handle(group));
                     if catalog.meta()?.is_some() {
                         return Err(LimboError::LockingError(format!(
                             "branch catalog {} gained state after this branch store opened: \
@@ -8381,12 +11080,15 @@ impl StoreInner {
                     }
                     self.cat = Some(CatState::new(catalog, self.sync, 0)?);
                     // A new catalog holds no name: the filter is built, empty, at once.
-                    if self.names.filter.built.is_none() && self.names.filter.pending.is_none() {
-                        let mut built = HashSet::default();
+                    if matches!(self.names.filter.state, FilterState::Unbuilt) {
+                        // The catalog's creation (the first create of a catalog store) makes the
+                        // table, once; every later create only fills it.
+                        let table = FilterTable::for_keys(self.names.map.len());
                         for name in self.names.map.keys() {
-                            built.insert(self.names.filter.hash(name));
+                            table.insert(self.names.filter.hash(name));
                         }
-                        self.names.filter.built = Some(built);
+                        self.names.filter.live = table.len() as u64;
+                        self.names.filter.state = FilterState::Ready { table: Arc::new(table) };
                     }
                 }
                 let arena = Arena::open_file(&files.arena, page_size, true, &[])?;
@@ -8566,7 +11268,7 @@ impl StoreInner {
         let installed = self.checkpoint_install(cap, written, None);
         kill_point("ckpt.installed");
         if installed.is_ok() {
-            truncate_catalog_wal(&mut w, group);
+            truncate_catalog_wal(&mut w, group, None);
         }
         drop(w);
         if let Some(cat) = self.cat.as_mut() {
@@ -8598,7 +11300,9 @@ impl StoreInner {
         flight_in_air: bool,
     ) -> Result<Box<Captured>> {
         #[cfg(test)]
-        CAPTURE_ENTERED.with(|c| c.set(c.get() + 1));
+        CAPTURE_ENTERED.fetch_add(1, Ordering::Relaxed);
+        #[cfg(test)]
+        count_in_scope(|c| &c.capture_entered, 1);
         if fuzzy && self.splice && !guard_mutant("c") {
             return Err(LimboError::InvalidArgument(
                 "fuzzy capture refused: splice arm (r13-compose S-12)".to_string(),
@@ -8687,7 +11391,9 @@ impl StoreInner {
         };
         #[cfg(test)]
         if arena_file.is_some() {
-            CAPTURE_ARENA_HANDLES.with(|c| c.set(c.get() + 1));
+            CAPTURE_ARENA_HANDLES.fetch_add(1, Ordering::Relaxed);
+            #[cfg(test)]
+            count_in_scope(|c| &c.capture_arena_handles, 1);
         }
         let snapshot = if self.failpoint.take_if(|f| *f == BranchFailpoint::CaptureFails).is_some() {
             Err(LimboError::InternalError("failpoint: the capture's read snapshot failed".to_string()))
@@ -8700,20 +11406,34 @@ impl StoreInner {
             }
             return Err(e);
         }
+        held_trace("capture.snapshot");
+        // A fuzzy capture FREEZES its rows (L2(d), O(1); `BranchTable::freeze`, at the end, after
+        // every fallible step): the writer encodes them, each as of the capture. A sharp one, under
+        // the mutex for its whole write anyway, builds them here. Mutant `capture_copies` (test
+        // builds only): the fuzzy capture builds them here too, O(dirty) under the mutex, as before.
+        let cow = fuzzy && early.is_none() && !fe_mutant("capture_copies");
         let (dirty, rows) = match early {
             Some(taken) => taken,
+            None if cow => (std::mem::take(&mut cat.dirty), Vec::new()),
             None => {
                 let dirty = std::mem::take(&mut cat.dirty);
                 let rows = capture_rows(&self.branches, &dirty);
                 (dirty, rows)
             }
         };
+        #[cfg(test)]
+        let verify = (cow && (std::env::var_os("FE_CAPTURE_VERIFY").is_some() || CAPTURE_VERIFY_FORCED.load(Ordering::Acquire)))
+            .then(|| capture_rows(&self.branches, &dirty));
+        held_trace("capture.rows");
         // The trunk: the versions retained since the last checkpoint (all in memory, none in the
         // catalog) are inserted, and the catalog versions reaped since are deleted, one row each.
         let trunk_new = self.trunk.lineage.retained_list();
         let trunk_gone: Vec<(u32, u64)> = cat.trunk_gone.iter().copied().collect();
-        let (n_rows, n_trunk_new, n_trunk_gone) =
-            (rows.len() as u64, trunk_new.len() as u64, trunk_gone.len() as u64);
+        let (n_rows, n_trunk_new, n_trunk_gone) = (
+            if cow { dirty.len() } else { rows.len() } as u64,
+            trunk_new.len() as u64,
+            trunk_gone.len() as u64,
+        );
         // Slots reserved by open write transactions are named by no durable state: the catalog
         // lists them free (a crash frees them), and this process keeps them as taken.
         // F-W2: only a branch that reserved a slot since the last prune can hold one, so the walk
@@ -8741,6 +11461,7 @@ impl StoreInner {
                 .flat_map(|id| branches[id].pending.values().copied())
                 .collect()
         };
+        held_trace("capture.trunk_and_reserved");
         // ARIES's begin-checkpoint record: the capture covers the log up to and including it.
         if !marker_first {
             if let Err(e) = journal.buffer(&Record::Checkpoint { generation }) {
@@ -8813,13 +11534,55 @@ impl StoreInner {
                 arena.in_use()
             );
         }
+        held_trace("capture.meta");
         cat.flight = true;
         let fail_arena_sync = (arena_file.is_some() || settle_arena)
             && self.failpoint.take_if(|f| *f == BranchFailpoint::ArenaSyncFails).is_some();
+        let free_list = arena.free_list().to_vec();
+        held_trace("capture.free_list");
+        // O(1): the child index's generation is frozen, not copied (`ChildIndex::freeze`).
+        self.children.freeze();
+        held_trace("capture.child_keys");
+        // O(1): swapped, not copied (see `NameIndex`). A capture never runs with a frozen generation
+        // left (one flight at a time, and the install or a failed write ends it).
+        debug_assert!(self.names.frozen.is_none(), "a capture with names still frozen");
+        let names = Arc::new(FrozenNames {
+            fresh: std::mem::take(&mut self.names.fresh),
+            gone: std::mem::take(&mut self.names.gone),
+        });
+        self.names.frozen = Some(names.clone());
+        held_trace("capture.names");
+        // The rows last, after every fallible step (see above): the dirty map moves into the
+        // branch table's freeze, and the capture keeps none of it.
+        let dirty = if cow {
+            if let Err(back) = self.branches.freeze(dirty) {
+                // Never: one flight at a time, and its writer or its undo ends the freeze. Refused
+                // rather than lose a row: the capture is undone as any failed one.
+                if let Some(cat) = self.cat.as_mut() {
+                    cat.catalog.end_read_snapshot();
+                    cat.flight = false;
+                    for (id, what) in back {
+                        *cat.dirty.entry(id).or_insert(0) |= what;
+                    }
+                }
+                self.names.unfreeze();
+                self.children.unfreeze();
+                return Err(LimboError::InternalError(
+                    "a fuzzy capture while another's rows are still frozen".to_string(),
+                ));
+            }
+            BTreeMap::new()
+        } else {
+            dirty
+        };
         Ok(Box::new(Captured {
             generation,
             log_from,
             rows,
+            #[cfg(test)]
+            verify,
+            rows_frozen: cow,
+            lease_floor_after: None,
             dirty,
             removed: cat.removed.iter().copied().collect(),
             trunk_new,
@@ -8827,27 +11590,19 @@ impl StoreInner {
             free_cursor: cat.free_cursor,
             fresh_arena: false,
             taken: cat.taken.iter().copied().collect(),
-            free_list: arena.free_list().to_vec(),
+            free_list,
             reserved,
             deferred,
             deferred_lsn,
             meta,
-            child_keys: self.children.map.keys().copied().collect(),
-            child_removed: self.children.removed.keys().copied().collect(),
+
             arena: arena_file,
             // Every record the catalog takes over stays as durable as it was (review B-F3).
             arena_sync: commit_class,
             settle_class,
             settle_arena,
             fail_stop: self.fail_stop.clone(),
-            // fastest-engine mutant `names_taken_at_capture` (test builds only): as before review
-            // C-F1, the capture takes the names out of the index.
-            names_gone: if fe_mutant("names_taken_at_capture") {
-                std::mem::take(&mut self.names.gone)
-            } else {
-                self.names.gone.clone()
-            },
-            names_fresh: self.names.fresh.clone(),
+            names,
             lease_now: now,
             fail_after_commit,
             fail_write: self
@@ -8878,6 +11633,7 @@ impl StoreInner {
         };
         let q0 = cat.catalog.counters.queries;
         cat.catalog.end_read_snapshot();
+        ckpt_held("install.snapshot_ended");
         cat.flight = false;
         if let Err(e) = written {
             // D-T2's mutant r13_install_err_drops_dirty: a failed write forgets the captured dirt.
@@ -8885,8 +11641,13 @@ impl StoreInner {
                 for (id, what) in cap.dirty {
                     *cat.dirty.entry(id).or_insert(0) |= what;
                 }
+                // A fuzzy capture's rows, which the dirty map was frozen into (L2(d)).
+                for (row, what) in &cap.rows {
+                    *cat.dirty.entry(BranchId(row.id)).or_insert(0) |= *what;
+                }
             }
-            // The capture copied the names; the index still holds them, for the next checkpoint.
+            self.names.unfreeze();
+            self.children.unfreeze();
             // Not retried before another threshold's worth of log (review 2 #5).
             if let Some(journal) = self.journal.as_mut() {
                 journal.defer_compaction();
@@ -8895,18 +11656,9 @@ impl StoreInner {
         }
         cat.generation = cap.generation;
         cat.ckpt.count += 1;
-        // The catalog holds the captured names now: drop each entry no release or create since
-        // has moved (see `NameIndex`).
-        for (name, release) in &cap.names_gone {
-            if self.names.gone.get(name) == Some(release) {
-                self.names.gone.remove(name);
-            }
-        }
-        for (name, id) in &cap.names_fresh {
-            if self.names.fresh.get(name) == Some(id) {
-                self.names.fresh.remove(name);
-            }
-        }
+        // The catalog holds the captured names now: the frozen generation is let go of, and freed
+        // after the store mutex (see `NameIndex`).
+        self.names.retired = self.names.frozen.take();
         // From here the catalog is the truth up to the capture's log position.
         let Some(journal) = self.journal.as_mut() else {
             return Err(LimboError::InternalError(
@@ -8923,8 +11675,23 @@ impl StoreInner {
         // A failure before its rename leaves the old log in use, whose checkpoint marker says
         // where recovery cuts it: correct, only longer. The install below must happen either way.
         let rewritten = match prepared {
-            Some(prep) => journal.finish_cut(prep, cap.log_from, cap.generation),
-            None => journal.rewrite_from(cap.log_from, cap.generation),
+            Some(prep) => {
+                #[cfg(test)]
+                INSTALL_CUTS.fetch_add(1, Ordering::Relaxed);
+                #[cfg(test)]
+                count_in_scope(|c| &c.install_cuts, 1);
+                ckpt_held("install.before_cut");
+                let cut = journal.finish_cut(prep, cap.log_from, cap.generation);
+                ckpt_held("install.cut_finished");
+                cut
+            }
+            None => {
+                #[cfg(test)]
+                INSTALL_REWRITES.fetch_add(1, Ordering::Relaxed);
+                #[cfg(test)]
+                count_in_scope(|c| &c.install_rewrites, 1);
+                journal.rewrite_from(cap.log_from, cap.generation)
+            }
         };
         if rewritten.is_err() {
             // The old log stays, correct and longer; not cut again before another threshold's
@@ -8952,12 +11719,7 @@ impl StoreInner {
         }
         // Children forked before the capture have rows now; links of children removed before it
         // pointed at rows that are deleted now.
-        for key in &cap.child_keys {
-            self.children.map.remove(key);
-        }
-        for key in &cap.child_removed {
-            self.children.removed.remove(key);
-        }
+        self.children.retire_frozen();
         // The free list: every slot the checkpoint listed free in the catalog leaves the in-memory
         // list if it is still there; one that is not is in use (or reserved) now, and is taken.
         // Slots freed since the capture stay on the list: the catalog does not hold them. (The
@@ -8993,7 +11755,10 @@ impl StoreInner {
         }
         cat.free_cursor = None;
         cat.free_exhausted = false;
-        cat.lease_floor = cat.catalog.lease_min()?;
+        cat.lease_floor = match cap.lease_floor_after {
+            Some(floor) => floor,
+            None => cat.catalog.lease_min()?,
+        };
         cat.ckpt.stmts_locked += cat.catalog.counters.queries - q0;
         self.lease.durable_at_least(cap.lease_now);
         // githost-shape instrument (observing only; r13-compose S-1): counted from the capture,
@@ -9297,6 +12062,7 @@ impl StoreInner {
             if self.names.fresh.get(&name) == Some(&id) {
                 self.names.fresh.remove(&name);
             }
+            self.names.filter.released();
             if self.cat.is_some() || self.catalog_mode {
                 self.names.releases += 1;
                 self.names.gone.insert(name, self.names.releases);
@@ -9809,7 +12575,7 @@ impl StoreInner {
                     BranchId(*child),
                     None,
                     Handle::Detached,
-                    Some(Arc::from(name.as_str())),
+                    Some(name.clone()),
                 )
                 .map_err(corrupt),
             Record::Commit { branch, pages } => {
@@ -10046,7 +12812,7 @@ impl StoreInner {
                     )))?
                     .lineage
             };
-            if self.children.map.contains_key(&(parent.0, f)) {
+            if self.children.contains(&(parent.0, f)) {
                 return Err(LimboError::Corrupt(format!(
                     "branch snapshot: two children at fork epoch {f} of branch {}",
                     parent.0
@@ -11412,6 +14178,56 @@ mod sota_tree_tests {
 mod group_tests {
     use super::*;
 
+    /// Budget create_allocates_no_table_of_every_branch_under_the_store_mutex (64 KiB per create
+    /// under the store mutex) measured one create allocating 2,195,727 bytes as the live branches
+    /// reached 33,056 (artie raw l5-branch_b88c38329.txt): a new chunk of the branch table
+    /// (table.rs: CHUNK entries, allocated whole under the mutex). The chunk's own size must fit
+    /// the budget; the message prints the entry's size, so the fix can be sized from it.
+    #[test]
+    fn a_branch_table_chunk_fits_the_create_allocation_budget() {
+        let entry = std::mem::size_of::<Option<(BranchId, BranchState)>>();
+        let chunk = entry * super::super::table::CHUNK;
+        assert!(
+            chunk <= 64 << 10,
+            "CLAIM: a branch table chunk is {chunk} bytes ({} entries of {entry}; BranchState {}, Lineage {}, \
+             PageMap {}), over the 64 KiB a create may allocate under the store mutex",
+            super::super::table::CHUNK,
+            std::mem::size_of::<BranchState>(),
+            std::mem::size_of::<Lineage>(),
+            std::mem::size_of::<PageMap>()
+        );
+    }
+
+    /// DECISIONS ba515419c3 (found by fastest-budgets reading bb6af4d94): `offer_confirm` compared
+    /// an offered confirmation only with the one the writer HOLDS. Once the writer had taken and
+    /// written flight N's proved word, the slot was empty, so a re-offer of that same word (a
+    /// held-free upgrade's landing, `mark_upgraded`, with no flight since; a proved ordered flight
+    /// upgraded) was queued again and written a second time: one extra pwrite. Here flight N lands
+    /// proved, the writer's step is done by hand (take, write), and the upgrade re-offers N's word:
+    /// nothing is queued, and the word was written once. Mutant `reoffer_written_word`.
+    #[test]
+    fn a_reoffer_of_a_written_word_writes_it_once() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let log = || std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(dir.path().join("log")).unwrap();
+        let group = Group::new(0, Arc::new(AtomicBool::new(false)));
+        group.lock().flushing = true;
+        assert!(group.land(10, SyncClass::FullFsync, true, Some(Confirm::for_test(log(), true))), "premise: flight N landed");
+        let (_, taken) = group.lock().confirm.take().expect("premise: N's proved word is queued");
+        group.write_confirm(&taken, false);
+        drop(taken);
+        assert_eq!(group.confirms_written.load(Ordering::Relaxed), 1, "premise: N's word was written");
+        let left = group.mark_upgraded(10, SyncClass::FullFsync, Some(Confirm::for_test(log(), true)));
+        if let Some((_, again)) = group.lock().confirm.take() {
+            group.write_confirm(&again, false);
+        }
+        drop(left);
+        assert_eq!(
+            group.confirms_written.load(Ordering::Relaxed),
+            1,
+            "CLAIM: a re-offer of the word already written was queued and written again"
+        );
+    }
+
     /// Engine review 8 #9 (its FIX half): an ordered flight's landing leaves no earlier flight's
     /// confirmation queued. An ordered flight is barriered, not synced, so it has no confirmation
     /// of its own, and the log's last flight is now it: the earlier word, written into page 0 by
@@ -11460,6 +14276,80 @@ mod group_tests {
             group.lock().confirm.is_some(),
             "a frameless ordered upgrade dropped the last flight's confirmation"
         );
+    }
+}
+
+#[cfg(test)]
+mod compaction_wait_tests {
+    use super::*;
+
+    /// Codex C25 MED 1 (artie frontier/fastest/reviews/REVIEW-codex-11-engine-2f480432a..0e8b1cf18.md):
+    /// `StoreMutex::lock` read `compacting` only before it tried the mutex, so a requester that
+    /// read it even, then found a background compaction's counted hold begun and holding the mutex,
+    /// waited behind it uncounted, and a zero counter could not show A29's exclusion. Three
+    /// schedules on a real StoreMutex and Compacting, no disk: uncontended (counter +0), a
+    /// compaction marked before the precheck (+1, the control), and one begun after the precheck
+    /// (`AFTER_PRECHECK`) and holding the mutex when the requester locks: it must be counted too.
+    #[test]
+    fn a_lock_behind_a_compaction_begun_after_its_precheck_is_counted() {
+        let m = StoreMutex::new(StoreInner::fresh(None, SyncClass::Off, None));
+        let waits = |m: &StoreMutex| m.compaction_waits.load(Ordering::Relaxed);
+        let w0 = waits(&m);
+        drop(m.lock());
+        assert_eq!(waits(&m), w0, "premise: an uncontended lock was counted as waiting behind a compaction");
+        // Holds the mutex in a counted compaction hold until told to let go; `marked` is sent once
+        // it holds it.
+        let compactor = |m: &StoreMutex, marked: std::sync::mpsc::Sender<()>, release: std::sync::mpsc::Receiver<()>| {
+            let counted = Compacting::begin(m);
+            let guard = m.lock_uncounted();
+            marked.send(()).unwrap();
+            release.recv().unwrap();
+            drop(guard);
+            drop(counted);
+        };
+        for race in [false, true] {
+            let before = waits(&m);
+            let (marked_tx, marked_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let blocked = std::thread::scope(|s| {
+                let mref = &m;
+                let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+                s.spawn(move || {
+                    go_rx.recv().unwrap();
+                    compactor(mref, marked_tx, release_rx)
+                });
+                if race {
+                    // After the precheck: the compaction begins and takes the mutex first.
+                    let mut once = Some((go_tx, marked_rx));
+                    AFTER_PRECHECK.with(|h| {
+                        *h.borrow_mut() = Some(Box::new(move || {
+                            if let Some((go, marked)) = once.take() {
+                                go.send(()).unwrap();
+                                marked.recv().unwrap();
+                            }
+                        }))
+                    });
+                } else {
+                    go_tx.send(()).unwrap();
+                    marked_rx.recv().unwrap();
+                }
+                let release = std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    release_tx.send(()).unwrap();
+                });
+                let t = std::time::Instant::now();
+                drop(m.lock());
+                AFTER_PRECHECK.with(|h| *h.borrow_mut() = None);
+                release.join().unwrap();
+                t.elapsed() >= std::time::Duration::from_millis(50)
+            });
+            assert!(blocked, "premise: race={race}: the requester did not wait behind the compaction's hold");
+            assert_eq!(
+                waits(&m) - before,
+                1,
+                "CLAIM: race={race}: a lock that waited behind a background compaction's counted hold was not counted"
+            );
+        }
     }
 }
 

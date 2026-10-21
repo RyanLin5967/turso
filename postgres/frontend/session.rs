@@ -45,6 +45,16 @@ struct SessionState {
     search_path: Vec<String>,
 }
 
+/// The PostgreSQL parser's and translator's error as the engine's: its stack-guard refusal is the
+/// engine's own (`LimboError::StackDepthLimitExceeded`, 54001 on the wire), anything else a parse
+/// error as before.
+pub(crate) fn pg_parse_error(e: turso_pg_parser::ParseError) -> LimboError {
+    match e {
+        turso_pg_parser::ParseError::StackDepthLimitExceeded => LimboError::StackDepthLimitExceeded,
+        e => LimboError::ParseError(e.to_string()),
+    }
+}
+
 /// Open a database with the PostgreSQL schema dialect, resolving the IO
 /// backend from `vfs` or the path like [`turso_core::Database::open_new`].
 pub fn open_database(
@@ -494,7 +504,7 @@ fn prepare_statement_checked(
 
     // One parse serves both the special forms and the translation (it was two).
     let parse_result =
-        turso_pg_parser::parse(sql).map_err(|e| LimboError::ParseError(e.to_string()))?;
+        turso_pg_parser::parse(sql).map_err(crate::session::pg_parse_error)?;
     // One statement per prepare, as PostgreSQL's Parse takes one (42601): the translator reads the
     // first, so `COMMIT; INSERT ...` in one Parse committed and skipped the INSERT, answering
     // success (wire review 14 item 5). The simple protocol splits a query before it prepares.
@@ -511,7 +521,7 @@ fn prepare_statement_checked(
         // Read from the text as PostgreSQL 18 reads them: a number above i32::MAX is 42601, never
         // libpg_query's 32-bit wrap (wire review 12 item 1).
         let numbers = turso_pg_parser::checked_param_numbers(&parse_result, sql)
-            .map_err(|e| LimboError::ParseError(e.to_string()))?;
+            .map_err(crate::session::pg_parse_error)?;
         if let Some(n) = numbers
             .iter()
             .find(|n| !(1..=crate::result_types::MAX_PARAMETER as i32).contains(*n))
@@ -609,7 +619,7 @@ fn prepare_statement_checked(
     };
     let translated = translator
         .translate_with_prereqs(&parse_result)
-        .map_err(|e| LimboError::ParseError(e.to_string()))?;
+        .map_err(crate::session::pg_parse_error)?;
     reject_catalog_dml(translated.cmd.stmt())?;
     if let Some(types) = types {
         types.new_table_keys = new_table_keys;
@@ -1122,7 +1132,7 @@ fn handle_pg_add_constraints(
         ))
     })?;
     let mut parsed =
-        turso_pg_parser::parse(pg_definition).map_err(|e| LimboError::ParseError(e.to_string()))?;
+        turso_pg_parser::parse(pg_definition).map_err(crate::session::pg_parse_error)?;
     // Taken before the definition is edited below (a clone made while `create` borrows it would
     // not compile).
     let mut aside_tree = parsed.protobuf.clone();
@@ -1183,10 +1193,10 @@ fn handle_pg_add_constraints(
         }
     }
     let aside_def =
-        turso_pg_parser::deparse(&aside_tree).map_err(|e| LimboError::ParseError(e.to_string()))?;
+        turso_pg_parser::deparse(&aside_tree).map_err(crate::session::pg_parse_error)?;
     create.table_elts.extend(add.constraints.iter().cloned());
     let rebuilt = turso_pg_parser::deparse(&parsed.protobuf)
-        .map_err(|e| LimboError::ParseError(e.to_string()))?;
+        .map_err(crate::session::pg_parse_error)?;
 
     let quoted = format!("\"{}\"", table.replace('"', "\"\""));
     let aside = format!("\"{}\"", aside_name.replace('"', "\"\""));
