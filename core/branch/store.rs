@@ -255,6 +255,11 @@ pub(crate) struct BranchStore {
     /// F-FZ back-pressure: set while a fuzzy checkpoint is in flight and the log is past twice the
     /// threshold; an operation that sees it after releasing the store mutex waits for the install.
     over_hard: Arc<AtomicBool>,
+    /// Test builds (h1gap-rev-c HIGH-2, ruling 4412c8a62b's cause tag): the fuzzy checkpoint last started
+    /// carries link-fill or upgrade work (its capture runs the whole-catalog upgrade), so a back-pressure
+    /// wait on its install is counted apart (`thread_fill_waits`).
+    #[cfg(test)]
+    fill_flight: AtomicBool,
     /// F-FZ: set from a fuzzy checkpoint's install until its WAL truncation ends; no checkpoint
     /// starts meanwhile, whose capture would pin a read mark and make the truncation busy.
     truncating: Arc<AtomicBool>,
@@ -1554,6 +1559,19 @@ thread_local! {
     /// commit's WAL flush, for a checkpoint's install, for a trunk commit's publication (test
     /// builds; review 7 #7 as the flagged-edit judge asked: a wait is counted, not timed).
     static THREAD_WAITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The back-pressure waits this thread made on the install of a fuzzy checkpoint whose capture carries
+    /// link-fill or upgrade work (h1gap-rev-c HIGH-2's cause-tagged counter, ruling 4412c8a62b).
+    static THREAD_FILL_WAITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// See `THREAD_FILL_WAITS`.
+#[cfg(test)]
+pub(crate) fn thread_fill_waits() -> u64 {
+    THREAD_FILL_WAITS.with(std::cell::Cell::get)
 }
 
 /// One wait (`THREAD_WAITS`).
@@ -4083,7 +4101,12 @@ impl Drop for Backpressure<'_> {
                 return;
             }
             #[cfg(test)]
-            note_wait();
+            {
+                note_wait();
+                if self.0.fill_flight.load(Ordering::Acquire) {
+                    THREAD_FILL_WAITS.with(|n| n.set(n.get() + 1));
+                }
+            }
             n = installed
                 .wait_timeout(n, Duration::from_millis(50))
                 .unwrap_or_else(|e| e.into_inner())
@@ -4333,6 +4356,8 @@ impl BranchStore {
             name_filter_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             flight_hold: Arc::new(AtomicU8::new(0)),
             over_hard: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            fill_flight: AtomicBool::new(false),
             truncating: Arc::new(AtomicBool::new(false)),
             installs: Arc::new((std::sync::Mutex::new(0), std::sync::Condvar::new())),
             trunk_children: AtomicUsize::new(0),
@@ -4640,6 +4665,8 @@ impl BranchStore {
             name_filter_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             flight_hold: Arc::new(AtomicU8::new(0)),
             over_hard: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            fill_flight: AtomicBool::new(false),
             truncating: Arc::new(AtomicBool::new(false)),
             installs: Arc::new((std::sync::Mutex::new(0), std::sync::Condvar::new())),
             unsynced: AtomicBool::new(false),
@@ -6238,6 +6265,13 @@ impl BranchStore {
             }
         };
         let cat = inner.cat.as_mut().expect("captured above");
+        // Test builds (ruling 4412c8a62b's cause tag): this flight's capture runs the whole-catalog upgrade
+        // (`checkpoint_write`: a flip with no complete fill).
+        #[cfg(test)]
+        self.fill_flight.store(
+            super::journal::carries_links(cap.meta.format) && !cat.catalog.links_valid() && !(cap.links_prefilled && cat.catalog.links()),
+            Ordering::Release,
+        );
         cat.ckpt.hold(ns(t));
         cat.ckpt.stmts_locked += cat.catalog.counters.queries - q0;
         let writer = cat.writer.clone();
