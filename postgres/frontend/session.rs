@@ -614,10 +614,39 @@ fn refuse_alter_column_type_across_families(
                 _ => return None,
             })
         };
+        // The same type under another spelling (float8 and double precision, bool and boolean),
+        // and a numeric whose scale is kept and precision widened, keep the stored form too
+        // (wire-rev-7128c6f73 L6: they were refused as if their values would stay unconverted).
+        fn same(t: &str) -> &str {
+            match t {
+                "float8" | "double precision" | "double" | "float" => "float8",
+                "float4" | "real" => "float4",
+                "bool" | "boolean" => "boolean",
+                other => other,
+            }
+        }
+        let numeric_widened = || {
+            let old_mods: Option<Vec<i64>> = col
+                .ty_params
+                .iter()
+                .map(|e| match e.as_ref() {
+                    turso_parser::ast::Expr::Literal(turso_parser::ast::Literal::Numeric(n)) => n.parse().ok(),
+                    _ => None,
+                })
+                .collect();
+            let new_mods = def.type_name.as_ref().map(turso_pg_parser::translator::type_modifiers).and_then(|m| m.ok());
+            match (old_mods.as_deref(), new_mods.as_deref()) {
+                (Some([p0, s0]), Some([p1, s1])) => s0 == s1 && p1 >= p0,
+                (Some([p0]), Some([p1])) => p1 >= p0,
+                (Some([p0]), Some([p1, 0])) => p1 >= p0,
+                _ => false,
+            }
+        };
         let allowed = match (family(&old), family(&new)) {
             (Some((0, _)), Some((0, _))) => true,
             (Some((1, w_old)), Some((1, w_new))) => w_new >= w_old,
-            _ => false,
+            _ if old == "numeric" && matches!(new.as_str(), "numeric" | "decimal") => numeric_widened(),
+            _ => same(&old) == same(&new) && matches!(same(&old), "float8" | "float4" | "boolean"),
         };
         if !allowed {
             return Err(LimboError::ParseError(SqlErrorMessage::classified(
