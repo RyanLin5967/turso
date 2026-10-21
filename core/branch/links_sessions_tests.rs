@@ -44,6 +44,14 @@ fn log_bytes(path: &std::path::Path) -> u64 {
     std::fs::metadata(format!("{}-branch-log", path.display())).map_or(0, |m| m.len())
 }
 
+/// `log_bytes` for the polls that read a cut (h1-rev-72bfb0127 LOW-7, FLAGGED stricter): a log that cannot
+/// be read is refused, never read as 0 B (under any peak, so a cut).
+fn log_present(path: &std::path::Path) -> u64 {
+    std::fs::metadata(format!("{}-branch-log", path.display()))
+        .map(|m| m.len())
+        .unwrap_or_else(|e| panic!("the branch log of {} cannot be read: {e}", path.display()))
+}
+
 /// A 19 store of `n` branches made and checkpointed by the older build (the stand-in).
 fn older_store(path: &std::path::Path, n: usize) {
     super::journal::CREATE_LEGACY.with(|c| c.set(true));
@@ -238,7 +246,7 @@ fn ls_hard_whole_child() {
     db.branch_checkpoint_wait();
     let whole = super::catalog::WHOLE_UPGRADE_BATCHES.load(Ordering::Acquire) - w0;
     // The asserted readings, taken before the LOW-3 observation below.
-    let (meta, log) = (meta_version(&path), log_bytes(&path));
+    let (meta, log) = (meta_version(&path), log_present(&path));
     // h1-rev-72bfb0127 LOW-3 (observing here; asserted by its own test): fill threads started, and batches a
     // superseded fill started, through the end of the run.
     std::thread::sleep(std::time::Duration::from_millis(2_500));
@@ -435,7 +443,7 @@ fn ls_hard_limit_child() {
     db.branch_checkpoint_wait();
     // Observing only (l4-rev-h1 LOW 4, measured, no assertion): busy catalog WAL truncations meanwhile.
     let busy = db.branches.wal_truncate_busy_for_test() - busy0;
-    println!("LS-HARD meta={} log={} peak={peak} wal_busy={busy}", meta_version(&path), log_bytes(&path));
+    println!("LS-HARD meta={} log={} peak={peak} wal_busy={busy}", meta_version(&path), log_present(&path));
     super::store::LINKS_FILL_PAUSE_MS.store(0, Ordering::Release);
 }
 
@@ -496,10 +504,10 @@ fn ls_fill_starved_child() {
     // only then waited on: checkpoint_wait joins the fill thread, which a hold in place never ends.
     // (Ruling 62c11ec63d: what is polled is the log's cut; the meta row is read once it is.)
     let t = std::time::Instant::now();
-    let mut log_held = log_bytes(&path);
+    let mut log_held = log_present(&path);
     while log_held >= peak && t.elapsed() < std::time::Duration::from_secs(60) {
         std::thread::sleep(std::time::Duration::from_millis(20));
-        log_held = log_bytes(&path);
+        log_held = log_present(&path);
     }
     let meta = try_meta_version(&path).unwrap_or(0);
     super::store::LINKS_FILL_HOLD_UNRECORDED.store(false, Ordering::Release);
@@ -564,10 +572,10 @@ fn ls_fill_entry_starved_child() {
     // the wait; a fill that held the upgrade never gets there).
     // (Ruling 62c11ec63d: what is polled is the log's cut; the meta row is read once it is.)
     let t = std::time::Instant::now();
-    let mut log_held = log_bytes(&path);
+    let mut log_held = log_present(&path);
     while log_held >= peak && t.elapsed() < std::time::Duration::from_secs(60) {
         std::thread::sleep(std::time::Duration::from_millis(20));
-        log_held = log_bytes(&path);
+        log_held = log_present(&path);
     }
     let meta_held = try_meta_version(&path).unwrap_or(0);
     super::store::LINKS_FILL_HOLD_AT_ENTRY.store(false, Ordering::Release);
@@ -982,7 +990,7 @@ fn ls_nonflip_crash_child() {
     }
     // The checkpoints the creates started, installed (a fuzzy one waited for; the fill is not joined).
     let t = std::time::Instant::now();
-    while log_bytes(&path) >= peak && t.elapsed() < std::time::Duration::from_secs(30) {
+    while log_present(&path) >= peak && t.elapsed() < std::time::Duration::from_secs(30) {
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
     // The meta row read Busy-tolerant (a checkpoint may hold the catalog: FLAGGED harness repair, measured at
@@ -993,7 +1001,7 @@ fn ls_nonflip_crash_child() {
         std::thread::sleep(std::time::Duration::from_millis(20));
         meta = try_meta_version(&path);
     }
-    println!("LS-NFCUT past={} meta={} peak={peak} log={}", u64::from(db.branches.past_hard_limit_for_test()), meta.unwrap_or(0), log_bytes(&path));
+    println!("LS-NFCUT past={} meta={} peak={peak} log={}", u64::from(db.branches.past_hard_limit_for_test()), meta.unwrap_or(0), log_present(&path));
     std::process::exit(0);
 }
 
@@ -1127,7 +1135,7 @@ fn ls_nonflip_behind_child() {
         let _ = trunk.fork_branch().unwrap().into_id();
     }
     let t = std::time::Instant::now();
-    while log_bytes(&path) >= peak && t.elapsed() < std::time::Duration::from_secs(30) {
+    while log_present(&path) >= peak && t.elapsed() < std::time::Duration::from_secs(30) {
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
     let (cgen, cpar, cfe, cdone, mgen) = poll_cursor(&path).unwrap_or((0, 0, 0, 9, 9999));
@@ -1135,7 +1143,7 @@ fn ls_nonflip_behind_child() {
     println!(
         "LS-NFBEHIND past={} meta={meta} peak={peak} log={} cgen={cgen} mgen={mgen} cpar={cpar} cfe={cfe} cdone={cdone} markpar={mark_par} markfe={mark_fe}",
         u64::from(db.branches.past_hard_limit_for_test()),
-        log_bytes(&path)
+        log_present(&path)
     );
     std::process::exit(0);
 }
@@ -1211,7 +1219,7 @@ fn ls_xbuild_cut_child() {
         let _ = trunk.fork_branch().unwrap().into_id();
     }
     let t = std::time::Instant::now();
-    while log_bytes(&path) >= peak && t.elapsed() < std::time::Duration::from_secs(30) {
+    while log_present(&path) >= peak && t.elapsed() < std::time::Duration::from_secs(30) {
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
     let (cgen, cpar, cfe, cdone, mgen) = poll_cursor(&path).unwrap_or((0, 0, 0, 9, 9999));
@@ -1219,7 +1227,7 @@ fn ls_xbuild_cut_child() {
     println!(
         "LS-XBCUT past={} meta={meta} peak={peak} log={} cgen={cgen} mgen={mgen} cpar={cpar} cfe={cfe} cdone={cdone}",
         u64::from(db.branches.past_hard_limit_for_test()),
-        log_bytes(&path)
+        log_present(&path)
     );
     std::process::exit(0);
 }
