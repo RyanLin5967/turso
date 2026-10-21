@@ -2072,6 +2072,17 @@ fn prepare_statement_parsed(
                 if f.funcname.last().is_some_and(|p| matches!(&p.node,
                     Some(turso_pg_parser::pg_query::protobuf::node::Node::String(s)) if s.sval.eq_ignore_ascii_case("min") || s.sval.eq_ignore_ascii_case("max"))))
         });
+        // ... and for one calling a function PostgreSQL has none of, a quoted name with an
+        // upper-case letter or a public-qualified one, which the walk refuses 42883
+        // (wire-rev-1de981755-rest LOW-3: "LENGTH"('abc') answered). Bounded by the text as
+        // above: such a call is a quoted name right before its '(' or a "public." prefix.
+        let unknown_call = (may_name(b"\"(") || may_name(b"public."))
+            && parse_result.protobuf.nodes().iter().any(|(n, ..)| {
+                matches!(n, turso_pg_parser::pg_query::NodeRef::FuncCall(f)
+                    if f.funcname.iter().any(|p| matches!(&p.node,
+                        Some(turso_pg_parser::pg_query::protobuf::node::Node::String(s))
+                            if s.sval == "public" || s.sval.bytes().any(|b| b.is_ascii_uppercase()))))
+            });
         // ... and for one that may read an interval, time or timestamp value, whose arithmetic and
         // interval comparisons the walk refuses (wire-rev-1de981755-rest HIGH-2, MED-8: `WHERE ts2 >
         // ts + interval '1 hour'` was never walked). The text bounds it as for min and max: such a
@@ -2102,7 +2113,7 @@ fn prepare_statement_parsed(
                                 .any(|(table, t)| mentions(&view.sql, table.as_bytes()) && temporal_table(t.as_ref())))
                 })
         };
-        if !used.is_empty() || aggregates.contains(&true) || min_max || temporal() {
+        if !used.is_empty() || aggregates.contains(&true) || min_max || unknown_call || temporal() {
             // A parameter compared with something no context types is refused (42P18) by the
             // server, which alone reads the types the client declared (wire review 8 item 7,
             // review 11 item 1).

@@ -2585,19 +2585,33 @@ impl Infer<'_> {
                         _ => None,
                     })
                     .collect();
-                let unknown_min_max = match parts.as_slice() {
-                    [name] | ["pg_catalog", name] => {
-                        (name.eq_ignore_ascii_case("min") || name.eq_ignore_ascii_case("max")) && !matches!(*name, "min" | "max")
-                    }
+                // A function PostgreSQL has none of: a name quoted with an upper-case letter (every
+                // pg_catalog function is lower case: "LENGTH", "MAX"), or one qualified by public, or
+                // min or max qualified by any schema but pg_catalog; 42883 named as written, with
+                // its arguments' types (wire-rev-351702a43 LOW-8, wire-rev-7128c6f73 L5,
+                // wire-rev-1de981755-rest LOW-3: only min and max were judged, and "MAX"(NULL)
+                // answered). An argument the walk cannot type leaves it to the engine.
+                let unknown_function = match parts.as_slice() {
+                    [name] | ["pg_catalog", name] => name.bytes().any(|b| b.is_ascii_uppercase()),
+                    ["public", _] => true,
                     [_, name] => matches!(*name, "min" | "max"),
                     _ => false,
                 };
-                if unknown_min_max {
-                    if let Some(t) = call.args.first().and_then(|a| self.type_of(a, scope)).filter(|t| type_name(*t) != "unknown") {
+                if unknown_function {
+                    use turso_pg_parser::pg_query::protobuf::a_const::Val;
+                    let types: Option<Vec<&str>> = call
+                        .args
+                        .iter()
+                        .map(|a| match a.node.as_ref() {
+                            Some(Node::AConst(c)) if c.isnull || matches!(c.val, Some(Val::Sval(_))) => Some("unknown"),
+                            _ => self.type_of(a, scope).map(type_name).filter(|n| *n != "unknown"),
+                        })
+                        .collect();
+                    if let Some(types) = types {
                         self.first_refusal.borrow_mut().get_or_insert_with(|| {
                             Some(SqlErrorMessage::classified(
                                 SqlErrorKind::UndefinedFunction,
-                                format!("function {}({}) does not exist", parts.join("."), type_name(t)),
+                                format!("function {}({}) does not exist", parts.join("."), types.join(", ")),
                             ))
                         });
                     }
