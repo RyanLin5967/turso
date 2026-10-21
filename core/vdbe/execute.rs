@@ -241,7 +241,14 @@ fn numeric_operand(val: &Value) -> Result<bigdecimal::BigDecimal> {
             "invalid input for type numeric: \"{val}\""
         )));
     }
-    value_to_bigdecimal(val)
+    let value = value_to_bigdecimal(val)?;
+    // Within PostgreSQL's numeric range, or refused before any arithmetic (engine review 21 MED
+    // 10: a scale bounded only by i64 made one division build billions of digits). Mutant
+    // `numeric_range_unchecked` (test builds only): not checked, as before.
+    if !crate::branch::store::fe_mutant("numeric_range_unchecked") {
+        crate::numeric::decimal::check_numeric_range(&value)?;
+    }
+    Ok(value)
 }
 
 /// Create a sort comparator closure from a SortComparatorType enum.
@@ -717,10 +724,14 @@ pub fn op_checkpoint(
         Ok(IOResult::IO(io)) => Ok(InsnFunctionStepResult::IO(io)),
         Err(err) => {
             tracing::debug!("PRAGMA wal_checkpoint failed: {err:?}");
-            // A trunk sync the pager noted (the database file's) that failed after it yielded is a
-            // failed drain of the device, acted on before the row reports busy (engine review 17
-            // HIGH 1; the WAL's own syncs are acted on where they fail). Mutant
-            // `pragma_checkpoint_failure_cleared` (test builds only): cleared unchecked, as before.
+            // A trunk sync the pager noted that failed after it yielded is a failed drain of the
+            // device, acted on before the row reports busy (engine review 17 HIGH 1): since
+            // e733305fd that includes the checkpoint's and the TRUNCATE's own WAL syncs, which
+            // `WalFile::watched` notes when they return (engine review 19 HIGH 1), so a busy row
+            // from one of them is acted on here, on async IO (review 19 LOW 8 found this arm with
+            // no reachable case before that fix). Mutant `pragma_checkpoint_failure_cleared` (test
+            // builds only): cleared unchecked, as before; its killer is meant to be the busy-row
+            // case of the a_yielded_*_reported_by_the_pragma_fail_stops arms, UNVERIFIED (QUIET).
             if !crate::branch::store::fe_mutant("pragma_checkpoint_failure_cleared") {
                 pager.check_noted_syncs();
             }
@@ -10606,6 +10617,9 @@ pub fn op_function(
                                 "invalid input for type numeric: \"{text}\""
                             ))
                         })?;
+                        // PostgreSQL's range first: a rescale of an unbounded scale is as
+                        // unbounded as a division (engine review 21 MED 10).
+                        crate::numeric::decimal::check_numeric_range(&bd)?;
                         let validated = validate_precision_scale(&bd, precision, scale)?;
                         Value::from_blob(bigdecimal_to_blob(&validated))
                     }
@@ -10658,7 +10672,7 @@ pub fn op_function(
                                 if crate::branch::store::fe_mutant("div_scale_bigdecimal") {
                                     a / b
                                 } else {
-                                    crate::numeric::decimal::pg_numeric_div(&a, &b)
+                                    crate::numeric::decimal::pg_numeric_div(&a, &b)?
                                 }
                             }
                             _ => unreachable!(),
@@ -16216,7 +16230,7 @@ pub fn op_integrity_check(
     Ok(InsnFunctionStepResult::Step)
 }
 pub fn op_cast(
-    _program: &Program,
+    program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
@@ -16224,6 +16238,16 @@ pub fn op_cast(
     load_insn!(Cast { reg, affinity }, insn);
 
     let value = state.registers[*reg].get_value().clone();
+    // A dialect may read a text as a float in its own way (PostgreSQL's 'Infinity').
+    if matches!(affinity, Affinity::Real) {
+        if let Some(text) = value.to_text() {
+            if let Some(float) = program.connection.dialect().cast_text_to_float(text) {
+                state.registers[*reg].set_value(Value::from_f64(float?));
+                state.pc += 1;
+                return Ok(InsnFunctionStepResult::Step);
+            }
+        }
+    }
     let result = match affinity {
         Affinity::Blob | Affinity::None => value.exec_cast("BLOB"),
         Affinity::Text => value.exec_cast("TEXT"),

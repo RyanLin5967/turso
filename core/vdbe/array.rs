@@ -155,7 +155,7 @@ pub(crate) fn values_to_record_blob(values: &[Value]) -> Result<Value> {
 /// - NULL elements → uppercase `NULL` (unquoted)
 /// - Text elements → double-quoted if they contain special chars, unquoted otherwise
 /// - Numeric elements → unquoted
-pub(crate) fn serialize_array_from_blob(blob: &[u8]) -> Result<String> {
+pub fn serialize_array_from_blob(blob: &[u8]) -> Result<String> {
     let iter = ValueIterator::new(blob)?;
     let mut result = String::from("{");
     let mut first = true;

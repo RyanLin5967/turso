@@ -357,6 +357,10 @@ pub(crate) fn store_unlocked() {
 /// counters, which see one connection each. BLIND SPOT: transaction control and pragmas
 /// (`conn.execute("BEGIN")`, `wal_checkpoint`) are not statements of `Stmt` and are not counted.
 pub(crate) fn catalog_statement(write: bool, rows: u64) {
+    // Diagnostic (`trace_lifecycle_catalog`): who runs each catalog statement.
+    if TRACE_CAT.load(Relaxed) {
+        eprintln!("CATALOG STMT write={write} rows={rows}\n{}", std::backtrace::Backtrace::force_capture());
+    }
     CAT_STMTS.fetch_add(1, Relaxed);
     CAT_ROWS.fetch_add(rows, Relaxed);
     bump(&T_CAT_STMTS, 1);
@@ -617,10 +621,99 @@ pub(crate) fn persistent_live() -> i64 {
     PERSISTENT_LIVE.load(Relaxed)
 }
 
+/// A thread of this process held suspended (Mach `thread_suspend`) until this is dropped, which
+/// resumes it and gives its port back. For fire-checks only, outside every measured window (review
+/// C14: the confirmation writer delayed between a notification and its wait's return).
+#[cfg(target_vendor = "apple")]
+pub(crate) struct Suspended(libc::thread_act_t);
+
+#[cfg(target_vendor = "apple")]
+extern "C" {
+    fn thread_suspend(target: libc::thread_act_t) -> libc::kern_return_t;
+    fn thread_resume(target: libc::thread_act_t) -> libc::kern_return_t;
+}
+
+#[cfg(target_vendor = "apple")]
+impl Drop for Suspended {
+    #[allow(deprecated)]
+    fn drop(&mut self) {
+        extern "C" {
+            fn mach_port_deallocate(task: libc::mach_port_t, name: libc::mach_port_t) -> libc::kern_return_t;
+        }
+        // SAFETY: a thread port of this task that this guard suspended once and still holds.
+        unsafe {
+            thread_resume(self.0);
+            mach_port_deallocate(libc::mach_task_self(), self.0);
+        }
+    }
+}
+
+/// Suspend the one thread of this process whose pthread name is `name`; `None` unless exactly one
+/// has it, or if the suspend fails. Not for a measured window (it reads thread names).
+#[cfg(target_vendor = "apple")]
+#[allow(deprecated)]
+pub(crate) fn suspend_thread_named(name: &str) -> Option<Suspended> {
+    extern "C" {
+        fn mach_port_deallocate(task: libc::mach_port_t, name: libc::mach_port_t) -> libc::kern_return_t;
+    }
+    let mut list: libc::thread_act_array_t = std::ptr::null_mut();
+    let mut count: libc::mach_msg_type_number_t = 0;
+    // SAFETY: this task's own port; on success `list` holds `count` thread ports in memory the kernel
+    // mapped for us, all given back below but the one kept.
+    let task = unsafe { libc::mach_task_self() };
+    // SAFETY: as above.
+    if unsafe { libc::task_threads(task, &mut list, &mut count) } != 0 {
+        return None;
+    }
+    let mut matching = Vec::new();
+    for i in 0..count as usize {
+        // SAFETY: `list` holds `count` ports.
+        let port = unsafe { *list.add(i) };
+        let mut buf = [0 as libc::c_char; 64];
+        // SAFETY: a thread port of this task; no new right is made.
+        let pt = unsafe { libc::pthread_from_mach_thread_np(port) };
+        let named = pt != 0
+            // SAFETY: a live pthread of this process and a buffer of the length given.
+            && unsafe { libc::pthread_getname_np(pt, buf.as_mut_ptr(), buf.len()) } == 0
+            // SAFETY: NUL-terminated by pthread_getname_np.
+            && unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) }.to_str() == Ok(name);
+        if named {
+            matching.push(port);
+        } else {
+            // SAFETY: a send right from `list`, released once.
+            unsafe { mach_port_deallocate(task, port) };
+        }
+    }
+    // SAFETY: the array the kernel mapped, of exactly this size.
+    unsafe {
+        libc::vm_deallocate(
+            task,
+            list as libc::vm_address_t,
+            count as libc::vm_size_t * std::mem::size_of::<libc::thread_act_t>() as libc::vm_size_t,
+        )
+    };
+    if matching.len() != 1 {
+        for port in matching {
+            // SAFETY: a send right from `list`, released once.
+            unsafe { mach_port_deallocate(task, port) };
+        }
+        return None;
+    }
+    let only = matching[0];
+    // SAFETY: a thread port of this task; a failed suspend leaves it running.
+    if unsafe { thread_suspend(only) } != 0 {
+        // SAFETY: as above.
+        unsafe { mach_port_deallocate(task, only) };
+        return None;
+    }
+    Some(Suspended(only))
+}
+
 /// The threads of this process, each as `(is_self, blocked)`, given to `each`; `None` when they cannot
 /// be listed (off Apple). Mach traps and userspace only (the port list is given back with
 /// `mach_port_deallocate` and `vm_deallocate`), so it can run inside a measured window without moving
 /// the syscall count. `blocked` is the kernel's `TH_STATE_WAITING` for the thread.
+#[allow(deprecated)]
 fn each_thread(mut each: impl FnMut(bool, bool)) -> Option<()> {
     #[cfg(target_vendor = "apple")]
     {
@@ -717,3 +810,6 @@ fn linux_threads() -> Option<u64> {
         None
     }
 }
+
+/// Diagnostic (`trace_lifecycle_catalog`): print a backtrace at every catalog statement while set.
+pub(crate) static TRACE_CAT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
