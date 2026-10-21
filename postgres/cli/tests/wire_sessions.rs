@@ -8188,6 +8188,12 @@ fn copy_start(a: &mut Wire, sql: &str, data: &[u8]) -> Reply {
     r
 }
 
+/// Rows enough to be spilled while their COPY is still open: about 177 KB of integer lines, past
+/// the 64 KiB the server gathers before it reads a piece, so it reads and spills them before
+/// CopyDone (5000 rows, about 24 KB, were read only at CopyDone: the red run copy-red11's
+/// premises failed on it).
+const SPILLING_ROWS: usize = 30000;
+
 /// The COPY spill files the server `pid` holds open: each descriptor whose link names one
 /// (`turso-copy-`), with the link's text and the file's permission bits (read through the
 /// descriptor, so an unlinked file's too).
@@ -8241,7 +8247,7 @@ fn a_failed_copy_lets_go_of_its_spill_file_at_once() {
     let mut a = server.connect();
     a.s.set_read_timeout(Some(Duration::from_secs(300))).unwrap();
     a.q("CREATE TABLE sf (id int PRIMARY KEY)").ok("sf");
-    let rows: Vec<u8> = (1..=5000).flat_map(|i| format!("{i}\n").into_bytes()).collect();
+    let rows: Vec<u8> = (1..=SPILLING_ROWS).flat_map(|i| format!("{i}\n").into_bytes()).collect();
     for (what, last, code) in [
         ("a duplicate key at the end", &b"1\n"[..], "23505"),
         ("a bad line", b"x\n", "22P02"),
@@ -8264,7 +8270,7 @@ fn a_failed_copy_lets_go_of_its_spill_file_at_once() {
 }
 
 /// COPY spills beside its database by default, so a missing TMPDIR changes nothing: a COPY of
-/// 5000 rows with TMPDIR naming no directory spills into the database's directory and loads, as
+/// SPILLING_ROWS rows with TMPDIR naming no directory spills into the database's directory and loads, as
 /// PostgreSQL (which has no spill) loads it. The spill went to $TMPDIR, so every COPY over 1000
 /// rows failed there with XX000 "COPY FROM: the spill file failed: No such file or directory"
 /// (review wire-rev-copystdin3 M1, `tmpdir`; 970721b5c loaded it).
@@ -8276,7 +8282,7 @@ fn copy_spills_beside_its_database_whatever_tmpdir_is() {
     let mut a = server.connect();
     a.s.set_read_timeout(Some(Duration::from_secs(300))).unwrap();
     a.q("CREATE TABLE st (id int)").ok("st");
-    let rows: Vec<u8> = (1..=5000).flat_map(|i| format!("{i}\n").into_bytes()).collect();
+    let rows: Vec<u8> = (1..=SPILLING_ROWS).flat_map(|i| format!("{i}\n").into_bytes()).collect();
     let mut r = copy_start(&mut a, "COPY st FROM STDIN", &rows);
     let held = wait_for_spill(server.pid());
     let db_dir = std::fs::canonicalize(&dir.0).unwrap();
@@ -8286,7 +8292,7 @@ fn copy_spills_beside_its_database_whatever_tmpdir_is() {
     );
     a.send(b'c', &[]);
     a.read_into(&mut r, false);
-    assert_eq!(r.ok("the COPY").tags, vec!["COPY 5000".to_string()]);
+    assert_eq!(r.ok("the COPY").tags, vec![format!("COPY {SPILLING_ROWS}")]);
 }
 
 /// `--temp-file-limit` caps COPY's spill in kB, as PostgreSQL 18.6's temp_file_limit caps a temp
@@ -8358,7 +8364,7 @@ fn the_copy_spill_dir_is_where_copy_spills_and_is_checked_at_startup() {
     let mut a = server.connect();
     a.s.set_read_timeout(Some(Duration::from_secs(300))).unwrap();
     a.q("CREATE TABLE sp (id int)").ok("sp");
-    let rows: Vec<u8> = (1..=5000).flat_map(|i| format!("{i}\n").into_bytes()).collect();
+    let rows: Vec<u8> = (1..=SPILLING_ROWS).flat_map(|i| format!("{i}\n").into_bytes()).collect();
     let mut r = copy_start(&mut a, "COPY sp FROM STDIN", &rows);
     let held = wait_for_spill(server.pid());
     let spill = std::fs::canonicalize(&spill).unwrap();
@@ -8368,7 +8374,7 @@ fn the_copy_spill_dir_is_where_copy_spills_and_is_checked_at_startup() {
     );
     a.send(b'c', &[]);
     a.read_into(&mut r, false);
-    assert_eq!(r.ok("the COPY").tags, vec!["COPY 5000".to_string()]);
+    assert_eq!(r.ok("the COPY").tags, vec![format!("COPY {SPILLING_ROWS}")]);
 }
 
 /// A COPY's spill file is its owner's alone (mode 0600) from its creation: it was created with
@@ -8394,7 +8400,7 @@ fn a_copy_spill_file_is_its_owners_alone() {
     let mut a = server.connect();
     a.s.set_read_timeout(Some(Duration::from_secs(300))).unwrap();
     a.q("CREATE TABLE sm (id int)").ok("sm");
-    let rows: Vec<u8> = (1..=5000).flat_map(|i| format!("{i}\n").into_bytes()).collect();
+    let rows: Vec<u8> = (1..=SPILLING_ROWS).flat_map(|i| format!("{i}\n").into_bytes()).collect();
     let mut r = copy_start(&mut a, "COPY sm FROM STDIN", &rows);
     let held = wait_for_spill(server.pid());
     assert!(!held.is_empty(), "premise not met: the COPY opened no spill file");
@@ -8403,7 +8409,7 @@ fn a_copy_spill_file_is_its_owners_alone() {
     }
     a.send(b'c', &[]);
     a.read_into(&mut r, false);
-    assert_eq!(r.ok("the COPY").tags, vec!["COPY 5000".to_string()]);
+    assert_eq!(r.ok("the COPY").tags, vec![format!("COPY {SPILLING_ROWS}")]);
 }
 
 /// numeric_in refuses an exponent past ±(INT32_MAX / 2) = ±1073741823 with 22003 "value
