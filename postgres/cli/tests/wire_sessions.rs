@@ -8511,6 +8511,131 @@ fn a_copy_stalled_inside_a_message_ends_at_a_cancel_or_its_timeout() {
     assert_eq!(a.q("SELECT count(*) FROM ph2").single("count"), "2");
 }
 
+/// Integer lines 1..=n, one per row, for COPY.
+fn int_rows(n: usize) -> Vec<u8> {
+    (1..=n).flat_map(|i| format!("{i}\n").into_bytes()).collect()
+}
+
+/// A statement_timeout or a CancelRequest during ALTER TABLE ADD CONSTRAINT's rebuild answers
+/// 57014 with PostgreSQL's message, the session idle and usable, the table whole and without the
+/// constraint (PostgreSQL 18.6: 57014, review wire-rev-copystdin4 run rv4-3017-pg2). Its own undo
+/// runs unstoppable since 3017001a2; at 121844bd2 the undo was stopped too: FATAL 08006, 8 of 8
+/// timeouts and 3 of 3 cancels (run rv4-3017-tr). Written by the reviewer (`rv4_tests.rs`) for
+/// LOW 1, the commit's untested claim: it passes at 3017001a2 and covers that claim.
+#[test]
+fn a_timeout_or_cancel_during_an_alter_add_constraint_leaves_the_session_usable() {
+    let dir = Scratch::new("alterstop");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.s.set_read_timeout(Some(Duration::from_secs(600))).unwrap();
+    let key = a.key.clone().expect("BackendKeyData at startup");
+    a.q("CREATE TABLE b (id int)").ok("b");
+    copy_in_pieces(&mut a, "COPY b FROM STDIN", &int_rows(200_000)).ok("load b");
+    a.q("SET statement_timeout = 200").ok("timeout");
+    let r = a.q("ALTER TABLE b ADD CONSTRAINT bk CHECK (id > 0)");
+    let e = r.err("ALTER under a 200 ms timeout");
+    assert_eq!(
+        (e.code.as_str(), e.message.as_str()),
+        ("57014", "canceling statement due to statement timeout")
+    );
+    assert_eq!(r.status, b'I');
+    a.q("RESET statement_timeout").ok("the session after the timeout");
+    a.send(b'Q', b"ALTER TABLE b ADD CONSTRAINT bk CHECK (id > 0)\0");
+    std::thread::sleep(Duration::from_millis(300));
+    let mut s = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+    let mut m = ((8 + key.len()) as i32).to_be_bytes().to_vec();
+    m.extend_from_slice(&80877102i32.to_be_bytes());
+    m.extend_from_slice(&key);
+    s.write_all(&m).unwrap();
+    let mut r = Reply::default();
+    a.read_into(&mut r, false);
+    let e = r.err("ALTER cancelled after 300 ms");
+    assert_eq!(
+        (e.code.as_str(), e.message.as_str()),
+        ("57014", "canceling statement due to user request")
+    );
+    assert_eq!(r.status, b'I');
+    assert_eq!(a.q("SELECT count(*) FROM b").single("count"), "200000");
+    a.q("INSERT INTO b VALUES (-1)").ok("no constraint was added");
+}
+
+/// A multi-object DROP stopped by statement_timeout drops nothing and leaves the session idle,
+/// holding no lock: PostgreSQL 18.6's `DROP TABLE d1, d2` is all or none, and an error from it
+/// never leaves a transaction or half a drop (review wire-rev-copystdin4 run rv4-3017-pg3). The
+/// DROP's own undo (ROLLBACK TO turso_pg_drop_objects, then RELEASE, each `let _ =`) ran with the
+/// timeout still armed, so it was stopped too: 57014 with the session 'T' in a transaction the
+/// client never opened, another session's write 55P03, and the client's next COMMIT committed
+/// d1's drop and not d2's (review HIGH 1, runs rv4-3017-tip and rv4-3017-tr, the same at
+/// 121844bd2). Written by the reviewer (`rv4_tests.rs`); it refuses to pass with no DROP stopped.
+#[test]
+fn a_timeout_during_a_multi_object_drop_drops_nothing() {
+    let dir = Scratch::new("dropstop");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.s.set_read_timeout(Some(Duration::from_secs(600))).unwrap();
+    let mut stopped = 0;
+    for t in [150, 200, 250, 300, 350, 400, 450] {
+        a.q("DROP TABLE IF EXISTS d1").ok("d1 gone");
+        a.q("DROP TABLE IF EXISTS d2").ok("d2 gone");
+        a.q("CREATE TABLE d1 (id int)").ok("d1");
+        for i in 0..3 {
+            a.q(&format!("CREATE INDEX d1_i{i} ON d1 (id)")).ok("index");
+        }
+        copy_in_pieces(&mut a, "COPY d1 FROM STDIN", &int_rows(200_000)).ok("load d1");
+        a.q("CREATE TABLE d2 (id int)").ok("d2");
+        a.q(&format!("SET statement_timeout = {t}")).ok("timeout");
+        let r = a.q("DROP TABLE d1, d2");
+        a.q("RESET statement_timeout").ok("reset");
+        let Some(e) = r.error.clone() else {
+            assert_eq!(r.status, b'I', "t={t}: the DROP's status");
+            continue;
+        };
+        stopped += 1;
+        assert_eq!(e.code, "57014", "t={t}: {e:?}");
+        assert_eq!(r.status, b'I', "t={t}: the session after a stopped DROP is idle");
+        a.q("COMMIT");
+        let mut b = server.connect();
+        assert_eq!(b.q("SELECT count(*) FROM d1").single("d1 after a stopped DROP"), "200000", "t={t}");
+        assert_eq!(b.q("SELECT count(*) FROM d2").single("d2 after a stopped DROP"), "0", "t={t}");
+    }
+    assert!(stopped > 0, "no DROP was stopped: the test did not reach its case");
+}
+
+/// Inside a block, a write the statement_timeout stopped after a SAVEPOINT is undone by ROLLBACK
+/// TO and the block commits its earlier work, as PostgreSQL 18.6 commits it for an ALTER TABLE ADD
+/// CONSTRAINT (review wire-rev-copystdin4 run rv4-3017-pg2, keep 1) and for a CREATE INDEX. At
+/// 3017001a2 the ALTER's COMMIT answered XX000 "cannot commit - an unfinished write statement
+/// was abandoned" and rolled the whole block back, its row before the savepoint with it (review
+/// MED 1, run rv4-3017-tip; FATAL 08006 at the ALTER at 121844bd2): a silent loss of work the
+/// client was told was done. The ALTER case is the reviewer's (`rv4_tests.rs`); the CREATE INDEX
+/// case asks whether the same holds for a statement the client sent itself.
+#[test]
+fn a_timeout_after_a_savepoint_keeps_the_blocks_earlier_work() {
+    let dir = Scratch::new("svptstop");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.s.set_read_timeout(Some(Duration::from_secs(600))).unwrap();
+    a.q("CREATE TABLE b (id int)").ok("b");
+    copy_in_pieces(&mut a, "COPY b FROM STDIN", &int_rows(200_000)).ok("load b");
+    a.q("CREATE TABLE keep (x int)").ok("keep");
+    for (n, stopped) in [
+        (1, "ALTER TABLE b ADD CONSTRAINT bk CHECK (id > 0)"),
+        (2, "CREATE INDEX bi ON b (id)"),
+    ] {
+        a.q("BEGIN").ok("begin");
+        a.q(&format!("INSERT INTO keep VALUES ({n})")).ok("keep row");
+        a.q("SAVEPOINT s").ok("savepoint");
+        a.q("SET statement_timeout = 50").ok("timeout");
+        let r = a.q(stopped);
+        assert_eq!(r.err(&format!("{stopped} under a 50 ms timeout")).code, "57014");
+        assert_eq!(r.status, b'E', "{stopped}");
+        a.q("ROLLBACK TO s").ok("rollback to");
+        a.q("RESET statement_timeout").ok("reset");
+        a.q("COMMIT").ok(&format!("COMMIT after ROLLBACK TO, {stopped}"));
+        assert_eq!(a.q("SELECT count(*) FROM keep").single("keep"), n.to_string(), "{stopped}");
+    }
+}
+
 /// COPY FROM a file with no file granted is 42501 before the table, its columns or its options are
 /// read, as PostgreSQL 18.6 refuses a role without pg_read_server_files first (recorded,
 /// copy-stdin-pg18.txt part 3: `nofiles`). Checked after the table, these were 42P01, 42703, 42601.
