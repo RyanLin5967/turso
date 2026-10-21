@@ -642,6 +642,40 @@ mod tests {
         }
     }
 
+    /// budgets-rev-nm-cb67 LOW-2 (its ADV-3): chunks left exactly half live, each retired with the tail
+    /// slack a store name can leave (up to 256 B: the next 255-byte name does not fit), are never
+    /// evacuated, so the held bytes per live byte reach 2 x CHUNK / (CHUNK - 256), not 2. Built: 64
+    /// chunks of 3,840 used bytes (one 255-byte name, one 126-byte, 27 of 127), then every chunk's
+    /// 255- and 126-byte names and 12 of its 127-byte ones removed (premises asserted: 64 chunks, none
+    /// evacuated, each exactly half live). The bound is the one the churn test claims.
+    #[test]
+    fn half_live_chunks_with_tail_slack_stay_within_the_bound() {
+        let named = |tag: String, len: usize| format!("{tag}{}", "x".repeat(len - tag.len()));
+        let mut m = NameMirror::default();
+        for c in 0..64 {
+            m.insert(&named(format!("{c}-big-"), 255), BranchId(c)).unwrap();
+            m.insert(&named(format!("{c}-mid-"), 126), BranchId(c)).unwrap();
+            for k in 0..27 {
+                m.insert(&named(format!("{c}-{k}-"), 127), BranchId(c)).unwrap();
+            }
+        }
+        for c in 0..64 {
+            assert_eq!(m.remove(&named(format!("{c}-big-"), 255)), Some(BranchId(c)));
+            assert_eq!(m.remove(&named(format!("{c}-mid-"), 126)), Some(BranchId(c)));
+            for k in 0..12 {
+                assert_eq!(m.remove(&named(format!("{c}-{k}-"), 127)), Some(BranchId(c)));
+            }
+        }
+        assert_eq!(m.evacuations, 0, "premise: no chunk was evacuated");
+        let held_chunks: Vec<usize> = (0..m.chunks.len()).filter(|&c| m.chunks[c].is_some()).collect();
+        assert_eq!(held_chunks.len(), 64, "premise: 64 chunks are held");
+        for &c in &held_chunks {
+            assert_eq!((m.used[c], m.live[c]), (3_840, 1_920), "premise: chunk {c} is exactly half live");
+        }
+        let (held, live) = m.arena_bytes();
+        assert!(held <= 2 * live + 2 * CHUNK, "the arena holds {held} B for {live} live B");
+    }
+
     #[test]
     fn a_wide_id_round_trips() {
         let mut m = NameMirror::default();
