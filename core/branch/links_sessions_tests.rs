@@ -144,6 +144,50 @@ fn a_store_whose_sessions_are_shorter_than_its_fill_still_upgrades_and_cuts_its_
     assert!(last < peak, "the log was never cut: {last} B at the end, {peak} B at its peak");
 }
 
+// ---- h1gap-rev-c MED-1: a fill thread that panics ----
+
+#[test]
+fn ls_fill_panics_child() {
+    if !in_child() {
+        return;
+    }
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("p.db");
+    older_store(&path, 300);
+    super::store::LINKS_FILL_PANICS.store(true, Ordering::Release);
+    let db = open(&path);
+    db.branch_wait_name_filter();
+    let (tx, rx) = std::sync::mpsc::channel();
+    {
+        let db = db.clone();
+        std::thread::spawn(move || {
+            let r = db.branch_compact_now().map_err(|e| e.to_string());
+            let _ = tx.send(r);
+        });
+    }
+    let got = rx.recv_timeout(std::time::Duration::from_secs(20));
+    let (filling, _, starts) = db.branches.links_fill_state_for_test();
+    println!("LS-PANIC returned={} filling={} starts={starts}", u64::from(got.is_ok()), u64::from(filling));
+    // The checkpoint thread may still be waiting: end the child here.
+    std::process::exit(0);
+}
+
+/// h1gap-rev-c MED-1: a fill thread that panics is an exit like any other: an explicit checkpoint
+/// returns (within 20 s) and the store no longer reads as filling. Premise: a fill was started.
+#[test]
+fn a_fill_thread_that_panics_does_not_hang_an_explicit_checkpoint() {
+    if in_child() {
+        return;
+    }
+    let text = child("ls_fill_panics_child", &[]);
+    let r = readings(&text, "LS-PANIC ");
+    assert_eq!(r.len(), 1, "premise: the child reported:\n{text}");
+    let (returned, filling, starts) = (r[0][0], r[0][1], r[0][2]);
+    assert!(starts >= 1, "premise: no fill was started:\n{text}");
+    assert_eq!(returned, 1, "an explicit checkpoint did not return within 20 s after the fill thread panicked (filling {filling})");
+    assert_eq!(filling, 0, "the store still reads as filling after its fill thread panicked");
+}
+
 // ---- h1gap-rev-c HIGH-1: the fill resumes from its cursor, below the hard limit ----
 
 #[test]

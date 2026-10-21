@@ -3742,6 +3742,11 @@ impl Drop for CutGate<'_> {
 /// count does not see) ran under the store mutex in a sharp store (red a722957c4). Mutant
 /// `l4_fill_wal_left` (test builds only): not truncated here.
 fn run_links_fill(shared: &StoreMutex, writer: &Mutex<Catalog>, group: &Group, made: &AtomicBool, stop: &AtomicBool) {
+    // Test builds (h1gap-rev-c MED-1): the fill thread panics at its start.
+    #[cfg(test)]
+    if LINKS_FILL_PANICS.load(Ordering::Acquire) {
+        panic!("test hook: the link fill thread panics");
+    }
     // l4-rev-h1 HIGH 2 and MED-3: the link columns and the cursor's table are made FIRST, in a
     // transaction of their own on the writer, before this thread takes the store mutex at all, and
     // recorded lock-free: past the hard limit the gate can then let a checkpoint go on, however long
@@ -3961,6 +3966,9 @@ pub(crate) static LINKS_FILL_HOLD_AT_ENTRY: AtomicBool = AtomicBool::new(false);
 pub(crate) static LINKS_FILL_COLUMNS_IN_BATCH: AtomicBool = AtomicBool::new(false);
 #[cfg(test)]
 pub(crate) static LINKS_FILL_ENTRY_HELD: AtomicU64 = AtomicU64::new(0);
+/// Test builds (h1gap-rev-c MED-1): while set, a fill thread panics at its start.
+#[cfg(test)]
+pub(crate) static LINKS_FILL_PANICS: AtomicBool = AtomicBool::new(false);
 /// Test builds (lead ruling LOW 4): while set, a fill thread waits before its column-only transaction;
 /// `LINKS_FILL_BEFORE_COLUMNS_HELD` counts the fills that reached that point;
 /// `LINKS_FILL_FIRST_MADE_COLUMNS`: the first of them committed its column-only transaction.
