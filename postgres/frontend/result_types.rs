@@ -2197,7 +2197,19 @@ impl Infer<'_> {
                         self.first_refusal.borrow_mut().get_or_insert_with(|| {
                             Some(SqlErrorMessage::classified(
                                 SqlErrorKind::UndefinedFunction,
-                                format!("function {name}(boolean) does not exist"),
+                                // Named as written, its schema included ('function
+                                // pg_catalog.max(boolean) does not exist', PG 18.6).
+                                format!(
+                                    "function {}(boolean) does not exist",
+                                    call.funcname
+                                        .iter()
+                                        .filter_map(|p| match &p.node {
+                                            Some(Node::String(s)) => Some(s.sval.as_str()),
+                                            _ => None,
+                                        })
+                                        .collect::<Vec<_>>()
+                                        .join(".")
+                                ),
                             ))
                         });
                         None
