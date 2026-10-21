@@ -1492,6 +1492,23 @@ impl Parsed {
         }
     }
 
+    /// Refuse a Bind whose parameter types are not the ones this statement already fixed, before
+    /// any value is read by them (as PostgreSQL's GetCachedPlan refuses at Bind); fixes nothing.
+    /// A value read by the re-inferred type was refused for that type's reasons first (a binary
+    /// int4 read as text held NUL bytes: 22021 where PostgreSQL answers 0A000).
+    fn check_fixed_params(&self, params: &[Type]) -> SqlResult<()> {
+        match self.params.get() {
+            Some(fixed) if fixed.as_slice() != params => {
+                let i = fixed.iter().zip(params).take_while(|(a, b)| a == b).count();
+                Err(error(
+                    SqlErrorKind::FeatureNotSupported,
+                    format!("cached plan must not change the type of parameter ${}", i + 1),
+                ))
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// Fix the statement's result columns, each its name and type, at the first call, and refuse
     /// any later call whose columns are others, in PostgreSQL's words: its equalRowTypes compares
     /// names with types, so the same types in another order under other names are another row
@@ -4609,6 +4626,7 @@ impl ExtendedQueryHandler for Session {
                 .described_parameters(&portal.statement.statement.sql, &portal.statement.parameter_types)
                 .map_err(PgWireError::UserError)?;
             if params.len() == portal.parameters.len() {
+                portal.statement.statement.check_fixed_params(&params).map_err(PgWireError::UserError)?;
                 decode_portal_parameters(&portal, &params)?;
                 // A custom plan coerces each assignment at Bind; PostgreSQL 18.6 plans a
                 // statement, the unnamed one included, custom for its first five plans, then
