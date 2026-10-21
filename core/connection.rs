@@ -5227,6 +5227,13 @@ impl Connection {
         self.progress_handler.set(ops, handler);
     }
 
+    /// The same, with a handler shared across connections (fastest-wire M4: a server arms every
+    /// connection it opens with one handler over its interrupts, and a branch switch opens one, so
+    /// the boxed form cost an allocation per switch).
+    pub fn set_progress_handler_shared(&self, ops: u64, handler: Option<crate::progress::SharedProgressHandler>) {
+        self.progress_handler.set(ops, handler.map(|h| Box::new(move || h()) as ProgressHandlerCallback));
+    }
+
     /// Returns true when the step-based progress handler requests interruption.
     pub fn should_interrupt_for_progress(&self, vm_steps: u64) -> bool {
         self.progress_handler.should_interrupt(vm_steps)

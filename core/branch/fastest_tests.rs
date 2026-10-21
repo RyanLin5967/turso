@@ -16871,3 +16871,34 @@ fn a_panic_in_the_close_tail_is_caught_inside_the_close() {
     );
     assert!(dropped.is_ok(), "CLAIM: a panic in the close's tail escaped the store's Drop");
 }
+
+/// fastest-wire M4 (a branch switch's allocations, server_lib a_branch_call_allocates...): a server
+/// installs one progress handler, over its shared interrupts, on every connection it opens, and a
+/// branch switch opens one, so the boxed form cost an allocation per switch. The claim: installing
+/// a handler shared across connections allocates nothing, on each of 8 connections, and the shared
+/// handler still interrupts (a VM step count on its interval consults it).
+#[test]
+fn a_shared_progress_handler_is_installed_with_no_allocation() {
+    let _g = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("progress-shared.db"), DatabaseOpts::new());
+    let conns: Vec<_> = (0..8).map(|_| db.connect().unwrap()).collect();
+    let calls = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let shared: crate::progress::SharedProgressHandler = {
+        let calls = calls.clone();
+        Arc::new(move || {
+            calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            false
+        })
+    };
+    let mut allocs = Vec::new();
+    for c in &conns {
+        let handler = Some(shared.clone());
+        let a0 = super::budget_probe::thread_allocs().0;
+        c.set_progress_handler_shared(100, handler);
+        allocs.push(super::budget_probe::thread_allocs().0 - a0);
+    }
+    assert!(!conns[3].should_interrupt_for_progress(100), "premise: the shared handler answered false");
+    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1, "premise: the installed handler was consulted on its interval");
+    assert!(allocs.iter().all(|&n| n == 0), "CLAIM: installing a shared progress handler allocated {allocs:?} times per connection");
+}

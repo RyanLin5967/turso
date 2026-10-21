@@ -93,6 +93,7 @@ mod vdbe;
 mod vtab;
 
 pub use function::Func;
+pub use progress::SharedProgressHandler;
 #[cfg(any(feature = "fuzz", feature = "bench"))]
 pub use function::MathFunc;
 /// The printf engine backing the SQL printf()/format() functions, also used

@@ -2,6 +2,9 @@ use crate::sync::{atomic::AtomicU64, RwLock};
 use std::sync::atomic::Ordering;
 
 pub(crate) type ProgressHandlerCallback = Box<dyn Fn() -> bool + Send + Sync>;
+/// A progress callback one frontend shares across every connection it opens
+/// (`Connection::set_progress_handler_shared`).
+pub type SharedProgressHandler = std::sync::Arc<dyn Fn() -> bool + Send + Sync>;
 
 /// Connection-scoped progress callback state.
 ///
