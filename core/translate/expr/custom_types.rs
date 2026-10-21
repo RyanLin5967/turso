@@ -4763,4 +4763,34 @@ mod tests {
         ]);
         assert!(bad.is_empty(), "CLAIM: a copy of domain arithmetic did not compare as numeric: {bad:#?}");
     }
+
+    /// Adopted verbatim from engine-rev-types-08caaec44 (artie 8319b0a45e,
+    /// frontier/fastest/reviews/REVIEW-engine-types-08caaec44.md and raw-engine-types-08caaec44/
+    /// zz_rev08c.rs.txt); its expected values are that review's PostgreSQL 18.6 recordings
+    /// (raw-engine-types-08caaec44/p*.pgout.txt), never ours.
+    /// MED 7: ALTER TABLE ... ALTER COLUMN v TO v dpos checks every existing row's value against the
+    /// domain's CHECK (PostgreSQL 18.6 refuses ALTER COLUMN v TYPE dpos 23514 over -1), and a retype
+    /// from INTEGER leaves the column readable.
+    #[test]
+    fn rev08c_alter_column_to_a_domain_checks_existing_rows() {
+        let conn = open();
+        for sql in [
+            "CREATE DOMAIN dpos AS numeric(8, 2) CHECK (VALUE > 0)",
+            "CREATE TABLE a1(id INTEGER PRIMARY KEY, v numeric(8, 2)) STRICT",
+            "INSERT INTO a1 VALUES (1, -1.00), (2, 2.00)",
+            "CREATE TABLE a3(id INTEGER PRIMARY KEY, v INTEGER) STRICT",
+            "INSERT INTO a3 VALUES (1, 2), (2, 3)",
+        ] {
+            conn.execute(sql).unwrap();
+        }
+        let mut bad = Vec::new();
+        if conn.execute("ALTER TABLE a1 ALTER COLUMN v TO v dpos").is_ok() {
+            bad.push("ALTER TABLE a1 ALTER COLUMN v TO v dpos over a row holding -1.00 succeeded; PostgreSQL 18.6 refuses 23514".to_string());
+        }
+        let altered = conn.execute("ALTER TABLE a3 ALTER COLUMN v TO v dpos");
+        if altered.is_ok() {
+            bad.extend(diverging_after(&conn, &[], &[("SELECT id, v FROM a3 ORDER BY id", "1,2.00;2,3.00")]));
+        }
+        assert!(bad.is_empty(), "CLAIM: ALTER COLUMN to a domain did not check or convert existing rows: {bad:#?}");
+    }
 }
