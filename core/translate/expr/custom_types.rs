@@ -3522,4 +3522,38 @@ mod tests {
         );
         assert!(bad.is_empty(), "CLAIM: an index on a numeric expression supplied the order of its texts: {bad:#?}");
     }
+
+    /// core-integrator (artie 26f59de787, frontier/fastest/integrate/raw-we-c88df3a3f/
+    /// cast-attr-ecetesla1/diag.txt; SILENT wrong order): with `du` a domain over text, a derived
+    /// compound's column of `CAST(10 AS du)` and `CAST(9 AS du)` ordered 9 before 10. The CAST
+    /// yields text ('10', '9'), but the derived column took the affinity of the type NAME, `du`,
+    /// which SQLite's name rules read as NUMERIC, so the values compared as numbers; mutant
+    /// derived_column_untyped answered the same, so it is the affinity, not the inherited type. A
+    /// CAST to a custom type has its base primitive's affinity. Expected: PostgreSQL 18.6's text
+    /// order for this exact SQL (UW run typesrev2bd-oracle9; artie raw
+    /// frontier/fastest/lanes/engine/raw/pg18-types-rev2bd-8.txt 3ac66c1c64), never ours. The direct compound
+    /// and CAST to text are the controls.
+    #[test]
+    fn a_derived_column_of_a_cast_to_a_text_domain_orders_as_text() {
+        let conn = open();
+        for sql in [
+            "CREATE DOMAIN du AS text",
+            "CREATE TABLE src(id INTEGER PRIMARY KEY, v INTEGER)",
+            "INSERT INTO src VALUES (1, 10), (2, 9)",
+        ] {
+            conn.execute(sql).unwrap();
+        }
+        let bad = diverging(
+            &conn,
+            &[
+                ("SELECT CAST(10 AS du) AS x UNION ALL SELECT CAST(9 AS du) AS x ORDER BY x", "10;9"),
+                ("SELECT x FROM (SELECT CAST(10 AS text) AS x UNION ALL SELECT CAST(9 AS text) AS x) s ORDER BY x", "10;9"),
+                ("SELECT x FROM (SELECT CAST(10 AS du) AS x UNION ALL SELECT CAST(9 AS du) AS x) s ORDER BY x", "10;9"),
+                ("SELECT x FROM (SELECT CAST(v AS du) AS x FROM src) s ORDER BY x", "10;9"),
+                ("SELECT x FROM (SELECT CAST(v AS du) AS x FROM src) s WHERE x < '9' ORDER BY x", "10"),
+            ],
+            "PostgreSQL 18",
+        );
+        assert!(bad.is_empty(), "CLAIM: a derived column of a CAST to a text domain did not order as text: {bad:#?}");
+    }
 }
