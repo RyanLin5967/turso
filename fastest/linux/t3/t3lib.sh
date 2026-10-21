@@ -393,6 +393,14 @@ T3_CLOCK_ADJUSTERS=${T3_CLOCK_ADJUSTERS:-"systemd-timesyncd chrony chronyd ntp n
 t3_clockdelta() { # CLOCK_REALTIME minus CLOCK_MONOTONIC, in seconds: the default sampler (T3_CLOCKDELTA overrides it)
   python3 -B -c 'import time; print(time.clock_gettime(time.CLOCK_REALTIME) - time.clock_gettime(time.CLOCK_MONOTONIC))'
 }
+# unit_running SC UNIT: any ActiveState but inactive or failed is running (t3cov-1b MED 1: a running Type=oneshot
+# service, which is every service an Ubuntu timer starts, answers "activating"; deactivating and reloading are running
+# too, and an unreadable state counts as running, so its stop and the check after it decide)
+unit_running() {
+  local st
+  st=$($1 is-active "$2" 2> /dev/null)
+  case $st in inactive|failed) return 1 ;; *) return 0 ;; esac
+}
 host_quiet() {
   local rec=$1 sc=${T3_SYSTEMCTL:-sudo -n systemctl} timers u svc bad="" d0 d1
   local clk=${T3_CLOCKDELTA:-t3_clockdelta}
@@ -400,20 +408,20 @@ host_quiet() {
   timers=$(${sc} list-timers --all --no-legend --plain) || { echo "REFUSED: host_quiet: systemctl list-timers failed"; return 1; }
   while read -r u svc; do
     [ -n "$u" ] || continue
-    if [ "$(${sc} is-active "$u" 2> /dev/null)" = active ]; then
+    if unit_running "${sc}" "$u"; then
       ${sc} stop "$u"; printf 'timer\t%s\n' "$u" >> "$rec"
     fi
-    if [ -n "$svc" ] && [ "$(${sc} is-active "$svc" 2> /dev/null)" = active ]; then
+    if [ -n "$svc" ] && unit_running "${sc}" "$svc"; then
       ${sc} stop "$svc"; printf 'service\t%s\n' "$svc" >> "$rec"
     fi
   done < <(printf '%s\n' "$timers" | awk '{ for (i = 1; i <= NF; i++) if ($i ~ /\.timer$/) { print $i, $(i + 1); break } }')
   for u in $T3_CLOCK_ADJUSTERS; do
-    if [ "$(${sc} is-active "$u" 2> /dev/null)" = active ]; then
+    if unit_running "${sc}" "$u"; then
       ${sc} stop "$u"; printf 'clock\t%s\n' "$u" >> "$rec"
     fi
   done
   while IFS=$'\t' read -r _ u; do
-    [ "$(${sc} is-active "$u" 2> /dev/null)" = active ] && bad="$bad $u"
+    unit_running "${sc}" "$u" && bad="$bad $u"
   done < "$rec"
   [ -z "$bad" ] || { echo "REFUSED: host_quiet: still active after stop:$bad"; return 1; }
   d0=$($clk) && sleep "${T3_QUIET_WATCH_S:-30}" && d1=$($clk) && [ -n "$d0" ] && [ -n "$d1" ] ||
