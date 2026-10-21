@@ -87,6 +87,11 @@ pub(crate) fn expr_value_type(
 /// Whether CAST(x AS `type_name`) yields the type's values: every type in its chain has no DECODE
 /// or decodes to `value` itself, so its ENCODE's result is what a read of a stored value gives.
 fn cast_yields_values(schema: &Schema, type_name: &str) -> bool {
+    // A CAST yields its type's VALUE, ENCODE then DECODE (engine-rev-types-08caaec44 HIGH 1); under
+    // mutant `cast_yields_encoding` it yields the ENCODE, as below decides.
+    if !crate::branch::store::fe_mutant("cast_yields_encoding") {
+        return true;
+    }
     let is_value = |e: &ast::Expr| matches!(e, ast::Expr::Id(n) | ast::Expr::Name(n) if n.as_str().eq_ignore_ascii_case("value"));
     // A BUILT-IN type whose DECODE is the identity on every value its ENCODE stores, though not
     // written as `value`: boolean's `CASE WHEN value THEN 1 ELSE 0 END` over boolean_to_int's 0

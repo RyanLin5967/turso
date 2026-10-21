@@ -600,6 +600,29 @@ pub fn translate_expr(
                             target_register,
                             resolver,
                         )?;
+                        // The CAST yields the domain's VALUE, its chain's DECODE of what it
+                        // stores, as PostgreSQL's CAST does (engine-rev-types-08caaec44 HIGH 1).
+                        if !crate::branch::store::fe_mutant("cast_yields_encoding") {
+                            let skip = program.allocate_label();
+                            program.emit_insn(Insn::IsNull {
+                                reg: target_register,
+                                target_pc: skip,
+                            });
+                            for td in resolved.chain.iter().rev() {
+                                if let Some(decode_expr) = td.decode() {
+                                    emit_type_expr(
+                                        program,
+                                        decode_expr,
+                                        target_register,
+                                        target_register,
+                                        &cast_col,
+                                        td,
+                                        resolver,
+                                    )?;
+                                }
+                            }
+                            program.preassign_label_to_next_insn(skip);
+                        }
                         return Ok(target_register);
                     }
 
@@ -620,9 +643,13 @@ pub fn translate_expr(
                         );
                         cast_col.ty_params = ty_params;
 
-                        // CAST to custom type applies only the encode function,
-                        // producing the stored representation.
-                        // e.g. CAST(42 AS cents) → 4200
+                        // CAST to a custom type yields the type's VALUE: its ENCODE (which
+                        // validates and applies the parameters: 0.001 under numeric(8, 2) is 0.00)
+                        // then its DECODE, as PostgreSQL's CAST yields 1.50 for CAST(1.5 AS
+                        // numeric(8, 2)) (engine-rev-types-08caaec44 HIGH 1: the encoded blob it
+                        // yielded lost numeric's sum, order and extremes through a derived
+                        // relation, and compared as a blob). Mutant `cast_yields_encoding` (test
+                        // builds only): the ENCODE alone, the stored form, as before.
                         if let Some(encode_expr) = type_def.encode() {
                             emit_type_expr(
                                 program,
@@ -633,6 +660,26 @@ pub fn translate_expr(
                                 type_def,
                                 resolver,
                             )?;
+                            if let Some(decode_expr) = type_def
+                                .decode()
+                                .filter(|_| !crate::branch::store::fe_mutant("cast_yields_encoding"))
+                            {
+                                let skip = program.allocate_label();
+                                program.emit_insn(Insn::IsNull {
+                                    reg: target_register,
+                                    target_pc: skip,
+                                });
+                                emit_type_expr(
+                                    program,
+                                    decode_expr,
+                                    target_register,
+                                    target_register,
+                                    &cast_col,
+                                    type_def,
+                                    resolver,
+                                )?;
+                                program.preassign_label_to_next_insn(skip);
+                            }
                         } else {
                             // A BASE-only type (no ENCODE, e.g. float4/float8) casts as its
                             // primitive base does (C32 MED: nothing was emitted, so the value kept
