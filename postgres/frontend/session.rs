@@ -4894,7 +4894,7 @@ fn folds_at_plan(parse: &turso_pg_parser::pg_query::ParseResult) -> bool {
 
 /// Whether a node of the tree is itself a stable or volatile computation: a call of one
 /// ([`calls_non_immutable`]), a cast through a stable input function (to date, timestamp,
-/// timestamptz, interval, regclass, ...: [`STABLE_INPUT`], so `'nosuch'::text::regclass` raises
+/// timestamptz, interval, regclass, ...: [`has_immutable_input`], so `'nosuch'::text::regclass` raises
 /// after RowDescription, wire-rev-5cdb70e58 LOW-1), or a SQL value function (CURRENT_TIMESTAMP,
 /// CURRENT_USER). BLIND SPOT: a stable operator (timestamptz + interval) is taken as immutable.
 fn not_immutable(n: &turso_pg_parser::pg_query::NodeRef) -> bool {
@@ -4907,22 +4907,13 @@ fn not_immutable(n: &turso_pg_parser::pg_query::NodeRef) -> bool {
                     Some(turso_pg_parser::pg_query::protobuf::node::Node::String(s)) => Some(s.sval.to_ascii_lowercase()),
                     _ => None,
                 })
-                .is_some_and(|name| STABLE_INPUT.binary_search(&name.as_str()).is_ok())
+                .is_some_and(|name| !has_immutable_input(&name))
         }),
         NodeRef::SqlvalueFunction(_) => true,
         _ => false,
     }
 }
 
-/// PostgreSQL 18.6's base and range types whose input function is stable or volatile (pg_type
-/// typinput's provolatile; recorded on iccad2, fresh initdb, 2026-10-19), sorted.
-const STABLE_INPUT: [&str; 32] = [
-    "aclitem", "date", "datemultirange", "daterange", "int4multirange", "int4range",
-    "int8multirange", "int8range", "interval", "money", "nummultirange", "numrange", "regclass",
-    "regcollation", "regconfig", "regdictionary", "regnamespace", "regoper", "regoperator",
-    "regproc", "regprocedure", "regrole", "regtype", "time", "timestamp", "timestamptz", "timetz",
-    "tsmultirange", "tsrange", "tstzmultirange", "tstzrange", "xml",
-];
 
 /// [`crate::StatementTypes::fold_probe`]: the immutable constant parts of a no-FROM SELECT's
 /// targets and WHERE, each a maximal subtree with no stable or volatile part and no column, as one
@@ -5072,32 +5063,11 @@ fn fold_probe(parse: &turso_pg_parser::pg_query::ParseResult) -> Option<String> 
     Node::SelectStmt(Box::new(probe)).deparse().ok()
 }
 
-/// PostgreSQL 18.6's functions that are stable or volatile in every overload (recorded,
-/// pg18-nonimmutable-functions.list): the planner folds immutable calls only, so a statement
-/// calling one raises its error at execution, after RowDescription (pg_database_size(99999::oid):
-/// recorded, pg18-wirefuzz-pg_database_size_of_null_or_an_unknown_oid_answers_as_postgresql_does
-/// .out #3, #4). BLIND SPOT: a name with immutable and other overloads (31 of them) is taken as
-/// folded.
-static NON_IMMUTABLE: std::sync::LazyLock<Vec<&'static str>> = std::sync::LazyLock::new(|| {
-    include_str!("pg18-nonimmutable-functions.list")
-        .lines()
-        .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .collect()
-});
+/// The immutability lists (PostgreSQL 18.6's), shared with the translator.
+pub(crate) use turso_pg_parser::volatility::{has_immutable_input, is_immutable_call};
 
-/// Whether the function named `name` (bare, lowercased) is immutable in PostgreSQL 18.6 as far as
-/// [`NON_IMMUTABLE`] tells (a name it does not list).
-pub(crate) fn is_immutable_call(name: &str) -> bool {
-    NON_IMMUTABLE.binary_search(&name).is_err()
-}
-
-/// Whether a cast to the type named `name` reads through an immutable input function
-/// ([`STABLE_INPUT`] does not list it).
-pub(crate) fn has_immutable_input(name: &str) -> bool {
-    STABLE_INPUT.binary_search(&name.to_ascii_lowercase().as_str()).is_err()
-}
-
-/// Whether `call` names a function [`NON_IMMUTABLE`] lists, bare or pg_catalog-qualified.
+/// Whether `call` names a function PostgreSQL 18.6 has only stable or volatile overloads of
+/// ([`is_immutable_call`]), bare or pg_catalog-qualified.
 fn calls_non_immutable(call: &turso_pg_parser::pg_query::protobuf::FuncCall) -> bool {
     use turso_pg_parser::pg_query::protobuf::node::Node;
     let names: Vec<&str> = call
@@ -5112,7 +5082,7 @@ fn calls_non_immutable(call: &turso_pg_parser::pg_query::protobuf::FuncCall) -> 
         [name] | ["pg_catalog", name] => name.to_ascii_lowercase(),
         _ => return false,
     };
-    NON_IMMUTABLE.binary_search(&name.as_str()).is_ok()
+    !is_immutable_call(&name)
 }
 
 pub(crate) fn is_delete_using(sql: &str, parse: &turso_pg_parser::pg_query::ParseResult) -> bool {

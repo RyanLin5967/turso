@@ -22,6 +22,117 @@ fn column_default(expr: ast::Expr) -> ast::ColumnConstraint {
     }))
 }
 
+/// `args` of a BoolExpr of kind `boolop`, with each nested BoolExpr of the same kind replaced by its
+/// own arguments, as simplify_and_arguments flattens them.
+fn flatten_bool_args<'a>(boolop: i32, args: &'a [pg_query::protobuf::Node], out: &mut Vec<&'a pg_query::protobuf::Node>) {
+    for arg in args {
+        match arg.node.as_ref() {
+            Some(pg_query::protobuf::node::Node::BoolExpr(b)) if b.boolop == boolop => flatten_bool_args(boolop, &b.args, out),
+            _ => out.push(arg),
+        }
+    }
+}
+
+/// The value of a boolean constant PostgreSQL folds before it simplifies AND and OR: a boolean
+/// literal, a cast of one to boolean, NOT of a constant, or a comparison of two integer literals.
+/// None for anything else (NULL included).
+fn constant_bool(node: &pg_query::protobuf::Node) -> Option<bool> {
+    use pg_query::protobuf::{a_const::Val, node::Node, BoolExprType};
+    match node.node.as_ref()? {
+        Node::AConst(c) => match &c.val {
+            Some(Val::Boolval(b)) if !c.isnull => Some(b.boolval),
+            _ => None,
+        },
+        Node::TypeCast(t) => {
+            let boolean = t.type_name.as_ref().is_some_and(|t| {
+                t.array_bounds.is_empty()
+                    && t.names.last().is_some_and(|n| matches!(&n.node, Some(Node::String(s)) if matches!(s.sval.as_str(), "bool" | "boolean")))
+            });
+            if boolean { constant_bool(t.arg.as_deref()?) } else { None }
+        }
+        Node::BoolExpr(b) if BoolExprType::try_from(b.boolop) == Ok(BoolExprType::NotExpr) => {
+            constant_bool(b.args.first()?).map(|v| !v)
+        }
+        Node::AExpr(e) if e.kind == pg_query::protobuf::AExprKind::AexprOp as i32 => {
+            let int = |n: Option<&pg_query::protobuf::Node>| match n?.node.as_ref()? {
+                Node::AConst(c) => match &c.val {
+                    Some(Val::Ival(i)) => Some(i64::from(i.ival)),
+                    _ => None,
+                },
+                _ => None,
+            };
+            let (a, b) = (int(e.lexpr.as_deref())?, int(e.rexpr.as_deref())?);
+            let op = e.name.iter().find_map(|n| match &n.node {
+                Some(Node::String(s)) => Some(s.sval.as_str()),
+                _ => None,
+            })?;
+            match op {
+                "=" => Some(a == b),
+                "<>" | "!=" => Some(a != b),
+                "<" => Some(a < b),
+                "<=" => Some(a <= b),
+                ">" => Some(a > b),
+                ">=" => Some(a >= b),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Whether `node` is a NULL literal.
+fn null_literal(node: &pg_query::protobuf::Node) -> bool {
+    matches!(node.node.as_ref(), Some(pg_query::protobuf::node::Node::AConst(c)) if c.isnull)
+}
+
+/// Whether PostgreSQL's planner folds `node` to a constant: constants, operators, casts through an
+/// immutable input function and calls of immutable functions over such, with no column, parameter,
+/// subquery or SQL value function (crate::volatility). BLIND SPOT: an operator is taken as
+/// immutable (timestamptz + interval is stable).
+fn foldable(node: &pg_query::protobuf::Node) -> bool {
+    use pg_query::protobuf::node::Node;
+    let all = |nodes: &[pg_query::protobuf::Node]| nodes.iter().all(foldable);
+    match node.node.as_ref() {
+        Some(Node::AConst(_)) => true,
+        Some(Node::TypeCast(t)) => {
+            t.type_name.as_ref().is_some_and(|t| {
+                t.names.last().is_some_and(|n| matches!(&n.node, Some(Node::String(s)) if crate::volatility::has_immutable_input(&s.sval)))
+            }) && t.arg.as_deref().is_some_and(foldable)
+        }
+        Some(Node::AExpr(e)) => e.lexpr.as_deref().is_none_or(foldable) && e.rexpr.as_deref().is_none_or(foldable),
+        Some(Node::List(l)) => all(&l.items),
+        Some(Node::BoolExpr(b)) => all(&b.args),
+        Some(Node::NullTest(t)) => t.arg.as_deref().is_some_and(foldable),
+        Some(Node::BooleanTest(t)) => t.arg.as_deref().is_some_and(foldable),
+        Some(Node::CoalesceExpr(c)) => all(&c.args),
+        Some(Node::MinMaxExpr(m)) => all(&m.args),
+        Some(Node::CaseExpr(c)) => {
+            c.arg.as_deref().is_none_or(foldable)
+                && c.args.iter().all(|w| match w.node.as_ref() {
+                    Some(Node::CaseWhen(w)) => w.expr.as_deref().is_some_and(foldable) && w.result.as_deref().is_some_and(foldable),
+                    _ => false,
+                })
+                && c.defresult.as_deref().is_none_or(foldable)
+        }
+        Some(Node::FuncCall(f)) => {
+            let names: Vec<&str> = f
+                .funcname
+                .iter()
+                .filter_map(|n| match &n.node {
+                    Some(Node::String(s)) => Some(s.sval.as_str()),
+                    _ => None,
+                })
+                .collect();
+            let immutable = match names.as_slice() {
+                [name] | ["pg_catalog", name] => crate::volatility::is_immutable_call(&name.to_ascii_lowercase()),
+                _ => false,
+            };
+            immutable && f.over.is_none() && !f.agg_star && f.agg_filter.is_none() && all(&f.args)
+        }
+        _ => false,
+    }
+}
+
 /// PostgreSQL's oidin (uint32in_subr): strtoul with base 0 (leading spaces, a sign, 0x hexadecimal,
 /// a leading 0 octal), trailing spaces allowed, and a value that is neither a uint32 nor a negative
 /// int32 refused; 22P02 for no digits or other text, 22003 past the range, each naming the input as
@@ -3541,25 +3652,52 @@ impl PostgreSQLTranslator {
             Some(pg_query::protobuf::node::Node::AConst(a_const)) => self.translate_const(a_const),
             Some(pg_query::protobuf::node::Node::AExpr(a_expr)) => self.translate_a_expr(a_expr),
             Some(pg_query::protobuf::node::Node::BoolExpr(bool_expr)) => {
-                // AND with a constant false argument is false, OR with a constant true one is
-                // true, as PostgreSQL's eval_const_expressions reduces them before anything runs:
-                // the engine hoists constant arguments and evaluates them first, so a later
-                // bad constant (encode('abc', 'nosuch') = '') was raised where PG answers
-                // (wire-rev-351702a43 MED-4). The fold probe still runs the constant parts before
-                // the deciding constant, as PG simplifies those.
-                use pg_query::protobuf::{a_const::Val, BoolExprType};
+                // AND and OR are simplified as PostgreSQL's simplify_and_arguments (and _or_)
+                // simplifies them before anything runs: the arguments, nested ANDs (ORs)
+                // flattened, are simplified left to right, and the first constant that decides
+                // (false for AND, true for OR) ends it, so nothing after it runs. An immutable
+                // constant argument before it is folded first and raises; one reading a column, a
+                // parameter or a stable or volatile function is dropped. The engine hoists
+                // constant arguments and evaluates them first, so a later bad constant was raised
+                // where PG answers (wire-rev-351702a43 MED-4); ef15b1c6b then decided on a literal
+                // alone and dropped everything, so an earlier bad constant was not raised and
+                // (1 = 0) did not decide (wire-rev-1de981755-rest MED-4).
+                use pg_query::protobuf::BoolExprType;
                 let deciding = match BoolExprType::try_from(bool_expr.boolop) {
                     Ok(BoolExprType::AndExpr) => Some(false),
                     Ok(BoolExprType::OrExpr) => Some(true),
                     _ => None,
                 };
                 if let Some(v) = deciding {
-                    let decided = bool_expr.args.iter().any(|a| {
-                        matches!(a.node.as_ref(), Some(pg_query::protobuf::node::Node::AConst(c))
-                            if matches!(&c.val, Some(Val::Boolval(b)) if b.boolval == v))
-                    });
-                    if decided {
-                        return Ok(ast::Expr::Literal(ast::Literal::Numeric(if v { "1" } else { "0" }.to_string())));
+                    let mut flat = Vec::new();
+                    flatten_bool_args(bool_expr.boolop, &bool_expr.args, &mut flat);
+                    if let Some(k) = flat.iter().position(|a| constant_bool(a) == Some(v)) {
+                        let kept: Vec<pg_query::protobuf::Node> = flat[..k]
+                            .iter()
+                            .filter(|a| constant_bool(a).is_none() && !null_literal(a) && foldable(a))
+                            .map(|a| (*a).clone())
+                            .collect();
+                        let decided = ast::Expr::Literal(ast::Literal::Numeric(if v { "1" } else { "0" }.to_string()));
+                        if kept.is_empty() {
+                            return Ok(decided);
+                        }
+                        let kept = match kept.as_slice() {
+                            [one] => self.translate_expr(one)?,
+                            _ => {
+                                let mut reduced = (**bool_expr).clone();
+                                reduced.args = kept;
+                                self.translate_bool_expr(&reduced)?
+                            }
+                        };
+                        // CASE WHEN kept THEN v ELSE v END: the kept constants are evaluated
+                        // (the engine factors a constant expression out of the loop, before any
+                        // row), and the engine does not drop them, as it drops the other side of
+                        // `x AND 0` in a WHERE.
+                        return Ok(ast::Expr::Case {
+                            base: None,
+                            when_then_pairs: vec![(Box::new(kept), Box::new(decided.clone()))],
+                            else_expr: Some(Box::new(decided)),
+                        });
                     }
                 }
                 self.translate_bool_expr(bool_expr)
