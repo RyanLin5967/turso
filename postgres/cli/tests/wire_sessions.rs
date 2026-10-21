@@ -16445,6 +16445,36 @@ fn a_decimal_past_15_digits_is_refused_on_every_path() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// wire-rev-7128c6f73 L4 (its PG 18.6 probe7 #3-#5, #10-#13): the engine has no interval type (PGDIV-INTERVAL-TEXT), so
+/// arithmetic with an interval operand or an interval result is refused 0A000 'interval arithmetic is not supported',
+/// never answered: now() + interval '1 day' > now() answered f (PG t), timestamptz - timestamptz answered '0', and
+/// interval '1 day' * 2 was refused with a type name PG never prints ('text * integer').
+#[test]
+fn interval_arithmetic_is_refused_not_answered() {
+    let dir = Scratch::new("interval-arith");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in ["CREATE TABLE tz(id int, ts timestamptz)", "INSERT INTO tz VALUES (1, '2026-10-20 10:00:00+00:00')"] {
+        a.q(sql).ok(sql);
+    }
+    let mut wrong = Vec::new();
+    for sql in [
+        "SELECT ts + interval '1 day' FROM tz",
+        "SELECT ts + '1 day'::interval FROM tz",
+        "SELECT ts - interval '1 hour' FROM tz",
+        "SELECT now() + interval '1 day' > now()",
+        "SELECT interval '1 day' * 2",
+        "SELECT '1 day'::interval + '1 hour'::interval",
+        "SELECT ts - '2026-01-01 00:00:00+00:00'::timestamptz FROM tz",
+    ] {
+        let r = a.q(sql);
+        if !r.error.as_ref().is_some_and(|e| e.code == "0A000" && e.message.ends_with("interval arithmetic is not supported")) {
+            wrong.push(format!("{sql}: rows {:?} error {:?}, refused 0A000 interval arithmetic is not supported", r.rows, r.error));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// wire-rev-351702a43 LOW-6 (its PG 18.6 probe3 #161): a CASE is typed by its results (an int4 constant and an int4
 /// function: 23); the walk never typed a CASE column, and the engine announced it text (25).
 #[test]
