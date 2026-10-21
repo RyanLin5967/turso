@@ -3926,13 +3926,22 @@ fn run_links_fill(shared: &StoreMutex, writer: &Mutex<Catalog>, group: &Group, m
         Err(e) => tracing::warn!("branch catalog link fill cursor not read: {e}"),
     }
     loop {
-        let cursor = {
+        // h1-rev-72bfb0127 LOW-3: whether a later spawn superseded this fill (its token is no longer the
+        // store's): such a fill carries on as the new one, sharing its cursor and writing cursors at its own
+        // stale generation.
+        let (cursor, superseded) = {
             let inner = shared.lock();
             match inner.cat.as_ref() {
-                Some(c) if c.filling => c.links_cursor,
+                Some(c) if c.filling => (c.links_cursor, !std::ptr::eq(&*c.links_fill_stop, stop)),
                 _ => return,
             }
         };
+        // Test builds: the batches started by a superseded fill.
+        #[cfg(test)]
+        if superseded {
+            LINKS_FILL_SUPERSEDED_BATCHES.fetch_add(1, Ordering::AcqRel);
+        }
+        let _ = superseded;
         let batch = {
             let mut w = writer.lock();
             #[cfg(test)]
@@ -4029,6 +4038,9 @@ fn run_links_fill(shared: &StoreMutex, writer: &Mutex<Catalog>, group: &Group, m
 /// only in a test's own child process.
 #[cfg(test)]
 pub(crate) static LINKS_FILL_PAUSE_MS: AtomicU64 = AtomicU64::new(0);
+/// Test builds (h1-rev-72bfb0127 LOW-3): fill batches started by a fill a later spawn superseded.
+#[cfg(test)]
+pub(crate) static LINKS_FILL_SUPERSEDED_BATCHES: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
 pub(crate) static LINKS_FILL_FAILS: AtomicBool = AtomicBool::new(false);
 /// Test builds (links H1 reopened): while set, a committed fill batch waits before it takes the store

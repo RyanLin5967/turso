@@ -219,6 +219,7 @@ fn ls_hard_whole_child() {
     db.branch_wait_name_filter();
     let trunk = db.connect().unwrap();
     let w0 = super::catalog::WHOLE_UPGRADE_BATCHES.load(Ordering::Acquire);
+    let sup0 = super::store::LINKS_FILL_SUPERSEDED_BATCHES.load(Ordering::Acquire);
     let mut k = 0;
     while !db.branches.past_hard_limit_for_test() && k < 20_000 {
         let _ = trunk.fork_branch().unwrap().into_id();
@@ -236,8 +237,32 @@ fn ls_hard_whole_child() {
     let fill_waits = super::store::thread_fill_waits() - fill_waits0;
     db.branch_checkpoint_wait();
     let whole = super::catalog::WHOLE_UPGRADE_BATCHES.load(Ordering::Acquire) - w0;
+    // The asserted readings, taken before the LOW-3 observation below.
+    let (meta, log) = (meta_version(&path), log_bytes(&path));
+    // h1-rev-72bfb0127 LOW-3 (observing here; asserted by its own test): fill threads started, and batches a
+    // superseded fill started, through the end of the run.
+    std::thread::sleep(std::time::Duration::from_millis(2_500));
+    let starts = db.branches.links_fill_state_for_test().2;
+    let superseded = super::store::LINKS_FILL_SUPERSEDED_BATCHES.load(Ordering::Acquire) - sup0;
     super::store::LINKS_FILL_PAUSE_MS.store(0, Ordering::Release);
-    println!("LS-WHOLE rows={n} past={} creates={k} whole_batches={whole} waits={waits} meta={} peak={peak} log={} fill_waits={fill_waits}", u64::from(past), meta_version(&path), log_bytes(&path));
+    println!("LS-WHOLE rows={n} past={} creates={k} whole_batches={whole} waits={waits} meta={meta} peak={peak} log={log} fill_waits={fill_waits} starts={starts} superseded={superseded}", u64::from(past));
+}
+
+/// h1-rev-72bfb0127 LOW-3: past the hard limit the gate stops the fill and a later checkpoint starts a new
+/// one; a fill superseded so (still in its batch or pause) starts no further batch, so two fills never run
+/// batches together, write cursors at a stale generation, or outlive the store unjoined. Read from the
+/// whole-catalog child at 1,000 rows. Premise: the fill was started more than once.
+#[test]
+fn past_the_hard_log_limit_a_superseded_fill_starts_no_batch() {
+    if in_child() {
+        return;
+    }
+    let text = child("ls_hard_whole_child", &[("FE_LS_ROWS", "1000")]);
+    let r = readings(&text, "LS-WHOLE ");
+    assert_eq!(r.len(), 1, "premise: the child reported:\n{text}");
+    let (starts, superseded) = (r[0][9], r[0][10]);
+    assert!(starts >= 2, "premise: the fill was started {starts} time(s), never superseded");
+    assert_eq!(superseded, 0, "a superseded fill started {superseded} batches (fill started {starts} times)");
 }
 
 /// h1gap-rev-c HIGH-2: past the hard log limit, with a slow fill, no checkpoint links the whole catalog
