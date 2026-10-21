@@ -4673,4 +4673,22 @@ mod tests {
         ]);
         assert!(bad.is_empty(), "CLAIM: a direct CAST to a text domain did not compare as text: {bad:#?}");
     }
+
+    /// Adopted verbatim from engine-rev-types-08caaec44 (artie 8319b0a45e,
+    /// frontier/fastest/reviews/REVIEW-engine-types-08caaec44.md and raw-engine-types-08caaec44/
+    /// zz_rev08c.rs.txt); its expected values are that review's PostgreSQL 18.6 recordings
+    /// (raw-engine-types-08caaec44/p*.pgout.txt), never ours.
+    /// MED: CAST to varchar(n), and to a domain over it, yields text: it orders and compares as text.
+    #[test]
+    fn rev08c_a_cast_to_varchar_orders_as_text() {
+        let conn = open();
+        let bad = diverging_after(&conn, &["CREATE DOMAIN dvc AS varchar(3)", "CREATE TABLE i(id INTEGER PRIMARY KEY, k INTEGER) STRICT", "INSERT INTO i VALUES (1, 1), (2, 10), (3, 2)"], &[
+            ("SELECT CAST(k * 5 AS text) AS x FROM i ORDER BY x", "10;5;50"),
+            ("SELECT CAST(k * 5 AS varchar(3)) AS x FROM i ORDER BY x", "10;5;50"),
+            ("SELECT x FROM (SELECT CAST(k * 5 AS varchar(3)) AS x FROM i) s ORDER BY x", "10;5;50"),
+            ("SELECT CAST(k * 5 AS dvc) AS x FROM i ORDER BY x", "10;5;50"),
+            ("SELECT count(*) FROM i WHERE CAST(k * 5 AS dvc) < '6'", "3"),
+        ]);
+        assert!(bad.is_empty(), "CLAIM: a CAST to varchar did not order as text: {bad:#?}");
+    }
 }
