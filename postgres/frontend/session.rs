@@ -1817,16 +1817,17 @@ fn prepare_statement_parsed(
     let options = {
         let state = pg_conn.session_state.lock();
         let mut path = state.search_path.clone();
-        // A path entry is looked up as written, as PostgreSQL looks a schema up: one that names no
-        // schema exactly (a quoted 'S1' beside a schema s1) is skipped here, never handed to the
-        // engine, whose resolver folds case (seen on integration base beb4d169f:
-        // the_positional_insert_lookup_takes_the_engines_order_and_spelling inserted into s1.v).
-        // A path all of whose entries were skipped stays a path (it names nothing), never None,
-        // which searches every schema.
+        // A path entry is looked up as written, as PostgreSQL looks a schema up: one that names a
+        // schema only by folding case (a quoted 'S1' beside a schema s1) names none, and is
+        // skipped here, never handed to the engine, whose resolver folds case (seen on integration
+        // base beb4d169f: the_positional_insert_lookup_takes_the_engines_order_and_spelling
+        // inserted into s1.v). Every other entry (public, $user, a schema's exact name, a missing
+        // one) goes to the engine as written. A path all of whose entries were skipped stays a
+        // path (it names nothing), never None, which searches every schema.
         let set = !path.is_empty();
         if set {
             let names = pg_conn.conn.attached_database_names();
-            path.retain(|e| e == "main" || names.iter().any(|n| n == e));
+            path.retain(|e| names.iter().any(|n| n == e) || !names.iter().any(|n| n.eq_ignore_ascii_case(e)));
         }
         PrepareOptions {
             unqualified_database_search_path: if set { Some(path) } else { None },
