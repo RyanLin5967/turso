@@ -4709,4 +4709,22 @@ mod tests {
         ]);
         assert!(bad.is_empty(), "CLAIM: a function of a numeric did not compare as numeric: {bad:#?}");
     }
+
+    /// Adopted verbatim from engine-rev-types-08caaec44 (artie 8319b0a45e,
+    /// frontier/fastest/reviews/REVIEW-engine-types-08caaec44.md and raw-engine-types-08caaec44/
+    /// zz_rev08c.rs.txt); its expected values are that review's PostgreSQL 18.6 recordings
+    /// (raw-engine-types-08caaec44/p*.pgout.txt), never ours.
+    /// MED: a CREATE TABLE AS copy of arithmetic over a domain over numeric compares and orders as
+    /// numeric (at da850ed1c it did, as SQLite's real; since 76fa781f8 it is numeric text in ANY).
+    #[test]
+    fn rev08c_a_copy_of_domain_arithmetic_compares_as_numeric() {
+        let conn = open();
+        let bad = diverging_after(&conn, &["CREATE DOMAIN dn AS numeric(8, 2)", "CREATE TABLE d(id INTEGER PRIMARY KEY, a dn) STRICT",
+            "INSERT INTO d VALUES (1, 10), (2, 9), (3, 1.5), (4, -2)", "CREATE TABLE c7 AS SELECT id, a + 0 AS a0 FROM d"], &[
+            ("SELECT count(*) FROM d WHERE a + 0 > 5", "2"),
+            ("SELECT count(*) FROM c7 WHERE a0 > 5", "2"),
+            ("SELECT id FROM c7 ORDER BY a0", "4;3;2;1"),
+        ]);
+        assert!(bad.is_empty(), "CLAIM: a copy of domain arithmetic did not compare as numeric: {bad:#?}");
+    }
 }
