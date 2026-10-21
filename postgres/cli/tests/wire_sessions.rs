@@ -17352,9 +17352,9 @@ fn a_qualified_name_names_its_schema_as_written() {
         ("CREATE TABLE q1.v(a int)", Err(("3F000", "schema \"q1\" does not exist"))),
     ] {
         let r = a.q(sql);
-        let agrees = match want {
+        let agrees = match &want {
             Ok(rows) => r.error.is_none() && r.rows == rows.iter().map(|v| vec![Some(v.to_string())]).collect::<Vec<_>>(),
-            Err((code, message)) => r.error.as_ref().is_some_and(|e| e.code == code && e.message == message),
+            Err((code, message)) => r.error.as_ref().is_some_and(|e| e.code == *code && e.message == *message),
         };
         if !agrees {
             wrong.push(format!("{sql}: PG {want:?}; got {:?} {:?}", r.rows, r.error));
