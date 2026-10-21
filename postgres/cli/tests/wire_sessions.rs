@@ -16674,6 +16674,122 @@ fn interval_arithmetic_is_refused_not_answered() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// wire-rev-1de981755-rest HIGH-2 and MED-8 (its PG 18.6 probe #154-#176 and probe2 #33-#46; the declared-parameter,
+/// time, ORDER BY, GROUP BY and DISTINCT forms recorded on iccad2 PG 18.6, interval_time_and_timestamp_values_are_
+/// never_computed_over_text.out): the engine stores an interval as its text and has no interval arithmetic
+/// (PGDIV-INTERVAL-TEXT), so arithmetic with an interval, time or timestamp operand wherever it comes from (a column, a
+/// declared parameter, now(), a comparison in the target list), and any comparison, ordering, grouping, DISTINCT or
+/// aggregate over an interval, is refused 0A000, or answered as PostgreSQL answers it; never answered over the text.
+/// ts + $1 interval answered '2027' typed float8, time - time 1 typed float8, interval '1 day' > interval '2 hours' f,
+/// ORDER BY and max over an interval ordered its text, and count(DISTINCT i) counted '1 day' and '24 hours' apart.
+#[test]
+fn interval_time_and_timestamp_values_are_never_computed_over_text() {
+    let dir = Scratch::new("interval-text");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in [
+        "CREATE TABLE it1(i interval, ts timestamp, ts2 timestamp)",
+        "INSERT INTO it1 VALUES ('1 day', '2026-01-01 00:00', '2026-01-03 00:00')",
+        "CREATE TABLE it3(i interval, ts timestamp, ts2 timestamp)",
+        "INSERT INTO it3 VALUES ('1 day', '2026-01-01 00:00', '2026-01-03 00:00'), ('2 hours', '2026-01-01', '2026-01-01 01:00'), \
+         ('30 minutes', '2026-01-01', '2026-01-01')",
+        "CREATE TABLE it(i interval, ts timestamp, ts2 timestamp, tm time)",
+        "INSERT INTO it VALUES ('1 day', '2026-01-01 00:00', '2026-01-03 00:00', '10:00'), ('24 hours', '2026-01-01', \
+         '2026-01-01 01:00', '09:30'), ('30 minutes', '2026-01-01', '2026-01-01', '23:00')",
+    ] {
+        a.q(sql).ok(sql);
+    }
+    // (statement, declared parameters (oid, value), PG 18.6's column types and rows, or its SQLSTATE)
+    type Want = Result<(Vec<u32>, Vec<Vec<&'static str>>), &'static str>;
+    let cases: Vec<(&str, Vec<(u32, &str)>, Want)> = vec![
+        ("SELECT interval '1 day' > interval '2 hours' AS a", vec![], Ok((vec![16], vec![vec!["t"]]))),
+        ("SELECT '1 day'::interval < '23 hours'::interval AS a", vec![], Ok((vec![16], vec![vec!["f"]]))),
+        ("SELECT now() + interval '1 day' > now() AS a", vec![], Ok((vec![16], vec![vec!["t"]]))),
+        ("SELECT i + interval '1 hour' AS a FROM it1", vec![], Ok((vec![1186], vec![vec!["1 day 01:00:00"]]))),
+        ("SELECT i * 2 AS a FROM it1", vec![], Ok((vec![1186], vec![vec!["2 days"]]))),
+        ("SELECT ts + i AS a FROM it1", vec![], Ok((vec![1114], vec![vec!["2026-01-02 00:00:00"]]))),
+        ("SELECT ts2 - ts AS a FROM it1", vec![], Ok((vec![1186], vec![vec!["2 days"]]))),
+        ("SELECT count(*) FROM it1 WHERE ts2 - ts > '1 day'", vec![], Ok((vec![20], vec![vec!["1"]]))),
+        ("SELECT count(*) FROM it1 WHERE ts2 - ts > interval '1 day'", vec![], Ok((vec![20], vec![vec!["1"]]))),
+        ("SELECT count(*) FROM it1 WHERE i > '2 hours'", vec![], Ok((vec![20], vec![vec!["1"]]))),
+        ("SELECT count(*) FROM it1 WHERE i > interval '2 hours'", vec![], Ok((vec![20], vec![vec!["1"]]))),
+        ("SELECT max(i) AS a, sum(i) AS b FROM it1", vec![], Ok((vec![1186, 1186], vec![vec!["1 day", "1 day"]]))),
+        ("SELECT -interval '1 day' AS a", vec![], Ok((vec![1186], vec![vec!["-1 days"]]))),
+        ("SELECT time '10:00' - time '09:00' AS a", vec![], Ok((vec![1186], vec![vec!["01:00:00"]]))),
+        ("SELECT ts2 - ts > interval '1 day' AS a FROM it1", vec![], Ok((vec![16], vec![vec!["t"]]))),
+        ("SELECT ts - '1 day'::interval AS a FROM it1", vec![], Ok((vec![1114], vec![vec!["2025-12-31 00:00:00"]]))),
+        ("SELECT now() + $1::interval > now() AS a", vec![(0, "1 day")], Ok((vec![16], vec![vec!["t"]]))),
+        ("SELECT now() + $1 > now() AS a", vec![(1186, "1 day")], Ok((vec![16], vec![vec!["t"]]))),
+        ("SELECT ts + $1 AS a FROM it1", vec![(1186, "1 day")], Ok((vec![1114], vec![vec!["2026-01-02 00:00:00"]]))),
+        ("SELECT $1 > interval '2 hours' AS a", vec![(1186, "1 day")], Ok((vec![16], vec![vec!["t"]]))),
+        ("SELECT $1::interval > '2 hours'::interval AS a", vec![(0, "1 day")], Ok((vec![16], vec![vec!["t"]]))),
+        (
+            "SELECT i, i < interval '3 hours' AS a FROM it3 ORDER BY ts2",
+            vec![],
+            Ok((vec![1186, 16], vec![vec!["00:30:00", "t"], vec!["02:00:00", "t"], vec!["1 day", "f"]])),
+        ),
+        ("SELECT i FROM it3 ORDER BY i", vec![], Ok((vec![1186], vec![vec!["00:30:00"], vec!["02:00:00"], vec!["1 day"]]))),
+        ("SELECT max(i) AS a, min(i) AS b FROM it3", vec![], Ok((vec![1186, 1186], vec![vec!["1 day", "00:30:00"]]))),
+        ("SELECT avg(i) AS a FROM it3", vec![], Ok((vec![1186], vec![vec!["08:50:00"]]))),
+        ("SELECT ts2 - ts AS d FROM it3 ORDER BY ts2", vec![], Ok((vec![1186], vec![vec!["00:00:00"], vec!["01:00:00"], vec!["2 days"]]))),
+        ("SELECT count(*) FROM it3 WHERE ts2 - ts > interval '1 hour'", vec![], Ok((vec![20], vec![vec!["1"]]))),
+        ("SELECT count(*) FROM it3 WHERE i BETWEEN interval '1 hour' AND interval '3 hours'", vec![], Ok((vec![20], vec![vec!["1"]]))),
+        (
+            "SELECT CASE WHEN ts2 - ts > interval '1 hour' THEN 'long' ELSE 'short' END AS a FROM it3 ORDER BY ts2",
+            vec![],
+            Ok((vec![25], vec![vec!["short"], vec!["short"], vec!["long"]])),
+        ),
+        (
+            "SELECT greatest(i, interval '5 hours') AS a FROM it3 ORDER BY ts2",
+            vec![],
+            Ok((vec![1186], vec![vec!["05:00:00"], vec!["05:00:00"], vec!["1 day"]])),
+        ),
+        ("SELECT (SELECT max(ts2 - ts) FROM it3) AS a", vec![], Ok((vec![1186], vec![vec!["2 days"]]))),
+        ("SELECT $1 > $2 AS a", vec![(1186, "1 day"), (1186, "2 hours")], Ok((vec![16], vec![vec!["t"]]))),
+        ("SELECT $1 = $2 AS a", vec![(1186, "1 day"), (1186, "24 hours")], Ok((vec![16], vec![vec!["t"]]))),
+        ("SELECT $1 + $2 AS a", vec![(1114, "2026-01-01 00:00"), (1186, "1 day")], Ok((vec![1114], vec![vec!["2026-01-02 00:00:00"]]))),
+        ("SELECT $1 * 2 AS a", vec![(1186, "1 day")], Ok((vec![1186], vec![vec!["2 days"]]))),
+        ("SELECT count(*) FROM it WHERE i = $1", vec![(1186, "24 hours")], Ok((vec![20], vec![vec!["2"]]))),
+        ("SELECT count(*) FROM it WHERE i = interval '1 day'", vec![], Ok((vec![20], vec![vec!["2"]]))),
+        ("SELECT count(DISTINCT i) FROM it", vec![], Ok((vec![20], vec![vec!["2"]]))),
+        ("SELECT i AS x FROM it ORDER BY x", vec![], Ok((vec![1186], vec![vec!["00:30:00"], vec!["1 day"], vec!["24:00:00"]]))),
+        ("SELECT i FROM it ORDER BY 1", vec![], Ok((vec![1186], vec![vec!["00:30:00"], vec!["1 day"], vec!["24:00:00"]]))),
+        ("SELECT i, count(*) FROM it GROUP BY i ORDER BY 2", vec![], Ok((vec![1186, 20], vec![vec!["00:30:00", "1"], vec!["1 day", "2"]]))),
+        ("SELECT DISTINCT i FROM it ORDER BY 1", vec![], Ok((vec![1186], vec![vec!["00:30:00"], vec!["1 day"]]))),
+        ("SELECT tm - time '09:00' AS a FROM it ORDER BY tm", vec![], Ok((vec![1186], vec![vec!["00:30:00"], vec!["01:00:00"], vec!["14:00:00"]]))),
+        ("SELECT tm + interval '1 hour' AS a FROM it ORDER BY tm", vec![], Ok((vec![1083], vec![vec!["10:30:00"], vec!["11:00:00"], vec!["00:00:00"]]))),
+        ("SELECT ts + 1 AS a FROM it", vec![], Err("42883")),
+        ("SELECT ts - ts2 AS a FROM it ORDER BY ts2", vec![], Ok((vec![1186], vec![vec!["00:00:00"], vec!["-01:00:00"], vec!["-2 days"]]))),
+        ("SELECT -ts AS a FROM it", vec![], Err("42883")),
+        ("SELECT date '2026-01-01' + time '10:00' AS a", vec![], Ok((vec![1114], vec![vec!["2026-01-01 10:00:00"]]))),
+        ("SELECT date '2026-01-01' + interval '1 day' AS a", vec![], Ok((vec![1114], vec![vec!["2026-01-02 00:00:00"]]))),
+        (
+            "SELECT ts, ts2 FROM it WHERE ts2 > ts + interval '1 hour'",
+            vec![],
+            Ok((vec![1114, 1114], vec![vec!["2026-01-01 00:00:00", "2026-01-03 00:00:00"]])),
+        ),
+        ("SELECT i FROM it WHERE i IN (interval '1 day')", vec![], Ok((vec![1186], vec![vec!["1 day"], vec!["24:00:00"]]))),
+    ];
+    let mut wrong = Vec::new();
+    for (sql, params, want) in &cases {
+        let declared: Vec<(u32, i16, &[u8])> = params.iter().map(|(oid, v)| (*oid, 0i16, v.as_bytes())).collect();
+        let r = if declared.is_empty() { a.q(sql) } else { a.xt(sql, &declared) };
+        let refused = r.error.as_ref().is_some_and(|e| e.code == "0A000");
+        let agrees = match want {
+            Ok((oids, rows)) => {
+                r.error.is_none()
+                    && r.oids.as_ref() == Some(oids)
+                    && r.rows == rows.iter().map(|row| row.iter().map(|v| Some(v.to_string())).collect::<Vec<_>>()).collect::<Vec<_>>()
+            }
+            Err(code) => r.error.as_ref().is_some_and(|e| e.code == *code),
+        };
+        if !(agrees || refused) {
+            wrong.push(format!("{sql} {params:?}: PG {want:?}; got oids {:?} rows {:?} error {:?}", r.oids, r.rows, r.error));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// wire-rev-351702a43 LOW-6 (its PG 18.6 probe3 #161): a CASE is typed by its results (an int4 constant and an int4
 /// function: 23); the walk never typed a CASE column, and the engine announced it text (25).
 #[test]
