@@ -16817,3 +16817,65 @@ fn a_failed_shutdown_wal_sync_fail_stops_a_store_with_an_undrained_release() {
         );
     }
 }
+
+/// fe-mutkill (survivor of the f4683e89d lib sweep): a PRAGMA wal_checkpoint that fails acts on a
+/// trunk sync its pager noted that has failed, before it answers its busy row (engine review 17
+/// HIGH 1, execute.rs `op_checkpoint`). The case: a D0 store with an undrained fork; a trunk
+/// commit's WAL sync is returned unfinished and fails at the IO's next step (FailWalSyncIo mode 3);
+/// the statement is dropped while it waits on that sync, so its rollback finds the sync noted and
+/// unfinished and leaves it noted; the IO steps, and the sync is now failed (premise: nothing acted
+/// on it yet, a fork from a fresh connection still succeeds). Another connection holds the write
+/// lock, so the trunk's PRAGMA wal_checkpoint(TRUNCATE) fails busy before it issues a sync of its
+/// own (premise: its busy row). After it, a fork from a fresh connection is refused. Both stores.
+/// Mutant `pragma_checkpoint_failure_cleared`.
+#[test]
+fn a_busy_pragma_checkpoint_acts_on_a_dropped_commits_failed_sync() {
+    use std::sync::atomic::Ordering as O;
+    let _s = serial();
+    for catalog in [false, true] {
+        let what = format!("catalog={catalog}");
+        let dir = tempfile::TempDir::new().unwrap();
+        let (db, armed) = open_failing_wal(&dir.path().join("dropped-sync.db"), opts(catalog, SyncClass::Off));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        trunk.execute("PRAGMA synchronous = FULL").unwrap();
+        trunk.execute("PRAGMA fullfsync = ON").unwrap();
+        trunk.execute("PRAGMA data_sync_retry = 1").unwrap();
+        let _b = trunk.fork_branch().unwrap().into_id();
+        assert!(
+            drained(&db) < db.branches.durable_for_test(SyncClass::Off),
+            "{what}: premise: the fork is written and not drained"
+        );
+        armed.store(3, O::Release);
+        {
+            let mut stmt = trunk.prepare("UPDATE t SET v = 'dropped' WHERE id = 7").unwrap();
+            loop {
+                match stmt.step() {
+                    Ok(crate::StepResult::IO) if armed.load(O::Acquire) == 0 => break,
+                    Ok(crate::StepResult::IO | crate::StepResult::Yield) => db.io.step().unwrap(),
+                    other => panic!("{what}: premise: the commit waits on its WAL sync, not {other:?}"),
+                }
+            }
+        }
+        // The held sync fails now, after its statement was dropped.
+        db.io.step().unwrap();
+        let _c = db
+            .connect()
+            .unwrap()
+            .fork_branch()
+            .unwrap_or_else(|e| panic!("{what}: premise: nothing acted on the failed sync before the PRAGMA: {e}"))
+            .into_id();
+        let other = db.connect().unwrap();
+        other.execute("BEGIN IMMEDIATE").unwrap();
+        let rows = trunk
+            .prepare("PRAGMA wal_checkpoint(TRUNCATE)")
+            .and_then(|mut s| s.run_collect_rows())
+            .unwrap_or_else(|e| panic!("{what}: premise: the PRAGMA answers rows: {e}"));
+        assert_eq!(rows[0][0].as_int(), Some(1), "{what}: premise: the PRAGMA answered busy=1 behind the other writer");
+        assert_fail_stopped(
+            db.connect().unwrap().fork_branch().map(|x| x.into_id()),
+            &format!("{what}: the next fork after a busy PRAGMA checkpoint over a failed noted sync"),
+        );
+        let _ = other.execute("ROLLBACK");
+    }
+}
