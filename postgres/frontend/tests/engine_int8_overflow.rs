@@ -61,7 +61,7 @@ fn an_int8_overflow_is_refused_under_the_postgresql_dialect_only() {
     .unwrap();
     let sc = sdb.connect().unwrap();
     let got = sc.prepare("SELECT typeof(9223372036854775807 + 1)").and_then(|mut s| s.run_collect_rows()).map(|r| r[0][0].to_string());
-    if got.as_deref() != Ok("real") {
+    if got.as_ref().ok().map(String::as_str) != Some("real") {
         wrong.push(format!("SQLite dialect control: typeof(9223372036854775807 + 1) is {got:?}, SQLite gives real"));
     }
     assert!(wrong.is_empty(), "CLAIM: an int8 overflow is refused under the PostgreSQL dialect only: {wrong:#?}");
