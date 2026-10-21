@@ -681,6 +681,40 @@ def self_test():
         ("uw4 E4: a process of ours that exited before the stop keeps its uid and login, its run unknown (?)",
          len(burn_owner) == 1 and burn_owner[0][2] == str(me_uid) and burn_owner[0][4] == "?"),
     ]
+    # LATE LOAD (found 2026-10-21 on eceubuntu4, raws linux-f6gate/linux-f6cal): the quiet baseline passed, then load
+    # that arrived later VOIDed a VALID-wanting live case, which read FAIL ("SUT burners only: want VALID, got VOID")
+    # where the host, not the sampler, was at fault. Such a case is N/A-on-busy-host only on evidence that cannot be
+    # this self-test's own: another uid, or a process of ours whose uwrun run is known and is not this self-test's run.
+    # Ours in this run, ours with run unknown (?), unrecorded or excluded is no evidence, so the child case's own child
+    # misclassified as foreign (mutant G1's shape) still FAILS. The red reaches late_busy and live_outcome through
+    # fallbacks with today's behaviour (no late evidence; a VOID is a FAIL)
+    lb_ = globals().get("late_busy", lambda path, exclude=(), own_run="-": [])
+    lo_ = globals().get("live_outcome", lambda out, want, burners, rec, mine, own_run="-": "FAIL")
+    java = [(7, "java", 90.0, "foreign", 2, 8)]
+    sut2 = [(41, "python3", 99.0, "sut", 0, 20), (42, "python3", 99.0, "sut", 0, 20)]
+    late_other = evid_file("late-other", sut2 + java, owners=[(7, other, "-", "-")])
+    late_mine = evid_file("late-mine", sut2 + java, owners=[(7, me_uid, me_user, "linux-this")])
+    synthetic_evid += [
+        ("late load: another uid's process at 90% for 8 s is late busy-host evidence",
+         lb_(evid_file("lb1", java, owners=[(7, other, "-", "-")]), exclude={40}, own_run="linux-this") != []),
+        ("late load: a process of ours in ANOTHER known run (uwq-w1) is late busy-host evidence",
+         lb_(evid_file("lb2", java, owners=[(7, me_uid, me_user, "uwq-w1")]), exclude={40}, own_run="linux-this") != []),
+        ("late load: a process of ours in THIS self-test's run is no evidence (it may be our own child)",
+         lb_(evid_file("lb3", java, owners=[(7, me_uid, me_user, "linux-this")]), exclude={40}, own_run="linux-this") == []),
+        ("late load: a process of ours whose run is unknown (?) is no evidence",
+         lb_(evid_file("lb4", java, owners=[(7, me_uid, me_user, "?")]), exclude={40}, own_run="linux-this") == []),
+        ("late load: a process with no #owner row is no evidence",
+         lb_(evid_file("lb5", java), exclude={40}, own_run="linux-this") == []),
+        ("late load: a process in the self-test's own tree (excluded) is no evidence",
+         lb_(evid_file("lb6", java, owners=[(7, other, "-", "-")]), exclude={7}, own_run="linux-this") == []),
+        ("late load: a VALID-wanting case VOIDed by another uid's late load is N/A, not FAIL",
+         lo_(decide(late_other)["verdict"], "VALID", two_sut, late_other, {40, 41, 42}, own_run="linux-this") == "N/A"),
+        ("late load: the same case VOIDed by a process of ours in this run stays a FAIL",
+         lo_(decide(late_mine)["verdict"], "VALID", two_sut, late_mine, {40, 41, 42}, own_run="linux-this") == "FAIL"),
+        ("late load: the case's VALID window with both burners seen is a PASS",
+         lo_(decide(evid_file("late-none", sut2))["verdict"], "VALID", two_sut, evid_file("late-none", sut2), {40, 41, 42},
+             own_run="linux-this") == "PASS"),
+    ]
     # linux-rev-uw5 L7: under root, pid 1 is our own uid, so the "another uid" case cannot run: N/A-on-root, not a pass
     if os.getuid() == 0:
         n_na += 1
