@@ -5471,7 +5471,11 @@ fn past_announced_integer(val: &Value, pg_type: &Type) -> Option<&'static str> {
                 Type::INT4 => (f64::from(i32::MIN), f64::from(i32::MAX)),
                 _ => (-9.223372036854775808e18, 9.223372036854775807e18),
             };
-            (!f.is_finite() || f < lo || f >= hi + if *pg_type == Type::INT8 { 0.0 } else { 1.0 }).then_some(name)
+            // Under int8 a REAL is the engine's overflow, and one rounding to exactly -2^63 is past
+            // the range too (wire-rev-1de981755-rest MED-7: -v - 2 over int8's maximum answered
+            // -9.223372036854776e+18).
+            let below = if *pg_type == Type::INT8 { f <= lo } else { f < lo };
+            (!f.is_finite() || below || f >= hi + if *pg_type == Type::INT8 { 0.0 } else { 1.0 }).then_some(name)
         }
         _ => None,
     }
