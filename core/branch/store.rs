@@ -3949,6 +3949,10 @@ fn run_links_fill(shared: &StoreMutex, writer: &Mutex<Catalog>, group: &Group, m
         Ok(_) => {}
         Err(e) => tracing::warn!("branch catalog link fill cursor not read: {e}"),
     }
+    // Test builds (the lead's fill-LIVENESS ruling, observing): the batches this spawn committed; a spawn that
+    // ends stopped (or superseded) with none is counted in `LINKS_FILL_EMPTY_SPAWNS`.
+    #[cfg(test)]
+    let mut committed = 0u64;
     loop {
         // h1-rev-72bfb0127 LOW-3: whether a later spawn superseded this fill (its token is no longer the
         // store's): such a fill carries on as the new one, sharing its cursor and writing cursors at its own
@@ -3957,13 +3961,28 @@ fn run_links_fill(shared: &StoreMutex, writer: &Mutex<Catalog>, group: &Group, m
             let inner = shared.lock();
             match inner.cat.as_ref() {
                 Some(c) if c.filling => (c.links_cursor, !std::ptr::eq(&*c.links_fill_stop, stop)),
-                _ => return,
+                _ => {
+                    #[cfg(test)]
+                    if committed == 0 {
+                        LINKS_FILL_EMPTY_SPAWNS.fetch_add(1, Ordering::AcqRel);
+                    }
+                    return;
+                }
             }
         };
         // The fix: a superseded fill ends here, before its next batch. Mutant `l4_fill_superseded_runs` (test
         // builds only): it carries on, as before.
         if superseded && !fe_mutant("l4_fill_superseded_runs") {
+            #[cfg(test)]
+            if committed == 0 {
+                LINKS_FILL_EMPTY_SPAWNS.fetch_add(1, Ordering::AcqRel);
+            }
             return;
+        }
+        // Mutant `l4_fill_starved` (test builds only; the liveness ruling's starving mutant): the fill loses
+        // 50 ms before each batch, as a thread the scheduler starves under foreground load.
+        if fe_mutant("l4_fill_starved") {
+            std::thread::sleep(Duration::from_millis(50));
         }
         // Test builds: the batches started by a superseded fill.
         #[cfg(test)]
@@ -3999,6 +4018,10 @@ fn run_links_fill(shared: &StoreMutex, writer: &Mutex<Catalog>, group: &Group, m
         };
         if batch.is_ok() {
             kill_point("ckpt.upgrade.batch");
+            #[cfg(test)]
+            {
+                committed += 1;
+            }
         }
         if matches!(batch, Ok(None)) && !fe_mutant("l4_fill_wal_left") {
             truncate_catalog_wal(&mut writer.lock(), group, None);
@@ -4082,6 +4105,10 @@ pub(crate) static LINKS_FILL_PAUSE_MS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static LINKS_FILL_COLUMN_TXNS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 #[cfg(test)]
 pub(crate) static LINKS_FILL_COLUMN_ERROR: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+/// Test builds (the lead's fill-LIVENESS ruling): fill spawns that ended stopped or superseded having committed
+/// no batch.
+#[cfg(test)]
+pub(crate) static LINKS_FILL_EMPTY_SPAWNS: AtomicU64 = AtomicU64::new(0);
 /// Test builds (h1-rev-72bfb0127 LOW-3): fill batches started by a fill a later spawn superseded.
 #[cfg(test)]
 pub(crate) static LINKS_FILL_SUPERSEDED_BATCHES: AtomicU64 = AtomicU64::new(0);

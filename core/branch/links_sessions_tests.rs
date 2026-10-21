@@ -34,7 +34,8 @@ fn meta_version(path: &std::path::Path) -> u32 {
     cat.meta().unwrap().map_or(0, |m| m.format)
 }
 
-/// `try_meta_version` polled for up to 30 s, 0 if it never reads (FLAGGED harness repair: amendment 28, the
+/// `try_meta_version` polled for up to 30 s; a catalog Busy throughout REFUSES, never reads as a value (lead
+/// ruling 19:31:16Z's condition) (FLAGGED harness repair: amendment 28, the
 /// 5-module batch on iccad13 at 995da809f, read "meta 0" from one Busy read while a checkpoint held the catalog).
 fn poll_meta_version(path: &std::path::Path) -> u32 {
     let t = std::time::Instant::now();
@@ -42,9 +43,7 @@ fn poll_meta_version(path: &std::path::Path) -> u32 {
         if let Some(m) = try_meta_version(path) {
             return m;
         }
-        if t.elapsed() > std::time::Duration::from_secs(30) {
-            return 0;
-        }
+        assert!(t.elapsed() < std::time::Duration::from_secs(30), "REFUSED: the catalog meta row of {} stayed unreadable (Busy) for 30 s", path.display());
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
 }
@@ -1122,13 +1121,9 @@ fn ls_nonflip_crash_child() {
     }
     // The meta row read Busy-tolerant (a checkpoint may hold the catalog: FLAGGED harness repair, measured at
     // 37917a0a6 on iccad6, "unwrap() on Err Busy" at meta_version).
-    let t = std::time::Instant::now();
-    let mut meta = try_meta_version(&path);
-    while meta.is_none() && t.elapsed() < std::time::Duration::from_secs(30) {
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        meta = try_meta_version(&path);
-    }
-    println!("LS-NFCUT past={} meta={} peak={peak} log={}", u64::from(db.branches.past_hard_limit_for_test()), meta.unwrap_or(0), log_present(&path));
+    // (Refusing on a 30 s Busy since the 19:31:16Z ruling's condition.)
+    let meta = poll_meta_version(&path);
+    println!("LS-NFCUT past={} meta={meta} peak={peak} log={}", u64::from(db.branches.past_hard_limit_for_test()), log_present(&path));
     std::process::exit(0);
 }
 
@@ -1207,9 +1202,7 @@ fn poll_cursor(path: &std::path::Path) -> Option<(u64, u64, u64, u64, u64)> {
         if let Some(c) = try_cursor(path) {
             return Some(c);
         }
-        if t.elapsed() > std::time::Duration::from_secs(30) {
-            return None;
-        }
+        assert!(t.elapsed() < std::time::Duration::from_secs(30), "REFUSED: the fill cursor of {} stayed unreadable (Busy, or no cursor) for 30 s", path.display());
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
 }
@@ -1456,6 +1449,152 @@ fn a_crash_after_a_non_flip_cut_then_a_real_older_builds_session_reopens_with_ev
     assert!(rows > 1_000, "premise: the rows are there ({rows})");
     assert_eq!(meta_version(&path), 21, "the store did not upgrade after the older build's session");
     assert_eq!(wrong, 0, "{wrong} of {rows} rows have wrong links after a real older build's session between a non-flip cut and the flip");
+}
+
+
+// ---- lead ruling 2026-10-21T17:58:38Z: a store closed while its checkpoint is held ----
+
+/// A 19 store past the hard limit whose checkpoints the fill gate holds (the fill held before its column-only
+/// transaction, so the columns are never recorded), closed so: the close must cut its log.
+#[test]
+fn ls_close_held_child() {
+    if !in_child() {
+        return;
+    }
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("c.db");
+    older_store(&path, 1_000);
+    super::journal::set_compact_threshold(4 << 10);
+    super::store::LINKS_FILL_HOLD_BEFORE_COLUMNS.store(true, Ordering::Release);
+    let held0 = super::store::CKPT_OUTCOMES[0].load(Ordering::Acquire);
+    let (past, peak, log_open) = {
+        let db = open(&path);
+        db.branch_wait_name_filter();
+        let trunk = db.connect().unwrap();
+        let mut k = 0;
+        while !(db.branches.past_hard_limit_for_test() && super::store::LINKS_FILL_BEFORE_COLUMNS_HELD.load(Ordering::Acquire) >= 1) && k < 20_000 {
+            let _ = trunk.fork_branch().unwrap().into_id();
+            k += 1;
+        }
+        let past = db.branches.past_hard_limit_for_test();
+        let peak = log_present(&path);
+        for _ in 0..50 {
+            let _ = trunk.fork_branch().unwrap().into_id();
+        }
+        let log_open = log_present(&path);
+        // The close (the store's Drop) stops the fill, then joins it: let the hold go once the close has begun.
+        let release = std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            super::store::LINKS_FILL_HOLD_BEFORE_COLUMNS.store(false, Ordering::Release);
+        });
+        drop(trunk);
+        drop(db);
+        release.join().unwrap();
+        (past, peak, log_open)
+    };
+    let held = super::store::CKPT_OUTCOMES[0].load(Ordering::Acquire) - held0;
+    let (log_closed, meta_closed) = (log_present(&path), meta_version(&path));
+    {
+        let db = open(&path);
+        db.branch_wait_name_filter();
+        db.branch_compact_now().unwrap();
+        db.branch_checkpoint_wait();
+    }
+    let (rows, wrong) = ls_wrong_links(&path).unwrap_or((0, 9999));
+    println!(
+        "LS-CLOSE past={} held={held} peak={peak} log_open={log_open} log_closed={log_closed} meta_closed={meta_closed} meta={} rows={rows} wrong={wrong}",
+        u64::from(past),
+        meta_version(&path)
+    );
+}
+
+/// Lead ruling 2026-10-21T17:58:38Z (the held checkpoint is deferral, not a stall), its condition: a store
+/// CLOSED while the fill gate holds its checkpoint past the hard limit cuts its log at the close (at its
+/// current 19, no flip), and reopens with every row's links right by the independent oracle once its fill is
+/// done. Premises: past the hard limit, checkpoints held by the gate, the log uncut while open. Mutant
+/// `l4_no_cut_at_close` (the close skips the held checkpoint) must fail it.
+#[test]
+fn a_store_closed_with_its_checkpoint_held_cuts_its_log_at_the_close() {
+    if in_child() {
+        return;
+    }
+    let text = child("ls_close_held_child", &[]);
+    let r = readings(&text, "LS-CLOSE ");
+    assert_eq!(r.len(), 1, "premise: the child reported:\n{text}");
+    let (past, held, peak, log_open, log_closed, meta_closed, meta, rows, wrong) = (r[0][0], r[0][1], r[0][2], r[0][3], r[0][4], r[0][5], r[0][6], r[0][7], r[0][8]);
+    println!("LS close-held: past {past} held {held} peak {peak} open {log_open} closed {log_closed} meta {meta_closed} -> {meta} rows {rows} wrong {wrong}");
+    assert_eq!(past, 1, "premise: the store never passed the hard limit");
+    assert!(held > 0, "premise: no checkpoint was held by the fill gate past the hard limit");
+    assert!(log_open >= peak, "premise: the log was cut while open ({log_open} B, peak {peak} B)");
+    assert!(log_closed < peak, "a store closed past the hard limit with its checkpoint held kept its uncut log ({log_closed} B, peak {peak} B)");
+    assert_eq!(meta_closed, 19, "the close flipped a store whose fill was not complete (meta {meta_closed})");
+    assert!(rows > 1_000, "premise: the rows are there ({rows})");
+    assert_eq!(meta, 21, "the reopened store did not upgrade");
+    assert_eq!(wrong, 0, "{wrong} of {rows} rows have wrong links after a close that cut a held checkpoint's log");
+}
+
+// ---- lead ruling 2026-10-21T18:01:45Z: the fill's liveness under sustained create load ----
+
+/// Sustained creates on a 19 store with its fill running unpaused: every cut and fill spawn counted.
+#[test]
+fn ls_fill_live_child() {
+    if !in_child() {
+        return;
+    }
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("l.db");
+    older_store(&path, 1_000);
+    super::journal::set_compact_threshold(4 << 10);
+    let (e0, b0) = (super::store::LINKS_FILL_EMPTY_SPAWNS.load(Ordering::Acquire), super::store::LINKS_FILL_HELD_BATCHES.load(Ordering::Acquire));
+    let db = open(&path);
+    db.branch_wait_name_filter();
+    let trunk = db.connect().unwrap();
+    let (mut cuts, mut last, mut grown, mut grown_creates) = (0u64, log_present(&path), 0u64, 0u64);
+    let mut creates = 0u64;
+    // Until the fill completes (cuts after it need no fill) or 3,000 creates.
+    while creates < 3_000 && !db.branches.links_fill_state_for_test().1 {
+        let _ = trunk.fork_branch().unwrap().into_id();
+        creates += 1;
+        let now = log_present(&path);
+        if now < last {
+            cuts += 1;
+        } else {
+            grown += now - last;
+            grown_creates += 1;
+        }
+        last = now;
+    }
+    let (_, prefilled, starts) = db.branches.links_fill_state_for_test();
+    let empty = super::store::LINKS_FILL_EMPTY_SPAWNS.load(Ordering::Acquire) - e0;
+    let batches = super::store::LINKS_FILL_HELD_BATCHES.load(Ordering::Acquire) - b0;
+    let per_create = grown / grown_creates.max(1);
+    println!("LS-LIVE creates={creates} cuts={cuts} starts={starts} empty={empty} batches={batches} prefilled={} per_create={per_create}", u64::from(prefilled));
+}
+
+/// Lead ruling 2026-10-21T18:01:45Z (fill LIVENESS): under sustained create load the fill makes bounded
+/// progress. The bound, from the fill's scheduling: past the hard limit the gate stops the fill after the batch
+/// it is in and lets a checkpoint cut; a later threshold starts it again from its cursor. So progress needs
+/// every spawn that is stopped to have committed a batch: one committed batch per hard-limit cycle at least,
+/// a cycle being at most (2 x the threshold) / (log bytes per create) creates, so at least one batch per K such
+/// creates. CLAIM: no spawn is stopped with no batch committed (`LINKS_FILL_EMPTY_SPAWNS` 0), and the batches
+/// are at least the cuts less one, over 3,000 creates. Premises: the log was cut at least twice (the load
+/// crossed the hard limit), the fill was started more than once. Mutant `l4_fill_starved` (500 ms lost before
+/// each batch) must fail it.
+#[test]
+fn under_sustained_creates_every_fill_spawn_commits_a_batch() {
+    if in_child() {
+        return;
+    }
+    let text = child("ls_fill_live_child", &[]);
+    let r = readings(&text, "LS-LIVE ");
+    assert_eq!(r.len(), 1, "premise: the child reported:\n{text}");
+    let (cuts, starts, empty, batches, prefilled, per_create) = (r[0][1], r[0][2], r[0][3], r[0][4], r[0][5], r[0][6]);
+    let k = (2 * (4u64 << 10)) / per_create.max(1);
+    println!("LS live: cuts {cuts} starts {starts} empty spawns {empty} batches {batches} prefilled {prefilled}; {per_create} B per create, K = {k} creates per cycle");
+    assert!(cuts >= 2, "premise: the log was cut {cuts} time(s) under {} creates", r[0][0]);
+    assert!(starts >= 2, "premise: the fill was started {starts} time(s)");
+    assert_eq!(empty, 0, "{empty} of {starts} fill spawns were stopped with no batch committed (cuts {cuts}, batches {batches})");
+    assert!(batches + 1 >= cuts, "the fill committed {batches} batches over {cuts} hard-limit cycles (K = {k} creates each)");
 }
 
 
