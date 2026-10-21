@@ -590,6 +590,39 @@ mod tests {
     }
 
     /// Ids above 2^32 survive the split into two halves.
+    /// h1gap-rev-b HIGH 1: under create/delete churn at a constant live count, the arena stays bounded.
+    /// Each cycle inserts a name and removes it at once, so every name of the filling chunk dies WHILE that
+    /// chunk is still filling (the premise, asserted: observed at least once with a chunk's live bytes 0
+    /// and its used bytes not). A release never evacuates the filling chunk, so once filling moves on such
+    /// a chunk was never freed: held bytes grew with the cycles. Bound: at most twice the live bytes plus
+    /// two chunks, checked every 1,000 cycles and at the end of 10^5; the 8 long-lived names resolve.
+    #[test]
+    fn churn_at_a_constant_live_count_keeps_the_arena_bounded() {
+        let mut m = NameMirror::default();
+        for k in 0..8u64 {
+            m.insert(&format!("kept-{k}"), BranchId(k)).unwrap();
+        }
+        let mut emptied_while_filling = false;
+        for i in 0..100_000u64 {
+            let name = format!("churn-{i}");
+            m.insert(&name, BranchId(1_000 + i)).unwrap();
+            assert_eq!(m.remove(&name), Some(BranchId(1_000 + i)));
+            if let Some(c) = m.filling {
+                emptied_while_filling |= m.live[c] == 0 && m.used[c] > 0;
+            }
+            if i % 1_000 == 999 {
+                let (held, live) = m.arena_bytes();
+                assert!(held <= 2 * live + 2 * CHUNK, "cycle {i}: the arena holds {held} B for {live} live B");
+            }
+        }
+        assert!(emptied_while_filling, "premise: the filling chunk never emptied while filling");
+        let (held, live) = m.arena_bytes();
+        assert!(held <= 2 * live + 2 * CHUNK, "after 10^5 cycles the arena holds {held} B for {live} live B");
+        for k in 0..8u64 {
+            assert_eq!(m.get(&format!("kept-{k}")), Some(BranchId(k)), "kept-{k} lost");
+        }
+    }
+
     #[test]
     fn a_wide_id_round_trips() {
         let mut m = NameMirror::default();
