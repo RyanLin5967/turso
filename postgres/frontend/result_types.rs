@@ -647,6 +647,9 @@ pub enum AssignTarget {
     BpChar(u32),
     /// numeric(p, s): past p - s integer digits once rounded to s, 22003.
     Numeric(u32, i32),
+    /// varchar(n)[]: each element past n characters, unless the excess is spaces, 22001
+    /// (wire-rev-cfdebc06d LOW-7).
+    VarCharArray(u32),
 }
 
 #[derive(Debug, Clone, Default)]
@@ -2572,9 +2575,7 @@ fn declared_target(schema: &Schema, relname: &str, column: &str) -> Option<Assig
 /// bpchar(n) (CHAR(n), catalog.rs's BPCHAR_TYPE_SQL) or the engine's numeric(p, s), each with
 /// integer-literal parameters; None for any other column.
 fn assign_target(col: &Column) -> Option<AssignTarget> {
-    if col.array_dimensions() > 0 {
-        return None;
-    }
+    let array = col.array_dimensions() > 0;
     let int = |e: &turso_parser::ast::Expr| -> Option<i64> {
         use turso_parser::ast::{Expr, Literal, UnaryOperator};
         match e {
@@ -2589,6 +2590,8 @@ fn assign_target(col: &Column) -> Option<AssignTarget> {
     let params: Vec<i64> = col.ty_params.iter().map(|p| int(p)).collect::<Option<_>>()?;
     let ty = col.ty_str.to_ascii_lowercase();
     match (ty.as_str(), params.as_slice()) {
+        ("varchar", [n]) if array => u32::try_from(*n).ok().map(AssignTarget::VarCharArray),
+        _ if array => None,
         ("varchar", [n]) => u32::try_from(*n).ok().map(AssignTarget::VarChar),
         ("bpchar", [n]) => u32::try_from(*n).ok().map(AssignTarget::BpChar),
         ("numeric", [p, s]) => Some(AssignTarget::Numeric(u32::try_from(*p).ok()?, i32::try_from(*s).ok()?)),

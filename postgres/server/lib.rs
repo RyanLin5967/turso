@@ -5751,12 +5751,19 @@ fn check_assignments(
                 }
             }
         };
-        let refusal = match target {
-            AssignTarget::VarChar(len) => text
-                .char_indices()
+        let too_long = |text: &str, len: u32| {
+            text.char_indices()
                 .nth(len as usize)
-                .filter(|(cut, _)| !text[*cut..].chars().all(|c| c == ' '))
-                .map(|_| (SqlErrorKind::StringDataRightTruncation, format!("value too long for type character varying({len})"))),
+                .is_some_and(|(cut, _)| !text[cut..].chars().all(|c| c == ' '))
+        };
+        let refusal = match target {
+            AssignTarget::VarChar(len) => too_long(text, len)
+                .then(|| (SqlErrorKind::StringDataRightTruncation, format!("value too long for type character varying({len})"))),
+            // Each element, as PG's array coercion casts each one; text this does not read as an
+            // array literal is left to Execute.
+            AssignTarget::VarCharArray(len) => array_text_elements(text)
+                .is_some_and(|elements| elements.iter().flatten().any(|e| too_long(e, len)))
+                .then(|| (SqlErrorKind::StringDataRightTruncation, format!("value too long for type character varying({len})"))),
             AssignTarget::BpChar(len) => (text.trim_end_matches(' ').chars().count() > len as usize)
                 .then(|| (SqlErrorKind::StringDataRightTruncation, format!("value too long for type character({len})"))),
             AssignTarget::Numeric(precision, scale) => numeric_overflows(&text, precision, scale)
@@ -5767,6 +5774,61 @@ fn check_assignments(
         }
     }
     Ok(())
+}
+
+/// The elements of a PostgreSQL array literal (`{a,"b c",NULL,{d}}`), nested arrays flattened, a
+/// NULL element None; None for text this does not read: a dimension decoration (`[1:2]={...}`), an
+/// unbalanced brace or quote, or anything outside the braces.
+fn array_text_elements(text: &str) -> Option<Vec<Option<String>>> {
+    let t = text.trim();
+    if !t.starts_with('{') {
+        return None;
+    }
+    let mut out = Vec::new();
+    let mut chars = t.chars().peekable();
+    let mut depth = 0usize;
+    let mut done = false;
+    while let Some(c) = chars.next() {
+        if done {
+            if !c.is_whitespace() {
+                return None;
+            }
+            continue;
+        }
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth = depth.checked_sub(1)?;
+                done = depth == 0;
+            }
+            ',' => {}
+            c if c.is_whitespace() => {}
+            '"' => {
+                let mut e = String::new();
+                loop {
+                    match chars.next()? {
+                        '\\' => e.push(chars.next()?),
+                        '"' => break,
+                        c => e.push(c),
+                    }
+                }
+                out.push(Some(e));
+            }
+            c => {
+                let mut e = String::from(c);
+                while let Some(&n) = chars.peek() {
+                    if matches!(n, ',' | '}' | '{' | '"') {
+                        break;
+                    }
+                    e.push(n);
+                    chars.next();
+                }
+                let e = e.trim_end().to_string();
+                out.push(if e.eq_ignore_ascii_case("null") { None } else { Some(e) });
+            }
+        }
+    }
+    (done && depth == 0).then_some(out)
 }
 
 /// Whether decimal `text` overflows numeric(`precision`, `scale`): more than precision - scale
