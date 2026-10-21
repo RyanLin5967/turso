@@ -11605,8 +11605,11 @@ pub fn op_function(
                         }
                     };
 
+                    // Parsed as ALTER COLUMN's own definition is (`parse_alter`): a PRIMARY KEY or
+                    // UNIQUE was judged by the translation (fastest-wire 1529a6674), and re-parsing it
+                    // with ADD COLUMN's refusal undid that.
                     let column_def =
-                        Parser::new(column_def.as_bytes()).parse_column_definition(true)?;
+                        Parser::new(column_def.as_bytes()).parse_column_definition(false)?;
 
                     let _rename_to = normalize_ident(column_def.col_name.as_str());
 
