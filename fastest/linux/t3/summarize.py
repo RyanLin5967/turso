@@ -237,6 +237,27 @@ def timed_verdict_ok(v, dry):
     return v == ("ok-smoke" if str(dry) == "1" else "ok")
 
 
+def ours_warmup_problems(j, live):
+    """t3cov-1a MED 1: ours' own warm-up, judged per run as the competitors' is: its live record (warmup-live.json) tied
+    to its summary's warmup (gates/driver_contract.py tie: one claim per op plus the stop's, the same stop, cap and
+    rule), and the warm-up's start after the last client was ready (t0_after_ready_ns, an int >= 0). A missing or
+    unreadable record is a refusal."""
+    saved = list(sys.path)
+    try:
+        sys.path[:0] = [GATES]
+        import driver_contract  # noqa: E402
+    except ImportError as e:
+        return [f"{e.name} cannot be imported: ours' warm-up cannot be judged"]
+    finally:
+        sys.path[:] = saved
+    bad = list(driver_contract.tie(j, live))
+    w = j.get("warmup") if isinstance(j, dict) else None
+    rd = w.get("t0_after_ready_ns") if isinstance(w, dict) else None
+    if type(rd) is not int or rd < 0:
+        bad.append(f"warmup.t0_after_ready_ns {rd!r}: the warm-up's start must follow the last client's ready")
+    return bad
+
+
 def run_parity(d, system, adapter_rc=None):
     """What a measured run itself recorded of its warm-up rule and measured op total (ours: result/summary.json; a
     competitor: every timed run under result/cells/*/timed/summary.json, the only latency files)."""
@@ -248,7 +269,12 @@ def run_parity(d, system, adapter_rc=None):
         exc, exc_bad, exc_absent = exception_deltas(j)
         j = j if isinstance(j, dict) else {}  # a non-object summary.json is refused above, never read as one
         cpu, win, sw = ours_sweeper(d, adapter_rc)
+        try:
+            live = json.load(open(os.path.join(d, "result", "warmup-live.json")))
+        except (OSError, ValueError):
+            live = None
         return {"warmup_rules": [j.get("warmup_rule")], "ops_measured": [j.get("ops_total")],
+                "warmup_contract_problems": ours_warmup_problems(j, live),
                 "exception_counter_deltas": exc, "exception_counter_problems": exc_bad,
                 "exception_counters_absent": exc_absent,
                 "ops_total_asked": j.get("ops_total_asked"), "sweeper_cpu_s": [cpu], "sweeper_windows": [win],
@@ -470,10 +496,14 @@ def conformance_problems(out):
     return bad
 
 
-# an out-of-space failure, as the kernel, libc, fio, strace and btrfs print it: the errno's text, its name, btrfs's
-# errno=-28, and btrfs's allocation failures. Case-sensitive: a record that only names the condition (enospc_count=0)
-# is not one
-ENOSPC_RE = re.compile(r"No space left on device|\bENOSPC\b|errno=-28\b|BTRFS[^\n]*(?:unable to allocate|failed to allocate|allocation failed)")
+# an out-of-space failure, as the kernel, libc, Go, fio, strace, SQLite and btrfs print it: the errno's text in any case
+# (Go's is lower case: t3cov-2 MED 1, Dolt and Doltgres are Go servers whose timed runs are not traced), its name as a
+# whole word, SQLite's SQLITE_FULL text, btrfs's errno=-28 and "error -28" (a transaction abort: t3cov-2 LOW 3), and
+# btrfs's allocation failures. A record that only names the condition (enospc_count=0) is not one: ENOSPC must stand as
+# a word, and "_" is a word character. Blind spot, stated: this is a list of known texts; a tool that reports running
+# out of space in other words is not seen here (EROFS after btrfs forces read-only included)
+ENOSPC_RE = re.compile(r"no space left on device|\bENOSPC\b|database or disk is full|errno=-28\b|\berror -28\b"
+                       r"|BTRFS[^\n]*(?:unable to allocate|failed to allocate|allocation failed)", re.IGNORECASE)
 
 
 def enospc_problems(out, fs, limit=5):
@@ -485,6 +515,8 @@ def enospc_problems(out, fs, limit=5):
     for d, _dirs, files in os.walk(root):
         for fn in sorted(files):
             p = os.path.join(d, fn)
+            if not os.path.isfile(p):  # a FIFO or socket left behind (trace.sh's $out.slp after a kill) would block
+                continue               # open() for ever (t3cov-2 LOW 5); it holds no record
             try:
                 f = gzip.open(p, "rt", errors="replace") if fn.endswith(".gz") else open(p, errors="replace")
                 with f:
@@ -673,6 +705,9 @@ def summarize(out, sha, dry, manifest):
                 parity.append(f"{fs}/{cell}: ops_total_asked {r.get('ops_total_asked')!r}, planned {want!r}")
             for x in r.get("expected_missing") or []:
                 parity.append(f"{fs}/{cell}: {x}")
+            for x in r.get("warmup_contract_problems") or []:  # t3cov-1a MED 1
+                warm.append(f"{fs}/{cell}: ours' warm-up: {x}")
+                parity.append(warm[-1])
             # the engine's branch exception counters (routing ruling 05:16:51Z): recorded for every run of ours; a
             # missing or unreadable record refuses, a nonzero delta in any (credited) window labels the cell uncredited
             for x in r.get("exception_counter_problems") or []:
@@ -726,6 +761,17 @@ def summarize(out, sha, dry, manifest):
     # the lead's DATA_GIB ruling: any ENOSPC or btrfs allocation failure in any step of a block refuses it
     for fs in fslist:
         failed_blocks += [f"{fs}: ENOSPC refuses the block (DATA_GIB ruling): {x}" for x in enospc_problems(out, fs)]
+        # the btrfs half of that guard reads only the block's kernel log (t3cov-2 MED 3): a block refuses unless t3run
+        # wrote one from a reader that succeeded (its first line "#kernel-log source=journalctl" or "source=dmesg")
+        kl = os.path.join(out, f"fs-{fs}", "kernel-log.txt")
+        try:
+            head = open(kl, errors="replace").readline().strip()
+        except OSError:
+            head = None
+        if head not in ("#kernel-log source=journalctl", "#kernel-log source=dmesg"):
+            failed_blocks.append(f"{fs}: no readable kernel log (kernel-log.txt "
+                                 + ("missing" if head is None else f"begins {head[:80]!r}") + "): the ENOSPC guard's "
+                                 "btrfs half cannot be read, so the block is refused")
     if not fslist:
         failed_blocks.append("fslist.txt missing or empty: no block was planned")
     mode = {}

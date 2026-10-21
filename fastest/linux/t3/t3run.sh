@@ -865,8 +865,14 @@ for FS_NOW in $FSLIST; do
   rc=$?
   # the kernel's log over the block, so a btrfs allocation failure or an ENOSPC the kernel reports is in the package
   # (summarize's enospc_problems refuses the block on one: the lead's DATA_GIB ruling)
-  sudo -n journalctl -k -o short-iso --no-pager --since "@$BLOCK_T0" > "$OUT/fs-$FS_NOW/kernel-log.txt" 2>&1 ||
-    sudo -n dmesg > "$OUT/fs-$FS_NOW/kernel-log.txt" 2>&1
+  # t3cov-2 MED 3: its first line names the reader that succeeded ("#kernel-log source=journalctl" or "source=dmesg"),
+  # and "source=none" when neither did, which refuses the block here and in summarize (never a silent empty log)
+  kl="$OUT/fs-$FS_NOW/kernel-log.txt"
+  if sudo -n journalctl -k -o short-iso --no-pager --since "@$BLOCK_T0" > "$kl.body" 2>&1; then klsrc=journalctl
+  elif sudo -n dmesg > "$kl.body" 2>&1; then klsrc=dmesg
+  else klsrc=none; fi
+  { echo "#kernel-log source=$klsrc"; cat "$kl.body"; } > "$kl" && rm -f "$kl.body" || klsrc=none
+  [ "$klsrc" != none ] || { echo "t3run: block fs-$FS_NOW: no kernel log could be read (sudo -n journalctl and dmesg both failed): the block is refused"; rc=1; }
   # the root's share of the run's disk (DECISIONS 18f492601b: run 14's root image grew 4.3 GiB over one block, which
   # the data filesystem's space.txt cannot see): the root filesystem and this run's out dir at each block's end, so a
   # package states its own disk cost beside the host trace vm_dryblock keeps
