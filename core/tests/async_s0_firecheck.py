@@ -117,7 +117,7 @@ def build(features):
     sys.exit("REFUSED: no async_s0 executable in cargo's output")
 
 
-BUILD = re.compile(r"^AD-T5 BUILD features=\[([^\]]*)\] cfg=\[([^\]]*)\]")
+BUILD = re.compile(r"AD-T5 BUILD features=\[([^\]]*)\] cfg=\[([^\]]*)\]")
 
 
 def check_build(binary, fire_check):
@@ -128,7 +128,10 @@ def check_build(binary, fire_check):
     env.pop("FE_MUTANT", None)
     proc = subprocess.run([binary, "ad_t5_build_flags", "--exact", "--nocapture", "--test-threads=1"],
                           env=env, capture_output=True, text=True)
-    found = [BUILD.match(l) for l in proc.stdout.splitlines()]
+    # Searched, not matched at the line's start: with --nocapture the harness prints
+    # "test ad_t5_build_flags ... " before the test's own first line, on the same line
+    # (rev2bd-l24fix-ic10: 0 BUILD lines found by a match at the start).
+    found = [BUILD.search(l) for l in proc.stdout.splitlines()]
     found = [m for m in found if m]
     if len(found) != 1:
         sys.exit(f"REFUSED: {binary} printed {len(found)} AD-T5 BUILD lines, not one")
