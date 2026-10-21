@@ -282,7 +282,12 @@ fn test_alter_table_add_column_keeps_implicit_foreign_key_reference_on_reopen() 
         let sql: Vec<(String,)> = conn.exec_rows("SELECT sql FROM sqlite_schema WHERE name = 't'");
         assert_eq!(
             sql,
-            vec![("CREATE TABLE t (x, s, FOREIGN KEY (x) REFERENCES u)".to_string(),)]
+            // FLAGGED SPEC CHANGE (lead ruling, LEAD-RULINGS.md, 2026-10-21): ADD COLUMN edits the
+            // stored text in place (b80fa60c8, engine-rev-qaf-fix HIGH 2-4), as SQLite does: SQLite
+            // 3.26.0 and 3.53.1 store `CREATE TABLE t(x REFERENCES u, s)` (artie 2b80f217aa). The
+            // old expectation was to_sql's regenerated form, which lifted the inline REFERENCES to a
+            // table constraint. The after-reopen assertions below are unchanged.
+            vec![("CREATE TABLE t (x REFERENCES u, s)".to_string(),)]
         );
 
         conn.close().unwrap();
