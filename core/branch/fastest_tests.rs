@@ -16708,10 +16708,15 @@ fn a_fuzzy_checkpoint_leaves_a_small_catalog_wal_untruncated() {
 /// fe-mutkill (survivor of the f4683e89d lib sweep): LEAP L3's cohort gather holds for at most
 /// `GroupState::gather_bound`, a tenth of the p50 flight, not the fixed 50 us it held before
 /// (`COHORT_GATHER_FIXED`, which expired before nearly every cohort was back). Every syncing flight
-/// is held 100 ms in the air (`journal::FLIGHT_SYNC_DELAY_US`), so the bound is at least 10 ms;
+/// is held 500 ms in the air (`journal::FLIGHT_SYNC_DELAY_US`), so the bound is at least 50 ms;
 /// with a cohort of 8 owed and the creator alone, the next create's leader gathers and its hold
-/// expires at the bound: it is held at least 5 ms (a lower bound, which load only lengthens).
+/// expires at the bound: it is held at least 25 ms (a lower bound, which load only lengthens).
 /// Mutant `cohort_gather_fixed`.
+///
+/// FLAGGED TEST EDIT (own test, 2a8a50439, never ruled; strengthens, no claim changed): at 100 ms
+/// and a 5 ms threshold the mutant's 50 us hold read 1.10 ms on a loaded ecetesla1 (raw
+/// mutkill-a-ecetesla1 cgf-mut), a 4.5x margin against a false survival; the delay is raised five
+/// times so a descheduled mutant needs 25 ms, not 5, to pass.
 #[test]
 fn a_cohort_gather_holds_for_its_flight_derived_bound() {
     struct Delay;
@@ -16722,7 +16727,7 @@ fn a_cohort_gather_holds_for_its_flight_derived_bound() {
     }
     let _s = serial();
     let _delay = Delay;
-    super::journal::FLIGHT_SYNC_DELAY_US.store(100_000, std::sync::atomic::Ordering::Release);
+    super::journal::FLIGHT_SYNC_DELAY_US.store(500_000, std::sync::atomic::Ordering::Release);
     let dir = tempfile::TempDir::new().unwrap();
     let db = open_at(&dir.path().join("gather-bound.db"), opts(false, SyncClass::Fsync));
     let trunk = db.connect().unwrap();
@@ -16738,8 +16743,8 @@ fn a_cohort_gather_holds_for_its_flight_derived_bound() {
     assert_eq!(g1[1] - g0[1], 1, "premise: the gather expired at its bound (the cohort never came back)");
     let held = std::time::Duration::from_nanos(ns1[0] - ns0[0]);
     assert!(
-        held >= std::time::Duration::from_millis(5),
-        "CLAIM: the gather held {held:?}, under half the bound a 100 ms flight sets (at least 10 ms)"
+        held >= std::time::Duration::from_millis(25),
+        "CLAIM: the gather held {held:?}, under half the bound a 500 ms flight sets (at least 50 ms)"
     );
 }
 
