@@ -1,9 +1,12 @@
 //! engine-2bdcd32c6 MED 4: HIGH F's refusal (`BranchStore::async_refusal`) refused every build
 //! without the lib's cfg(test), so AD-T5's fire-check binary (`--features turso_core/fe-mutants`,
 //! PREREG-v1 amendment 2) could make no async create: every async_s0 arm was VOID at its warm-up
-//! and the strict arm at N = 2 never ran. In that build an async create is accepted. This file is
-//! empty without the feature; the production half, refused, is async_refusal.rs, unchanged.
-#![cfg(feature = "fe-mutants")]
+//! and the strict arm at N = 2 never ran. In that build, which also sets
+//! `RUSTFLAGS="--cfg fe_ad_t5_firecheck"` (async_s0_firecheck.py; never a cargo feature, which
+//! `--all-features` would turn on: lead ruling, artie DECISIONS 66b4671687), an async create is
+//! accepted. This file is empty without both; the production half, refused, is async_refusal.rs,
+//! unchanged.
+#![cfg(all(feature = "fe-mutants", fe_ad_t5_firecheck))]
 
 use std::sync::Arc;
 use turso_core::branch::async_api::fe_mutants_compiled;

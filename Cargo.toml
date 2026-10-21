@@ -228,7 +228,7 @@ codegen-units = 16        # Less cross-unit inlining
 inherits = "release-official"
 
 [workspace.lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)', 'cfg(shuttle)', 'cfg(antithesis)', 'cfg(nightly)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)', 'cfg(shuttle)', 'cfg(antithesis)', 'cfg(nightly)', 'cfg(fe_ad_t5_firecheck)'] }
 # For now allow this for the allocator api migration
 unstable_name_collisions = "allow"
 

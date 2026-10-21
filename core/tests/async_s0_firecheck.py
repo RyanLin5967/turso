@@ -2,7 +2,8 @@
 """AD-T5's fire-check driver (PREREG-v1 amendment 2), Linux: correctness evidence only (T1 is c1btrace's).
 
 Builds async_s0 twice from the checked-out sha (the reading binary, and the fire-check binary with
-`--features turso_core/fe-mutants`) and prints both sha256s. It runs the reading binary once, and
+`--features turso_core/fe-mutants` and RUSTFLAGS="--cfg fe_ad_t5_firecheck", which lifts HIGH F's refusal of
+async creates in that build alone) and prints both sha256s. It runs the reading binary once, and
 the fire-check binary unmutated and once per registered mutant, each under
 `strace -f -y -e trace=...`. It counts, per arm and run, the creating thread's file writes under the
 trace root and its flushes, between that thread's own WINDOW OPEN and WINDOW CLOSE markers (written
@@ -72,11 +73,20 @@ SOURCE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "async_s0.rs")
 RUNS = None
 
 
+# The compiler flag that lifts HIGH F's refusal of async creates, set for the fire-check binary's
+# build alone (engine-2bdcd32c6 MED 4; lead ruling, artie DECISIONS 66b4671687: a cargo feature
+# would be turned on by --all-features). The reading binary is built without it, and refuses.
+FIRECHECK_CFG = "--cfg fe_ad_t5_firecheck"
+
+
 def build(features):
     cmd = ["cargo", "test", "--release", "-p", "turso_core", "--test", "async_s0", "--no-run", "--message-format=json"]
+    env = dict(os.environ)
+    env.pop("RUSTFLAGS", None)
     if features:
         cmd += ["--features", features]
-    out = subprocess.run(cmd, check=True, capture_output=True, text=True).stdout
+        env["RUSTFLAGS"] = FIRECHECK_CFG
+    out = subprocess.run(cmd, check=True, capture_output=True, text=True, env=env).stdout
     for line in out.splitlines():
         try:
             m = json.loads(line)
