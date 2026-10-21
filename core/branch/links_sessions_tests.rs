@@ -244,6 +244,16 @@ fn ls_hard_whole_child() {
     }
     let waits = super::store::thread_waits() - waits0;
     let fill_waits = super::store::thread_fill_waits() - fill_waits0;
+    // FLAGGED harness repair (amendments 22-24, iccad13: CKPT_OUTCOMES 200,98,0,..., the fill's column-only
+    // transaction made once, unfailed, after the 200 creates): until that O(1) transaction is recorded the gate
+    // holds every checkpoint (the columns must exist before a fuzzy flight, which may not change the schema), and
+    // a held checkpoint starts only at a later operation. So operations go on, one per 50 ms, until the log is cut
+    // (30 s at most; the fill, 1 s per 64 rows, is far from done, and "meta 19" below still fails a flip).
+    let t = std::time::Instant::now();
+    while log_present(&path) >= peak && t.elapsed() < std::time::Duration::from_secs(30) {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let _ = trunk.fork_branch().unwrap().into_id();
+    }
     db.branch_checkpoint_wait();
     let whole = super::catalog::WHOLE_UPGRADE_BATCHES.load(Ordering::Acquire) - w0;
     // The asserted readings, taken before the LOW-3 observation below.
@@ -1066,10 +1076,13 @@ fn ls_nonflip_crash_child() {
     for _ in 0..200 {
         let _ = trunk.fork_branch().unwrap().into_id();
     }
-    // The checkpoints the creates started, installed (a fuzzy one waited for; the fill is not joined).
+    // The checkpoints the creates started, installed (a fuzzy one waited for; the fill is not joined). FLAGGED
+    // harness repair (as in ls_hard_whole_child, amendments 22-24 on iccad13): operations go on while it waits, one
+    // per 50 ms, since a checkpoint the gate held until the fill's column-only transaction starts at a later one.
     let t = std::time::Instant::now();
     while log_present(&path) >= peak && t.elapsed() < std::time::Duration::from_secs(30) {
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let _ = trunk.fork_branch().unwrap().into_id();
     }
     // The meta row read Busy-tolerant (a checkpoint may hold the catalog: FLAGGED harness repair, measured at
     // 37917a0a6 on iccad6, "unwrap() on Err Busy" at meta_version).
