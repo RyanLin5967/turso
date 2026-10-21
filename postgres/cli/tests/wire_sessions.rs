@@ -16102,6 +16102,42 @@ fn a_bound_exponent_or_infinity_overflows_numeric_at_bind() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// wire-rev-351702a43 MED-1 and LOW-4 (its PG 18.6 probe3 #183-#190): a three-part name naming another database is
+/// 0A000 'cross-database references are not implemented' in DROP, COMMENT ON and ALTER ... RENAME too. The RENAME
+/// renamed THIS database's table silently, COMMENT ON was accepted, and DROP answered XX000 'no such database'.
+#[test]
+fn a_three_part_name_in_rename_drop_and_comment_must_name_this_database() {
+    let dir = Scratch::new("xdb-ddl");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in ["CREATE TABLE n(id int)", "INSERT INTO n VALUES (1)", "CREATE VIEW vm AS SELECT id FROM n", "CREATE INDEX ix ON n(id)"] {
+        a.q(sql).ok(sql);
+    }
+    let mut wrong = Vec::new();
+    for (sql, name) in [
+        ("ALTER TABLE otherdb.public.n RENAME TO n2", "otherdb.public.n"),
+        ("COMMENT ON TABLE otherdb.public.n IS 'x'", "otherdb.public.n"),
+        ("DROP TABLE otherdb.public.n", "otherdb.public.n"),
+        ("DROP VIEW otherdb.public.vm", "otherdb.public.vm"),
+        ("DROP INDEX otherdb.public.ix", "otherdb.public.ix"),
+    ] {
+        let r = a.q(sql);
+        let message = format!("cross-database references are not implemented: \"{name}\"");
+        if !r.error.as_ref().is_some_and(|e| e.code == "0A000" && e.message.ends_with(&message)) {
+            wrong.push(format!("{sql}: tags {:?} error {:?}, PostgreSQL 0A000 {message}", r.tags, r.error));
+        }
+    }
+    let r = a.q("SELECT count(*) FROM n");
+    if r.rows != vec![vec![Some("1".to_string())]] {
+        wrong.push(format!("n after the refusals: {:?} {:?}, PostgreSQL 1", r.rows, r.error));
+    }
+    let r = a.q("SELECT count(*) FROM vm");
+    if r.error.is_some() {
+        wrong.push(format!("vm after the refusals: {:?}", r.error));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// wire-rev-351702a43 MED-5 (its PG 18.6 probe3 #148, #157): an explicit cast to varchar(n) cuts its value to n characters
 /// (PG's explicit-cast length coercion), so $1::varchar(10) bound 'abcdefghijkl' is stored 'abcdefghij' in a varchar(20)
 /// column; the translator dropped the length and stored the whole text.
