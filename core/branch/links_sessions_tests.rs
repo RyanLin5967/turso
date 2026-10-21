@@ -242,8 +242,6 @@ fn ls_hard_whole_child() {
     for _ in 0..200 {
         let _ = trunk.fork_branch().unwrap().into_id();
     }
-    let waits = super::store::thread_waits() - waits0;
-    let fill_waits = super::store::thread_fill_waits() - fill_waits0;
     // FLAGGED harness repair (amendments 22-24, iccad13: CKPT_OUTCOMES 200,98,0,..., the fill's column-only
     // transaction made once, unfailed, after the 200 creates): until that O(1) transaction is recorded the gate
     // holds every checkpoint (the columns must exist before a fuzzy flight, which may not change the schema), and
@@ -254,6 +252,10 @@ fn ls_hard_whole_child() {
         std::thread::sleep(std::time::Duration::from_millis(50));
         let _ = trunk.fork_branch().unwrap().into_id();
     }
+    // The waits counted over every operation past the hard limit, these included (the cut may start among them:
+    // amendment 25 on iccad8, where the mutant l4_nonflip_fill_untagged's waits all fell here and went uncounted).
+    let waits = super::store::thread_waits() - waits0;
+    let fill_waits = super::store::thread_fill_waits() - fill_waits0;
     db.branch_checkpoint_wait();
     let whole = super::catalog::WHOLE_UPGRADE_BATCHES.load(Ordering::Acquire) - w0;
     // The asserted readings, taken before the LOW-3 observation below.
