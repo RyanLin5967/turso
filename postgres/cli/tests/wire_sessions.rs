@@ -16356,6 +16356,72 @@ fn a_bound_nan_is_refused_never_stored_as_null() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// wire-rev-1de981755-numeric HIGH-2, HIGH-4, HIGH-5, HIGH-6 (its PG 18.6 probe8 #22-#29, #48-#58): the literal
+/// refusal's own holes. A hex literal past int8 has fewer than 16 decimal digits, so the pre-filter skipped it
+/// (0xFFFFFFFFFFFFFFFF answered 1.8446744073709552e+19); a '-' after a keyword operand was read as a sign, so 2^63
+/// passed as int8's least; 1e400 and 1e-400 hold one digit yet are no double (Infinity, 0). Each is refused 0A000.
+/// And a bound integer-shaped numeric was decoded through f64: '9007199254740993' was stored ...992; it is the
+/// integer.
+#[test]
+fn the_long_numeric_refusal_has_no_spelling_holes() {
+    let dir = Scratch::new("numeric-holes");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in ["CREATE TABLE pz(id int, n numeric(30,0), b bigint)", "INSERT INTO pz VALUES (1, 1, 1)"] {
+        a.q(sql).ok(sql);
+    }
+    let mut wrong = Vec::new();
+    for sql in [
+        "SELECT 0xFFFFFFFFFFFFFFFF",
+        "SELECT 0x_7FFF_FFFF_FFFF_FFFF_F",
+        "INSERT INTO pz (id, n) VALUES (10, 0xFFFFFFFFFFFFFFFF)",
+        "SELECT b::bigint -9223372036854775808 FROM pz",
+        "SELECT CASE WHEN true THEN 1 END -9223372036854775808",
+        "SELECT 1e400",
+        "SELECT 1e-400",
+    ] {
+        let r = a.q(sql);
+        if r.error.as_ref().map(|e| e.code.as_str()) != Some("0A000") {
+            wrong.push(format!("{sql}: rows {:?} error {:?}, refused 0A000", r.rows, r.error));
+        }
+    }
+    let r = a.q("SELECT -9223372036854775808");
+    if r.error.is_some() || r.rows != vec![vec![Some("-9223372036854775808".to_string())]] {
+        wrong.push(format!("SELECT -9223372036854775808: rows {:?} error {:?}, PostgreSQL int8's least", r.rows, r.error));
+    }
+    for declared in [false, true] {
+        let mut parse = vec![0u8];
+        parse.extend_from_slice(b"INSERT INTO pz (id, n) VALUES (2, $1)\0");
+        if declared {
+            parse.extend_from_slice(&1i16.to_be_bytes());
+            parse.extend_from_slice(&1700i32.to_be_bytes());
+        } else {
+            parse.extend_from_slice(&0i16.to_be_bytes());
+        }
+        a.send(b'P', &parse);
+        let value = b"9007199254740993";
+        let mut bind = vec![0u8, 0u8];
+        bind.extend_from_slice(&0i16.to_be_bytes());
+        bind.extend_from_slice(&1i16.to_be_bytes());
+        bind.extend_from_slice(&(value.len() as i32).to_be_bytes());
+        bind.extend_from_slice(value);
+        bind.extend_from_slice(&0i16.to_be_bytes());
+        a.send(b'B', &bind);
+        a.send(b'E', &[0, 0, 0, 0, 0]);
+        a.send(b'S', &[]);
+        let r = a.read_reply();
+        if r.error.is_some() {
+            wrong.push(format!("bound 9007199254740993 (declared {declared}): {:?}", r.error));
+        }
+        let r = a.q("SELECT n FROM pz WHERE id = 2");
+        if r.rows != vec![vec![Some("9007199254740993".to_string())]] {
+            wrong.push(format!("stored (declared {declared}): {:?}, PostgreSQL 9007199254740993", r.rows));
+        }
+        a.q("DELETE FROM pz WHERE id = 2").ok("delete");
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// wire-rev-7128c6f73 HIGH-1, the lead's ruling (DECISIONS d2bf57effb; the review's PG 18.6 probe4 #3-#28, #47, probe5): a
 /// decimal of more than 15 significant digits reaches the engine as a REAL, which rounds it, so it is REFUSED 0A000 on
 /// every write path and in every comparison, never rounded and never stored as text. ef2141683 stored an INSERT VALUES
