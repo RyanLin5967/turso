@@ -335,9 +335,13 @@ impl NameMirror {
     fn intern(&mut self, name: &[u8]) -> u32 {
         let enc = leb_len(name.len()) + name.len();
         assert!(enc <= CHUNK, "a branch name of {} bytes", name.len());
+        // h1gap-rev-b HIGH 1: the chunk filling stops being when this name does not fit. A release never
+        // evacuates the filling chunk, so its dead spans are judged here, once it is no longer filling.
+        let mut retired = None;
         let c = match self.filling {
             Some(c) if usize::from(self.used[c]) + enc <= CHUNK => c,
-            _ => {
+            old => {
+                retired = old;
                 let chunk = vec![0u8; CHUNK].into_boxed_slice();
                 let c = match self.spare.pop() {
                     Some(c) => {
@@ -371,7 +375,20 @@ impl NameMirror {
         chunk[k..k + name.len()].copy_from_slice(name);
         self.used[c] += enc as u16;
         self.live[c] += enc as u16;
-        ((c as u32) << 12) | at as u32
+        let place = ((c as u32) << 12) | at as u32;
+        // The retired chunk, under half live, is evacuated now, as release would have done (a chunk whose
+        // names all died while it was filling is freed here). Mutant `name_mirror_retired_chunk_kept`
+        // (test builds only): not judged, as before.
+        #[cfg(test)]
+        let keep = super::store::fe_mutant("name_mirror_retired_chunk_kept");
+        #[cfg(not(test))]
+        let keep = false;
+        if let Some(p) = retired.filter(|&p| !keep && self.chunks[p].is_some()) {
+            if 2 * usize::from(self.live[p]) < usize::from(self.used[p]) {
+                self.evacuate(p);
+            }
+        }
+        place
     }
 
     /// A removed name's span is dead: its chunk is evacuated once under half live.
