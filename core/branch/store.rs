@@ -255,11 +255,6 @@ pub(crate) struct BranchStore {
     /// F-FZ back-pressure: set while a fuzzy checkpoint is in flight and the log is past twice the
     /// threshold; an operation that sees it after releasing the store mutex waits for the install.
     over_hard: Arc<AtomicBool>,
-    /// Test builds (h1gap-rev-c HIGH-2, ruling 4412c8a62b's cause tag): the fuzzy checkpoint last started
-    /// carries link-fill or upgrade work (its capture runs the whole-catalog upgrade), so a back-pressure
-    /// wait on its install is counted apart (`thread_fill_waits`).
-    #[cfg(test)]
-    fill_flight: AtomicBool,
     /// F-FZ: set from a fuzzy checkpoint's install until its WAL truncation ends; no checkpoint
     /// starts meanwhile, whose capture would pin a read mark and make the truncation busy.
     truncating: Arc<AtomicBool>,
@@ -1563,10 +1558,18 @@ thread_local! {
 
 #[cfg(test)]
 thread_local! {
-    /// The back-pressure waits this thread made on the install of a fuzzy checkpoint whose capture carries
-    /// link-fill or upgrade work (h1gap-rev-c HIGH-2's cause-tagged counter, ruling 4412c8a62b).
+    /// The back-pressure waits this thread made on the install of a fuzzy checkpoint whose write filled
+    /// links (h1gap-rev-c HIGH-2's cause-tagged counter, ruling 4412c8a62b). h1-rev-72bfb0127 MED-1: the
+    /// tag is the work observed, not a predicate: the rows the write's `upgrade_links_batch` calls filled
+    /// (`CatalogCounters::rows_filled`, moved inside the writer's hold), recorded per install
+    /// (`FILLED_INSTALLS`) and read by the waiter once the install it waited for is done.
     static THREAD_FILL_WAITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
+
+/// Test builds (h1-rev-72bfb0127 MED-1): the fuzzy installs whose checkpoint write filled links, as
+/// `(the store's install counter's address, its count after that install)`.
+#[cfg(test)]
+static FILLED_INSTALLS: std::sync::Mutex<Vec<(usize, u64)>> = std::sync::Mutex::new(Vec::new());
 
 /// See `THREAD_FILL_WAITS`.
 #[cfg(test)]
@@ -3601,6 +3604,9 @@ fn run_flight(
 ) {
     let ns = |t: Instant| u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX);
     let t = Instant::now();
+    // Test builds (h1-rev-72bfb0127 MED-1): the rows this write's fill batches filled.
+    #[cfg(test)]
+    let mut filled = 0u64;
     // A panic in the writer must still reach the install (with an error), or `flight` would stay
     // set: no checkpoint would start again and the read snapshot would stay pinned.
     let written = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -3642,11 +3648,16 @@ fn run_flight(
             }
         }
         let mut w = writer.lock();
-        let r0 = w.counters.rows_written;
+        let (r0, f0) = (w.counters.rows_written, w.counters.rows_filled);
         let written = checkpoint_write(&mut w, &cap, Some(&*hold));
         if written.is_err() {
             w.rollback();
         }
+        #[cfg(test)]
+        {
+            filled = w.counters.rows_filled - f0;
+        }
+        let _ = f0;
         (written, w.counters.rows_written - r0)
     }))
     .unwrap_or_else(|_| {
@@ -3734,7 +3745,15 @@ fn run_flight(
         truncating.store(installed.is_ok(), Ordering::Release);
         over_hard.store(false, Ordering::Release);
         let (count, signal) = &*installs;
-        *count.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+        let mut c = count.lock().unwrap_or_else(|e| e.into_inner());
+        *c += 1;
+        // Recorded before the waiters can read the new count (they hold `count` to read it).
+        #[cfg(test)]
+        if filled > 0 {
+            let key = Arc::as_ptr(&installs) as *const () as usize;
+            FILLED_INSTALLS.lock().unwrap_or_else(|e| e.into_inner()).push((key, *c));
+        }
+        drop(c);
         signal.notify_all();
         installed
     };
@@ -4108,6 +4127,8 @@ impl Drop for Backpressure<'_> {
         let mut n = count.lock().unwrap_or_else(|e| e.into_inner());
         let seen = *n;
         let started = Instant::now();
+        #[cfg(test)]
+        let mut waits = 0u64;
         while *n == seen && self.0.over_hard.load(Ordering::Acquire) {
             if started.elapsed() > Duration::from_secs(60) {
                 tracing::warn!("branch store back-pressure: no checkpoint install in 60 s");
@@ -4116,14 +4137,21 @@ impl Drop for Backpressure<'_> {
             #[cfg(test)]
             {
                 note_wait();
-                if self.0.fill_flight.load(Ordering::Acquire) {
-                    THREAD_FILL_WAITS.with(|n| n.set(n.get() + 1));
-                }
+                waits += 1;
             }
             n = installed
                 .wait_timeout(n, Duration::from_millis(50))
                 .unwrap_or_else(|e| e.into_inner())
                 .0;
+        }
+        // Test builds (MED-1): the waits were on an install whose write filled links (`FILLED_INSTALLS`).
+        #[cfg(test)]
+        if waits > 0 {
+            let key = Arc::as_ptr(&self.0.installs) as *const () as usize;
+            let filled = FILLED_INSTALLS.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(k, at)| k == key && at > seen && at <= *n);
+            if filled {
+                THREAD_FILL_WAITS.with(|c| c.set(c.get() + waits));
+            }
         }
     }
 }
@@ -4370,7 +4398,6 @@ impl BranchStore {
             flight_hold: Arc::new(AtomicU8::new(0)),
             over_hard: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
-            fill_flight: AtomicBool::new(false),
             truncating: Arc::new(AtomicBool::new(false)),
             installs: Arc::new((std::sync::Mutex::new(0), std::sync::Condvar::new())),
             trunk_children: AtomicUsize::new(0),
@@ -4679,7 +4706,6 @@ impl BranchStore {
             flight_hold: Arc::new(AtomicU8::new(0)),
             over_hard: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
-            fill_flight: AtomicBool::new(false),
             truncating: Arc::new(AtomicBool::new(false)),
             installs: Arc::new((std::sync::Mutex::new(0), std::sync::Condvar::new())),
             unsynced: AtomicBool::new(false),
@@ -6278,13 +6304,6 @@ impl BranchStore {
             }
         };
         let cat = inner.cat.as_mut().expect("captured above");
-        // Test builds (ruling 4412c8a62b's cause tag): this flight's capture runs the whole-catalog upgrade
-        // (`checkpoint_write`: a flip with no complete fill).
-        #[cfg(test)]
-        self.fill_flight.store(
-            super::journal::carries_links(cap.meta.format) && !cat.catalog.links_valid() && !(cap.links_prefilled && cat.catalog.links()),
-            Ordering::Release,
-        );
         cat.ckpt.hold(ns(t));
         cat.ckpt.stmts_locked += cat.catalog.counters.queries - q0;
         let writer = cat.writer.clone();

@@ -296,6 +296,9 @@ pub(crate) struct CatalogCounters {
     pub(crate) queries: u64,
     pub(crate) rows_read: u64,
     pub(crate) rows_written: u64,
+    /// Rows whose links the upgrade's fill set (`upgrade_links_batch`), on this handle, in any transaction
+    /// (h1-rev-72bfb0127 MED-1: a checkpoint's fill work is observed by this count's move in its write).
+    pub(crate) rows_filled: u64,
 }
 
 /// An integer as the catalog stores it. Every value the store keeps is below 2^63 except a
@@ -939,6 +942,9 @@ impl Catalog {
             if !skip {
                 self.relink(p, f)?;
             }
+        }
+        if !skip {
+            self.counters.rows_filled += keys.len() as u64;
         }
         super::store::kill_point("ckpt.upgrade.rows");
         Ok(if keys.len() < n { None } else { keys.last().copied() })

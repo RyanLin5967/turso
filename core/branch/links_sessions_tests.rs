@@ -250,7 +250,10 @@ fn ls_hard_whole_child() {
 /// and REPLACED by its cause-tagged form: no create waited on the install of a checkpoint whose capture
 /// carries fill or upgrade work (`thread_fill_waits`); the untagged waits are reported, never asserted. And
 /// the log was cut while the fill was incomplete: the store stays at 19, the log under its peak.
-/// Mutant `l4_upgrade_unbatched` (the fill back in the capture) must fail the tagged counter.
+/// Mutant `l4_upgrade_unbatched` (the fill back in the capture) must fail the tagged counter. h1-rev-72bfb0127
+/// MED-1: the tag is the fill work a checkpoint's write did (rows its fill batches filled), not the predicate
+/// that picks `upgrade_links`, so mutant `l4_nonflip_fill_untagged` (a non-flip write running the whole fill
+/// by direct batches) must fail it too; the assertion is unchanged.
 /// Premise: the log passed the hard limit.
 #[test]
 fn past_the_hard_log_limit_no_checkpoint_links_the_whole_catalog() {
