@@ -17180,6 +17180,36 @@ fn a_varchar_cast_length_is_bounded() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// wire-rev-1de981755-rest LOW-6 (its PG 18.6 probe #206-#208): an integer expression cast to oid is its 32-bit
+/// unsigned value, as int4's binary coercion to oid reads it ((-i)::oid wrote '-1' under oid; PG 4294967295), and an
+/// oid column goes out in binary as its four bytes (refused 0A000).
+#[test]
+fn an_integer_expression_cast_to_oid_is_unsigned() {
+    let dir = Scratch::new("oid-expr");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in ["CREATE TABLE ct(i int)", "INSERT INTO ct VALUES (1), (2)"] {
+        a.q(sql).ok(sql);
+    }
+    let mut wrong = Vec::new();
+    for (sql, rows) in [
+        ("SELECT i::oid AS a FROM ct ORDER BY i", vec!["1", "2"]),
+        ("SELECT (-i)::oid AS a FROM ct ORDER BY i", vec!["4294967295", "4294967294"]),
+    ] {
+        let r = a.q(sql);
+        let want: Vec<Vec<Option<String>>> = rows.iter().map(|v| vec![Some(v.to_string())]).collect();
+        if r.error.is_some() || r.oids != Some(vec![26]) || r.rows != want {
+            wrong.push(format!("{sql}: PG 26 {rows:?}; got {:?} {:?} {:?}", r.oids, r.rows, r.error));
+        }
+    }
+    let r = a.x_binary("SELECT (-1)::oid AS a");
+    let want = vec![vec![Some(String::from_utf8_lossy(&[0xff, 0xff, 0xff, 0xff]).into_owned())]];
+    if r.error.is_some() || r.oids != Some(vec![26]) || r.rows != want {
+        wrong.push(format!("binary (-1)::oid: PG 26 0xffffffff; got {:?} {:?} {:?}", r.oids, r.rows, r.error));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// wire-rev-351702a43 LOW-6 (its PG 18.6 probe3 #161): a CASE is typed by its results (an int4 constant and an int4
 /// function: 23); the walk never typed a CASE column, and the engine announced it text (25).
 #[test]
