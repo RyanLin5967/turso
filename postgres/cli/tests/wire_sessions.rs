@@ -16445,6 +16445,17 @@ fn a_decimal_past_15_digits_is_refused_on_every_path() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// wire-rev-351702a43 LOW-6 (its PG 18.6 probe3 #161): a CASE is typed by its results (an int4 constant and an int4
+/// function: 23); the walk never typed a CASE column, and the engine announced it text (25).
+#[test]
+fn a_case_column_is_typed_by_its_results() {
+    let dir = Scratch::new("case-type");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let r = a.q("SELECT CASE WHEN now() IS NULL THEN 1 WHEN false THEN length('x') END");
+    assert_eq!((r.oids, r.error), (Some(vec![23]), None), "PostgreSQL types the CASE int4");
+}
+
 /// wire-rev-7128c6f73 L3 (its PG 18.6 probe4 #140-#142): an int2 or int8 result past its type is 22003 in PG ('smallint
 /// out of range', 'bigint out of range'); ours announced 21 or 20 and wrote '32768' or '9.223372036854776e+18' in text
 /// format (binary already refused it).
