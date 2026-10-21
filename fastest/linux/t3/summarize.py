@@ -1742,7 +1742,14 @@ def self_test():
                                                                "phases_run": 4, "tm0_realtime_s": 100.1,
                                                                "tm1_realtime_s": 100.3, "tracerpid_tm0": 0,
                                                                "tracerpid_tm1": 0,
-                                                               "windows": ours_windows()}))  # TEST EDIT, flagged
+                                                               "windows": ours_windows(),
+                                                               # TEST EDIT, flagged (t3cov-1a MED 1): ours' warm-up
+                                                               # record and its live record, passing
+                                                               "warmup": {"ops_at_stop": 3, "ops": 3, "stop_secs": 1.5,
+                                                                          "capped": False, "rule": RULE,
+                                                                          "t0_after_ready_ns": 1000}}))  # TEST EDIT, flagged
+                    w(f"{a1}/result/warmup-live.json", json.dumps({"claims_ns": [1, 2, 3, 1500000000], "stop_at": 3,
+                                                                   "warm_ops": 3, "capped": 0, "rule": RULE}))
                     sweeper_files(a1)  # TEST EDIT, flagged (MED 12 ruling): ours' sweeper record, passing
                 else:
                     w(f"{a1}/result/functional.txt", "VERDICT PASS\n")
