@@ -2714,6 +2714,10 @@ pub(crate) static CUT_PANICS: AtomicBool = AtomicBool::new(false);
 /// error would (review 3 #7). Set before the open that starts the build.
 #[cfg(test)]
 pub(crate) static NAME_SCAN_FAILS: ArmedFlag = ArmedFlag::new();
+/// Test builds: the next store close panics in its tail, after its lease stamp and before its
+/// confirm word (engine-rev-async-20200c00a L3).
+#[cfg(test)]
+pub(crate) static CLOSE_TAIL_PANICS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Test builds: while it holds 1, a name filter's builder waits before its catalog scan, having
 /// marked its arrival (`| HOLD_ARRIVED`); stored 0 to release it (review 3 #7). Set before the open
@@ -11667,6 +11671,10 @@ impl StoreCore {
         }
         // After the stamp, which is a flight of its own.
         drop(inner);
+        #[cfg(test)]
+        if CLOSE_TAIL_PANICS.swap(false, Ordering::AcqRel) {
+            panic!("failpoint: the close's tail panicked");
+        }
         self.close_confirms();
     }
 }

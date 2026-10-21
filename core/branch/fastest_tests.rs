@@ -16838,3 +16838,36 @@ fn only_an_open_that_recovers_no_journal_makes_log_buffers() {
     assert_eq!(fresh, 1, "premise: a fresh open makes its first create's log buffers once");
     assert_eq!(recovering, 0, "CLAIM: an open that recovered a journal made no log buffers; it made {recovering}");
 }
+
+/// engine-rev-async-20200c00a L3: a store's close runs while its caller's thread may be unwinding,
+/// where a second panic aborts the process. LOW 4 put the close's async flight under catch_unwind;
+/// the rest of its I/O, the lease clock's stamp and the confirm word, was outside it. Failpoint
+/// `CLOSE_TAIL_PANICS` panics in that tail. The claim: the last handle's drop returns, the panic
+/// caught inside the close (the store fail-stops), rather than escaping `Drop`, where under an
+/// unwind it would abort. Mutant `close_tail_unguarded`.
+#[test]
+fn a_panic_in_the_close_tail_is_caught_inside_the_close() {
+    let _g = serial();
+    struct Disarm;
+    impl Drop for Disarm {
+        fn drop(&mut self) {
+            super::store::CLOSE_TAIL_PANICS.store(false, std::sync::atomic::Ordering::Release);
+        }
+    }
+    let _d = Disarm;
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("close-tail.db"), opts(true, SyncClass::Off));
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    trunk.create_branch("b").unwrap();
+    drop(trunk);
+    super::store::CLOSE_TAIL_PANICS.store(true, std::sync::atomic::Ordering::Release);
+    let store = Arc::downgrade(&db.branches);
+    let dropped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(db)));
+    assert!(store.upgrade().is_none(), "premise: the last handle's drop closed the store");
+    assert!(
+        !super::store::CLOSE_TAIL_PANICS.load(std::sync::atomic::Ordering::Acquire),
+        "premise: the close reached its tail's failpoint"
+    );
+    assert!(dropped.is_ok(), "CLAIM: a panic in the close's tail escaped the store's Drop");
+}
