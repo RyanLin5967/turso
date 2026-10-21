@@ -1687,6 +1687,10 @@ impl Infer<'_> {
         {
             for row in &s.values_lists {
                 if let Some(Node::List(l)) = row.node.as_ref() {
+                    // PostgreSQL analyses a multi-row VALUES row by row: one $n assigned two types
+                    // in different rows runs, only within one row is it 42P08
+                    // (wire-rev-4a1934c89-beb4 MED-1).
+                    self.assigned.clear();
                     for (item, ty) in l.items.iter().zip(&columns) {
                         self.assign_type(item, *ty);
                     }
@@ -1718,6 +1722,8 @@ impl Infer<'_> {
         };
         let target = vec![vec![self.target(rel), excluded]];
         if let Some(c) = &insert.on_conflict_clause {
+            // ON CONFLICT's SET is analysed after VALUES: its own scope for 42P08.
+            self.assigned.clear();
             self.set_targets(&c.target_list, relname.as_deref(), &target);
             self.qual(c.where_clause.as_deref(), &target);
         }
