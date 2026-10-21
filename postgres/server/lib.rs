@@ -5695,6 +5695,32 @@ fn inline_dml_complete(query: &str, rows: usize) -> Option<pgwire::messages::Inl
 /// Describe and Bind read the same list.
 fn parameter_types(types: &StatementTypes, declared: &[Option<Type>]) -> SqlResult<Vec<Type>> {
     let highest = types.used.last().map_or(0, |n| *n as usize);
+    // A $n of a string type (declared, or its first context's) assigned to a column of another
+    // category: no assignment cast exists, 42804 as PostgreSQL's assignment coercion answers, at the
+    // first such column in analysis order ([`StatementTypes::column_assignments`];
+    // wire-rev-4a1934c89-beb4 LOW-3: a declared text went into numeric, and crossed VALUES rows were
+    // 42P08). A type this table cannot name is not judged.
+    let string = |oid: u32| matches!(oid, 25 | 1043 | 1042 | 19);
+    for (n, column, target) in &types.column_assignments {
+        let own = match declared.get(*n as usize - 1) {
+            Some(Some(t)) if *t != Type::UNKNOWN => t.oid(),
+            // Two types deduced within one row or SET list is 42P08, below, as PostgreSQL's
+            // parse analysis refuses it before any coercion.
+            _ if types.inconsistent.contains(n) => continue,
+            _ => match types.params.get(n) {
+                Some(t) => *t,
+                None => continue,
+            },
+        };
+        if string(own) && !string(*target) {
+            if let (Some(have), Some(want)) = (pg_type_display(own), pg_type_display(*target)) {
+                return Err(error(
+                    SqlErrorKind::DatatypeMismatch,
+                    format!("column \"{column}\" is of type {want} but expression is of type {have}"),
+                ));
+            }
+        }
+    }
     (1..=highest.max(declared.len()))
         .map(|n| {
             if let Some(Some(t)) = declared.get(n - 1) {
@@ -5745,6 +5771,58 @@ fn parameter_types(types: &StatementTypes, declared: &[Option<Type>]) -> SqlResu
                 .unwrap_or(Type::TEXT))
         })
         .collect()
+}
+
+/// A type's name as PostgreSQL's format_type writes it in an error, for the types assignments name;
+/// None for any other.
+fn pg_type_display(oid: u32) -> Option<String> {
+    let scalar = |oid: u32| -> Option<&'static str> {
+        Some(match oid {
+            16 => "boolean",
+            17 => "bytea",
+            19 => "name",
+            20 => "bigint",
+            21 => "smallint",
+            23 => "integer",
+            25 => "text",
+            26 => "oid",
+            114 => "json",
+            700 => "real",
+            701 => "double precision",
+            1042 => "character",
+            1043 => "character varying",
+            1082 => "date",
+            1083 => "time without time zone",
+            1114 => "timestamp without time zone",
+            1184 => "timestamp with time zone",
+            1700 => "numeric",
+            2950 => "uuid",
+            3802 => "jsonb",
+            _ => return None,
+        })
+    };
+    if let Some(name) = scalar(oid) {
+        return Some(name.to_string());
+    }
+    let element = match oid {
+        1000 => 16,
+        1001 => 17,
+        1005 => 21,
+        1007 => 23,
+        1009 => 25,
+        1014 => 1042,
+        1015 => 1043,
+        1016 => 20,
+        1021 => 700,
+        1022 => 701,
+        1182 => 1082,
+        1115 => 1114,
+        1185 => 1184,
+        1231 => 1700,
+        2951 => 2950,
+        _ => return None,
+    };
+    scalar(element).map(|name| format!("{name}[]"))
 }
 
 /// Bind a portal's parameters to its statement, each converted from its text by its type, `types`

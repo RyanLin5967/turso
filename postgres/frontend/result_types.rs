@@ -652,6 +652,8 @@ pub struct Walked {
     pub arithmetic_operands: std::collections::BTreeSet<u32>,
     /// The bare $n that are an operand of a comparison ([`StatementTypes::compared_operands`]).
     pub compared_operands: std::collections::BTreeSet<u32>,
+    /// Each bare $n assigned to a column ([`StatementTypes::column_assignments`]).
+    pub column_assignments: Vec<(u32, String, u32)>,
     /// A plain SELECT's result columns' types, in order, as the walk read them (empty for any other
     /// statement): [`aggregate_types`] takes the aggregates' from these.
     pub columns: Vec<Option<u32>>,
@@ -723,6 +725,12 @@ pub struct StatementTypes {
     /// Every bare $n that is an operand of a comparison: one the client declared interval is
     /// refused 0A000 ($1 > $2 over two intervals compared their text; MED-8).
     pub compared_operands: std::collections::BTreeSet<u32>,
+    /// Each bare $n assigned to a column, in PostgreSQL's analysis order: ($n, the column, its type).
+    /// One whose type (declared, or its first context's) is a string type and whose column's is not
+    /// is 42804 'column "x" is of type numeric but expression is of type text', as PostgreSQL's
+    /// assignment coercion refuses it (no assignment cast from a string type to another category;
+    /// wire-rev-4a1934c89-beb4 LOW-3).
+    pub column_assignments: Vec<(u32, String, u32)>,
     /// The translated statement is a COMMIT (`commits`) or a ROLLBACK of the whole transaction
     /// (`rolls_back`), whatever its text: the server keys its COMMIT rules on this, never on its own
     /// reading of the text, which `COMMIT<NBSP>` and other spellings it did not know slipped past
@@ -858,6 +866,7 @@ fn parameter_types_with(
         missing_rte: Default::default(),
         first_refusal: Default::default(),
         operand_params: Default::default(),
+        column_assignments: Vec::new(),
     };
     let mut columns = Vec::new();
     if let [raw] = parse.protobuf.stmts.as_slice() {
@@ -878,12 +887,14 @@ fn parameter_types_with(
         return Err(refused);
     }
     let (arithmetic_operands, compared_operands) = infer.operand_params.take();
+    let column_assignments = std::mem::take(&mut infer.column_assignments);
     Ok(Walked {
         params: infer.types,
         untyped,
         inconsistent: infer.inconsistent,
         arithmetic_operands,
         compared_operands,
+        column_assignments,
         columns,
         assignments: infer.assignments,
     })
@@ -986,6 +997,9 @@ struct Infer<'a> {
     /// Each bare $n that is an operand of arithmetic (.0) or of a comparison (.1)
     /// ([`Walked::arithmetic_operands`], [`Walked::compared_operands`]).
     operand_params: std::rc::Rc<std::cell::RefCell<(std::collections::BTreeSet<u32>, std::collections::BTreeSet<u32>)>>,
+    /// Each bare $n assigned to a column, in the order PostgreSQL analyses them: ($n, the column's
+    /// name, its type) ([`Walked::column_assignments`]).
+    column_assignments: Vec<(u32, String, u32)>,
 }
 
 /// The stack a view's reading starts with, and the stack grown for it when less is left: each view
@@ -1662,6 +1676,7 @@ impl Infer<'_> {
             missing_rte: Default::default(),
             first_refusal: Default::default(),
             operand_params: Default::default(),
+            column_assignments: Vec::new(),
         };
         let columns = walk.select(query, &Vec::new());
         Some(rename(columns, &v.aliases))
@@ -1802,6 +1817,22 @@ impl Infer<'_> {
                 })
                 .collect(),
         };
+        let names: Vec<String> = match &relname {
+            None => Vec::new(),
+            Some(relname) if insert.cols.is_empty() => self
+                .schema
+                .get_btree_table(relname)
+                .map(|t| t.columns().iter().map(|c| c.name.clone().unwrap_or_default()).collect())
+                .unwrap_or_default(),
+            Some(_) => insert
+                .cols
+                .iter()
+                .map(|c| match c.node.as_ref() {
+                    Some(Node::ResTarget(t)) => t.name.clone(),
+                    _ => String::new(),
+                })
+                .collect(),
+        };
         let columns: Vec<Option<u32>> = match &relname {
             None => Vec::new(),
             Some(relname) if insert.cols.is_empty() => self
@@ -1847,8 +1878,11 @@ impl Infer<'_> {
                     // in different rows runs, only within one row is it 42P08
                     // (wire-rev-4a1934c89-beb4 MED-1).
                     self.assigned.clear();
-                    for (item, ty) in l.items.iter().zip(&columns) {
+                    for ((item, ty), name) in l.items.iter().zip(&columns).zip(names.iter().chain(std::iter::repeat(&String::new()))) {
                         self.assign_type(item, *ty);
+                        if let (Some(n), Some(t)) = (param(item), ty) {
+                            self.column_assignments.push((n, name.clone(), *t));
+                        }
                     }
                     for (item, len) in l.items.iter().zip(&lengths) {
                         self.assign_length(item, *len);
@@ -1924,6 +1958,9 @@ impl Infer<'_> {
                         .and_then(|i| row.args.get(i))
                     {
                         self.assign_type(item, column);
+                        if let (Some(n), Some(c)) = (param(item), column) {
+                            self.column_assignments.push((n, t.name.clone(), c));
+                        }
                         self.assign_length(item, length);
                         self.expr(item, scope);
                     }
@@ -1931,6 +1968,9 @@ impl Infer<'_> {
                 continue;
             }
             self.assign_type(val, column);
+            if let (Some(n), Some(c)) = (param(val), column) {
+                self.column_assignments.push((n, t.name.clone(), c));
+            }
             self.assign_length(val, length);
             self.expr(val, scope);
         }
@@ -2922,6 +2962,7 @@ impl Infer<'_> {
             missing_rte: self.missing_rte.clone(),
             first_refusal: self.first_refusal.clone(),
             operand_params: self.operand_params.clone(),
+            column_assignments: Vec::new(),
         };
         let level = walk.from_items(&s.from_clause, scope);
         let mut inner = scope.clone();
