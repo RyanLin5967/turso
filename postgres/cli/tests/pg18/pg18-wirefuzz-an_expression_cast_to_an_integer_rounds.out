@@ -1,0 +1,12 @@
+>> Q CREATE TABLE ce(id int, f float8)
+   C CREATE TABLE
+   Z I
+>> Q INSERT INTO ce VALUES (1, 1.5), (2, 2.75)
+   C INSERT 0 2
+   Z I
+>> Q SELECT id, (f * 1)::int, (f + 0)::int8 FROM ce ORDER BY id
+   T oids=[23, 23, 20]
+   D ['1', '2', '2']
+   D ['2', '3', '3']
+   C SELECT 2
+   Z I
