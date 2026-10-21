@@ -946,6 +946,38 @@ fn numeric_sums(plan: &mut SelectPlan, resolver: &Resolver) {
     }
 }
 
+/// A window's min or max over a value of a custom type whose '<' is a function (numeric_lt), with a
+/// moving frame, would keep the frame's values in an ephemeral index ordered plainly (by numeric's
+/// text: 2.00 above 10.00; engine-rev-types-08caaec44 MED 4), so its window recomputes every frame
+/// from scratch, where min and max compare through the type's '<' as OVER () does: the full-scan
+/// path an EXCLUDE takes, with EXCLUDE NO OTHERS, which excludes nothing. Mutant
+/// `window_extreme_compares_plainly` (test builds only): as before.
+fn typed_window_extremes(plan: &mut SelectPlan, resolver: &Resolver) {
+    if crate::branch::store::fe_mutant("window_extreme_compares_plainly") {
+        return;
+    }
+    let Some(window) = plan.window.as_mut() else {
+        return;
+    };
+    if window.frame.exclude.is_some()
+        || matches!(window.frame.start, crate::translate::plan::FrameBoundary::UnboundedPreceding)
+    {
+        return;
+    }
+    let typed_extreme = window.functions.iter().any(|function| {
+        matches!(
+            function.func,
+            crate::function::AccumulatorFunc::Agg(crate::function::AggFunc::Min | crate::function::AggFunc::Max)
+        ) && function.rewritten.as_ref().is_some_and(|rewritten| {
+            matches!(&rewritten.expr, ast::Expr::FunctionCall { args, .. } if args.len() == 1
+                && crate::translate::order_by::custom_type_comparator(&args[0], &plan.table_references, resolver.schema()).is_some())
+        })
+    });
+    if typed_extreme {
+        window.frame.exclude = Some(ast::FrameExclude::NoOthers);
+    }
+}
+
 #[turso_macros::trace_stack]
 fn optimize_select_plan_with_cache(
     plan: &mut SelectPlan,
@@ -955,6 +987,7 @@ fn optimize_select_plan_with_cache(
     // Optimized recursively per nested query (`stack::NestGuard`; the crash batch, 2026-10-15).
     let _nest = crate::stack::NestGuard::enter("subqueries")?;
     numeric_sums(plan, resolver);
+    typed_window_extremes(plan, resolver);
     if !plan
         .non_from_clause_subqueries
         .iter()
