@@ -16867,6 +16867,73 @@ fn every_cross_database_reference_is_refused_and_only_those() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// wire-rev-1de981755-rest MED-6 (its PG 18.6 probe #4, #20): an explicit cast to char(n), character(n) or bpchar(n)
+/// cuts the value to n characters, as the varchar(n) cast does (adafc938f), and so does a cast to varchar(n)[] for each
+/// element: 'abcdef'::char(3) answered 'abcdef' and ARRAY['abcdef']::varchar(2)[] '{abcdef}'. The values are PG's; the
+/// column type of a bare cast is the varchar cut's known divergence (announced text), so either it or PG's is taken.
+#[test]
+fn an_explicit_cast_to_a_fixed_or_array_length_cuts_the_value() {
+    let dir = Scratch::new("char-cut");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let mut wrong = Vec::new();
+    for (sql, types, row) in [
+        (
+            "SELECT 'abcdef'::char(3) AS a, 'abcdef'::character(2) AS b, 'abcdef'::bpchar(1) AS c",
+            [1042u32, 1042, 1042].as_slice(),
+            ["abc", "ab", "a"].as_slice(),
+        ),
+        ("SELECT ARRAY['abcdef']::varchar(2)[] AS a", [1015u32].as_slice(), ["{ab}"].as_slice()),
+    ] {
+        let r = a.q(sql);
+        let typed = r.oids.as_ref().is_some_and(|o| o.as_slice() == types || o.iter().all(|t| *t == 25));
+        let rows: Vec<Vec<Option<String>>> = vec![row.iter().map(|v| Some(v.to_string())).collect()];
+        if r.error.is_some() || !typed || r.rows != rows {
+            wrong.push(format!("{sql}: PG {types:?} {row:?}; got {:?} {:?} {:?}", r.oids, r.rows, r.error));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// wire-rev-1de981755-rest MED-9 (its PG 18.6 probe #193-#204, probe2 #84): a text literal cast to oid is read as
+/// oidin reads it, strtoul with base 0 (a leading 0 is octal, 0x hexadecimal; spaces and a sign allowed; a negative
+/// value down to -2^31 wraps), and anything else is 22P02 or 22003 as PG answers: '00012'::oid answered 12 (PG 10),
+/// '0x10' 0 (PG 16), and '1.5', '' and 'abc' were cast by the engine to 1, 0 and 0.
+#[test]
+fn a_text_literal_cast_to_oid_is_read_as_oidin_reads_it() {
+    let dir = Scratch::new("oid-in");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let mut wrong = Vec::new();
+    for (literal, want) in [
+        ("-1", Ok("4294967295")),
+        ("4294967295", Ok("4294967295")),
+        (" 7 ", Ok("7")),
+        ("+5", Ok("5")),
+        ("-2147483648", Ok("2147483648")),
+        ("00012", Ok("10")),
+        ("0x10", Ok("16")),
+        ("010", Ok("8")),
+        ("0", Ok("0")),
+        ("4294967296", Err(("22003", "value \"4294967296\" is out of range for type oid"))),
+        ("-2147483649", Err(("22003", "value \"-2147483649\" is out of range for type oid"))),
+        ("1.5", Err(("22P02", "invalid input syntax for type oid: \"1.5\""))),
+        ("", Err(("22P02", "invalid input syntax for type oid: \"\""))),
+        ("abc", Err(("22P02", "invalid input syntax for type oid: \"abc\""))),
+    ] {
+        let sql = format!("SELECT '{literal}'::oid AS a");
+        let r = a.q(&sql);
+        let agrees = match want {
+            Ok(v) => r.error.is_none() && r.oids == Some(vec![26]) && r.rows == vec![vec![Some(v.to_string())]],
+            Err((code, message)) => r.error.as_ref().is_some_and(|e| e.code == code && e.message == message),
+        };
+        if !agrees {
+            wrong.push(format!("{sql}: PG {want:?}; got {:?} {:?} {:?}", r.oids, r.rows, r.error));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// wire-rev-351702a43 LOW-6 (its PG 18.6 probe3 #161): a CASE is typed by its results (an int4 constant and an int4
 /// function: 23); the walk never typed a CASE column, and the engine announced it text (25).
 #[test]
