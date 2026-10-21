@@ -22,6 +22,18 @@ three-driver conformance record (warmup-conformance.json, rc 0) naming this pack
 fastest_profile by sha256 (binaries.txt), and with no competitor warm-up claim judged out of time order
 (warmup_backsteps 0 in either loop mode; the loop is reported in runs[].warmup_loops): otherwise a parity refusal and
 a loud_owed line (review 5 MED 6; PREREG annex A23).
+The engine's four branch exception counters (the lead's routing ruling, DECISIONS 2026-10-15T05:16:51Z): every
+window of ours' result/summary.json carries exception_counters {before, after} (hardcap_upgrades,
+header_raise_exclusive, inline_compaction_syncs, compaction_waits; fastest_profile emits them from
+Database::branch_exception_counters() on a tree that has it: fork fastest-linux-exc, 588b59bbc);
+runs[].exception_counter_deltas holds each window's re-derived delta. A missing or unreadable record is a parity
+refusal; a nonzero delta labels the cell uncredited (runs[].counters_credited false, listed in uncredited_cells),
+which does not fail the package. Competitor runs are not the turso engine and carry none.
+The shared sweeper (the lead's MED 12 ruling, DECISIONS 2026-10-15T04:21:48Z): every measured run's timed.json
+records sweeper_cpu_s (ours: t3lib.sh ours_timed_record, re-derived here from the run's own timed.tracer.tsv by
+gates/sweeper_record.py; a competitor: each timed.json timedrun.py wrote); a missing or refused one is a parity
+refusal. sweeper_creditable is true only when every measured run's sweeper window is its measured one (ours' since
+fastest_profile stamps its measured span, bb96279f3: summary.json tm0/tm1_realtime_s).
 A block is OK when both its V3 batches (before, after) pass blockgate.py (review 2 item 5, rulings A14 and A16; every
 VOID fails), the A16 plants re-derived on its real BEFORE record all fire (blockgate-plants.json stored and
 re-run), the before-to-after drift was taken (batchgate.py drift; REFUSED fails; a VOID is published, not a gate on
@@ -38,13 +50,16 @@ PREREG citations as ':N' or 'line N' are lines of artie frontier/fastest/PREREG-
 rulings cite, until PREREG-v1.md is registered (fourth lane review LOW 26).
 """
 import glob
+import gzip
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
 import sys
 import tempfile
+import zlib
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import blockgate  # noqa: E402
@@ -93,7 +108,7 @@ def v3_batch(fsdir, when, rc, block=None, plp="no"):
     return rec
 
 
-def block_record(out, fs, plp="no"):
+def block_record(out, fs, plp="no", dry=None):
     fsdir = os.path.join(out, f"fs-{fs}")
     if not os.path.isdir(fsdir):
         return {"fs": fs, "ok": False, "why": ["the block never ran"]}
@@ -151,6 +166,12 @@ def block_record(out, fs, plp="no"):
         except (OSError, ValueError) as e:
             rec["why"].append(f"V3L {when}: v3l-{when}/v3l.json unreadable ({type(e).__name__})")
             continue
+        # review 7 / C21 finding 4: the record's own mode is its package's (a dry label is kept, never upgraded; a
+        # record saying real in a dry package, or the reverse, does not stand for this package)
+        want = {"1": "dry", "0": "real"}.get(str(dry))
+        if want and (not isinstance(meas, dict) or meas.get("mode") != want):
+            rec["why"].append(f"V3L {when}: the record's mode is {(meas or {}).get('mode') if isinstance(meas, dict) else None!r}, "
+                              f"this package is {want}")
         try:
             again, ok_again = v3l.plants(meas)
         except (ValueError, KeyError, TypeError, AttributeError):
@@ -201,7 +222,22 @@ def block_record(out, fs, plp="no"):
     return rec
 
 
-def run_parity(d, system):
+def functional_verdict(text):
+    """'PASS', 'FAIL' or None: the LAST 'VERDICT ' line of a competitor's functional.txt (T3 runner review LOW 21), read
+    by its first word, as run_system.sh writes it ("VERDICT PASS (dolt)", "VERDICT FAIL (b1): 6 check(s) failed")"""
+    vl = [l.split() for l in text.splitlines() if l.startswith("VERDICT ")]
+    w = vl[-1][1] if vl and len(vl[-1]) > 1 else None
+    return w if w in ("PASS", "FAIL") else None
+
+
+def timed_verdict_ok(v, dry):
+    """a competitor timed run's timedrun.py verdict stands for this package: 'ok' in a real one; 'ok-smoke' in a dry one
+    (timedrun.py gives a dry run 'ok-smoke', never 'ok'; a real run warmed by another rule is 'ok-smoke-warmup', which
+    stands nowhere). Anything else is refused."""
+    return v == ("ok-smoke" if str(dry) == "1" else "ok")
+
+
+def run_parity(d, system, adapter_rc=None):
     """What a measured run itself recorded of its warm-up rule and measured op total (ours: result/summary.json; a
     competitor: every timed run under result/cells/*/timed/summary.json, the only latency files)."""
     if system == "ours":
@@ -209,12 +245,19 @@ def run_parity(d, system):
             j = json.load(open(os.path.join(d, "result", "summary.json")))
         except (OSError, ValueError):
             j = {}
+        exc, exc_bad, exc_absent = exception_deltas(j)
+        j = j if isinstance(j, dict) else {}  # a non-object summary.json is refused above, never read as one
+        cpu, win, sw = ours_sweeper(d, adapter_rc)
         return {"warmup_rules": [j.get("warmup_rule")], "ops_measured": [j.get("ops_total")],
-                "ops_total_asked": j.get("ops_total_asked")}
+                "exception_counter_deltas": exc, "exception_counter_problems": exc_bad,
+                "exception_counters_absent": exc_absent,
+                "ops_total_asked": j.get("ops_total_asked"), "sweeper_cpu_s": [cpu], "sweeper_windows": [win],
+                "sweeper_problems": sw}
     # A competitor's timed run is judged by timedrun.py check (its timed.json: verdict ok, ops = the N it ran for),
     # the validated rule that also accepts a run ended by the registered cap with >= 1000 ok ops (PREREG :212,
     # "completed with reduced n"; fourth lane review MED 4); summarize compares the warm-up rule and N to the plan.
     rules, ops, verdicts, reduced, seen, backsteps, loops = [], [], [], {}, set(), [], []
+    sweepers, sw = [], []  # MED 12 ruling: each timed.json's sweeper_cpu_s (timedrun.py's, over its measured window)
     for t in sorted(glob.glob(os.path.join(d, "result", "cells", "*", "timed", "summary.json"))):
         cell = os.path.basename(os.path.dirname(os.path.dirname(t)))
         try:
@@ -226,11 +269,17 @@ def run_parity(d, system):
         except (OSError, ValueError):
             tj = None
         rules.append(j.get("warmup_rule"))
-        ops.append((tj or {}).get("ops"))
+        ops.append((tj or {}).get("timed_measured_ops"))  # timedrun.py's own field (the writer's format)
         backsteps.append((cell, j.get("warmup_backsteps")))  # PREREG annex A23 (comp 12f79726b's field)
         loops.append(j.get("loop"))
         seen.add(cell)
         verdicts.append((cell, "no timed.json" if tj is None else tj.get("verdict")))
+        if tj is not None:
+            x = tj.get("sweeper_cpu_s")
+            sweepers.append(x)
+            if type(x) not in (int, float) or not math.isfinite(x) or x < 0:
+                sw.append(f"timed run {cell}: timed.json sweeper_cpu_s {x!r}, not a CPU time (the shared sweeper's "
+                          "record)")
         if j.get("capped") and isinstance(j.get("measured_ops"), int):
             reduced[cell] = j["measured_ops"]
     # every cell the run said it would produce has its timed run (fourth lane review LOW 24): run_system.sh writes
@@ -243,7 +292,151 @@ def run_parity(d, system):
     except OSError:
         missing = ["no expected-cells.txt: the cells this run had to produce are unknown"]
     return {"warmup_rules": rules, "ops_measured": ops, "timed_verdicts": verdicts, "reduced_n": reduced or None,
-            "expected_missing": missing, "warmup_backsteps": backsteps, "warmup_loops": loops}
+            "expected_missing": missing, "warmup_backsteps": backsteps, "warmup_loops": loops,
+            "sweeper_cpu_s": sweepers, "sweeper_windows": ["measured"] * len(sweepers), "sweeper_problems": sw}
+
+
+GATES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "gates")
+
+
+# the engine's branch exception counters, in Database::branch_exception_counters()'s order (the lead's routing ruling,
+# DECISIONS 2026-10-15T05:16:51Z): each counts a path that stalls or widens a create, so a credited cell needs all four
+# unchanged inside its windows
+EXCEPTION_COUNTERS = ("hardcap_upgrades", "header_raise_exclusive", "inline_compaction_syncs", "compaction_waits")
+PHASES = ("create", "connect", "write", "delete")  # fastest_profile's --mode phases windows, in order (main.rs PHASES)
+# what t3run.sh asks every run of ours for: --mode phases with no --phases, so every phase (fastest_profile's default)
+RUNNER_MODE, RUNNER_PHASES = "phases", len(PHASES)
+
+
+def exception_deltas(j):
+    """({window: {counter: after - before}} or None, the refusals, absent) from ours' result/summary.json: every window carries
+    exception_counters {before, after}, each naming all four counters as non-negative ints, none going backwards. The
+    deltas are re-derived here from the raw reads; fastest_profile emits them where the engine has them (588b59bbc). The windows
+    listed must be exactly, in order, the ones t3run asked for (RUNNER_MODE with RUNNER_PHASES phases, which the run's
+    own mode and phases_run must also say: a run's claim alone never narrows the coverage), each named, and no counter
+    may fall between one window's close and the next one's open. A rise between windows is not refused: the ruling
+    credits a cell on zero INSIDE its windows, and the gaps hold unmeasured work (the branch connections closing
+    before the delete window opens). ABSENT is true when the record is not there at all (no windows, or a window
+    with no exception_counters): a driver built without Database::branch_exception_counters(), set LOUD-OWED."""
+    if not isinstance(j, dict):
+        return None, ["summary.json is not an object, so the engine's branch exception counters are unknown"], False
+    wins = j.get("windows")
+    if not isinstance(wins, list) or not wins:
+        return None, ["summary.json has no windows, so the engine's branch exception counters are unknown "
+                      "(fastest_profile must record them per window)"], True
+    pr = j.get("phases_run")
+    if j.get("mode") != RUNNER_MODE or type(pr) is not int or pr != RUNNER_PHASES:
+        return None, [f"summary.json's mode {j.get('mode')!r} and phases_run {pr!r} are not what t3run asked for "
+                      f"({RUNNER_MODE!r}, {RUNNER_PHASES}), so the exception counters' coverage cannot be judged"], False
+    want = list(PHASES[:RUNNER_PHASES])
+    out, bad, prev, absent = {}, [], None, False
+    names = [w.get("window") if isinstance(w, dict) else None for w in wins]
+    if names != want:
+        bad += [f"window {x}: measured (mode {j.get('mode')}) but not listed" for x in want if x not in names]
+        bad += [f"window {x}: listed but not measured (mode {j.get('mode')}, phases_run {pr})" for x in names
+                if isinstance(x, str) and x not in want]
+        if not bad:
+            bad.append(f"windows {names!r} are not the measured {want!r}, in order")
+    for i, w in enumerate(wins):
+        if not isinstance(w, dict) or not isinstance(w.get("window"), str) or not w["window"]:
+            bad.append(f"window #{i} has no name")
+            prev = None
+            continue
+        name = w["window"]
+        ec = w.get("exception_counters")
+        if not isinstance(ec, dict) or not isinstance(ec.get("before"), dict) or not isinstance(ec.get("after"), dict):
+            bad.append(f"window {name}: no exception_counters {{before, after}} (the engine's branch exception "
+                       "counters; fastest_profile must record them)")
+            prev, absent = None, True
+            continue
+        d = {}
+        for k in EXCEPTION_COUNTERS:
+            a, b = ec["before"].get(k), ec["after"].get(k)
+            if type(a) is not int or type(b) is not int or a < 0 or b < 0:
+                bad.append(f"window {name}: exception counter {k} before {a!r} after {b!r}, not two non-negative ints")
+            elif b < a:
+                bad.append(f"window {name}: exception counter {k} went backwards ({a} -> {b})")
+            else:
+                d[k] = b - a
+                if prev is not None and type(prev[1].get(k)) is int and a < prev[1][k]:
+                    bad.append(f"exception counter {k} fell between windows {prev[0]} (closed at {prev[1][k]}) and "
+                               f"{name} (opened at {a})")
+        prev = (name, ec["after"])
+        if name in out:
+            bad.append(f"window {name}: named twice")
+        out[name] = d
+    return (None, bad, absent) if bad else (out, [], False)
+
+
+COMPETITORS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "competitors")
+
+
+def ours_sweeper(d, adapter_rc=None):
+    """The lead's MED 12 ruling (DECISIONS 2026-10-15T04:21:48Z, SAME INSTRUMENT FOR EVERY SYSTEM): ours' timed.json
+    (t3lib.sh ours_timed_record), its sweeper_cpu_s RE-DERIVED from the run's own timed.tracer.tsv over the run's own
+    window by the one reader, gates/sweeper_record.py (the stored value is compared, never read as the answer). The
+    record is held to the competitors' untraced-run rules by their own implementation, timedrun.py tracer_problems
+    (no TRACED line or TracerPid, trees walked, no gap over its GAP_S, the window bracketed), over ours' window, with
+    its two checks of the load generator's own TracerPid at tm0 and tm1 asked of fastest_profile's summary.json
+    tracerpid_tm0/tracerpid_tm1, which it records at the measured span's open and close, as bbload does.
+    The window is fastest_profile's MEASURED span (bb96279f3): timed.json's t0/t1 are its result/summary.json
+    tm0/tm1_realtime_s, inside the wrapper's process window, which timed.json carries as process_t0/process_t1 and which
+    must be t3lib.sh's own timed.window record (t0, t1, rc); its rc is the cell's adapter rc.
+    Returns (sweeper_cpu_s or None, sweeper_window or None, the refusals)."""
+    try:
+        tj = json.load(open(os.path.join(d, "timed.json")))
+    except (OSError, ValueError):
+        return None, None, ["no readable timed.json: the shared sweeper's record of this timed run is missing"]
+    if not isinstance(tj, dict):
+        return None, None, ["timed.json is not a record: the shared sweeper's record is unreadable"]
+    win = tj.get("sweeper_window")
+    try:
+        kv = dict(x.split("=", 1) for x in open(os.path.join(d, "timed.window")).read().split() if "=" in x)
+        tw = (float(kv["t0"]), float(kv["t1"]), int(kv["rc"]))
+    except (OSError, KeyError, ValueError):
+        tw = None
+    if adapter_rc is not None and tj.get("rc") != adapter_rc:
+        return None, win, [f"timed.json's rc {tj.get('rc')!r} is not the cell's adapter rc {adapter_rc}"]
+    if tw is None or (tj.get("process_t0"), tj.get("process_t1"), tj.get("rc")) != tw:
+        return None, win, [f"timed.json's process window and rc {(tj.get('process_t0'), tj.get('process_t1'), tj.get('rc'))!r}"
+                           f" are not timed.window's {tw!r}"]
+    if win != "measured":
+        return None, win, [f"timed.json names the sweeper window {win!r}, not 'measured' (fastest_profile's measured "
+                           "span, its summary.json tm0/tm1_realtime_s)"]
+    try:
+        sj = json.load(open(os.path.join(d, "result", "summary.json")))
+        tm = (sj["tm0_realtime_s"], sj["tm1_realtime_s"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None, win, ["result/summary.json carries no tm0_realtime_s/tm1_realtime_s: the measured span is unknown"]
+    if (tj.get("t0"), tj.get("t1")) != tm:
+        return None, win, [f"timed.json's window {(tj.get('t0'), tj.get('t1'))!r} is not summary.json's measured span "
+                           f"tm0_realtime_s/tm1_realtime_s {tm!r}"]
+    num = all(isinstance(x, (int, float)) and not isinstance(x, bool) for x in tm)
+    if not num or not tw[0] <= tm[0] <= tm[1] <= tw[1]:
+        return None, win, [f"the measured span {tm!r} lies outside the wrapper's process window {tw[:2]!r}"]
+    saved = list(sys.path)  # timedrun inserts its own gates path at import: restore the whole list, not a slice
+    try:
+        sys.path[:0] = [GATES, COMPETITORS]
+        import sweeper_record  # noqa: E402
+        import timedrun  # noqa: E402
+    except ImportError as e:
+        return None, win, [f"{e.name} cannot be imported: the sweeper's record cannot be re-derived or judged"]
+    finally:
+        sys.path[:] = saved
+    tp = timedrun.tracer_problems(os.path.join(d, "timed.tracer.tsv"),
+                                  {"tm0_realtime_s": tj.get("t0"), "tm1_realtime_s": tj.get("t1"),
+                                   "tracerpid_tm0": sj.get("tracerpid_tm0"), "tracerpid_tm1": sj.get("tracerpid_tm1")})
+    if tp:  # tracer_problems also carries the shared reader's own refusals
+        return None, win, [f"ours' timed run under the shared sweeper: {x}" for x in tp]
+    lines = open(os.path.join(d, "timed.tracer.tsv")).read().splitlines()
+    r, why = sweeper_record.sweeper_record(lines, tj.get("t0"), tj.get("t1"))
+    if r is None:
+        return None, win, ["the sweeper record is refused: " + "; ".join(why)]
+    bad = []
+    if tj.get("sweeper_cpu_s") != r["sweeper_cpu_s"]:
+        bad.append(f"timed.json says sweeper_cpu_s {tj.get('sweeper_cpu_s')!r}, its own record gives "
+                   f"{r['sweeper_cpu_s']!r}")
+    return (r["sweeper_cpu_s"] if not bad else None), win, bad
 
 
 def conformance_problems(out):
@@ -277,6 +470,61 @@ def conformance_problems(out):
     return bad
 
 
+# an out-of-space failure, as the kernel, libc, fio, strace and btrfs print it: the errno's text, its name, btrfs's
+# errno=-28, and btrfs's allocation failures. Case-sensitive: a record that only names the condition (enospc_count=0)
+# is not one
+ENOSPC_RE = re.compile(r"No space left on device|\bENOSPC\b|errno=-28\b|BTRFS[^\n]*(?:unable to allocate|failed to allocate|allocation failed)")
+
+
+def enospc_problems(out, fs, limit=5):
+    """Every out-of-space line in the block's files (out/fs-<fs>/, .gz read through), as 'path:line: text', at most
+    LIMIT named and the rest counted. The lead's DATA_GIB ruling (2026-10-16): the dry block's device is 16 GiB, so an
+    ENOSPC in any step refuses the block; it is never credited and never retried with a smaller setting."""
+    root = os.path.join(out, f"fs-{fs}")
+    hits, n = [], 0
+    for d, _dirs, files in os.walk(root):
+        for fn in sorted(files):
+            p = os.path.join(d, fn)
+            try:
+                f = gzip.open(p, "rt", errors="replace") if fn.endswith(".gz") else open(p, errors="replace")
+                with f:
+                    for k, ln in enumerate(f, 1):
+                        if ENOSPC_RE.search(ln):
+                            n += 1
+                            if len(hits) < limit:
+                                hits.append(f"{os.path.relpath(p, root)}:{k}: {ln.strip()[:160]}")
+            except (OSError, EOFError, zlib.error):
+                hits.append(f"{os.path.relpath(p, root)}: unreadable while scanning for ENOSPC")
+                n += 1
+    return hits + ([f"... and {n - len(hits)} more"] if n > len(hits) else [])
+
+
+def parent_record(d):
+    """the run's result/fixture.json (every system's, in comp's schema), or None when it is missing or not an object"""
+    try:
+        fx = json.load(open(os.path.join(d, "result", "fixture.json")))
+    except (OSError, ValueError):
+        return None
+    return fx if isinstance(fx, dict) else None
+
+
+def one_parent(parents):
+    """ONE parent for every system in a block (gate-6 t3run HIGH 4): PARENTS = [(label, fixture.json or None)] of the
+    block's measured runs; every one that has a record must name the same rows and gen_seed_sha256 as the first.
+    (A run with no record is fixture_check's to report.) Returns the refusals."""
+    have = [(lb, fx) for lb, fx in parents if isinstance(fx, dict)]
+    if not have:
+        return []
+    ref_lb, ref = have[0]
+    bad = []
+    for lb, fx in have[1:]:
+        diff = [k for k in ("rows", "gen_seed_sha256") if fx.get(k) != ref.get(k)]
+        if diff:
+            bad.append(f"{lb}: one parent: " + ", ".join(f"{k} {fx.get(k)!r}, {ref_lb}'s {ref.get(k)!r}" for k in diff)
+                       + " (fixture.json)")
+    return bad
+
+
 def fixture_check(d, system, plan, dry):
     """One parent fixture for every system (gate-6 t3run HIGH 4; comp's gen_seed parent aged by FT_AGE, with
     FT_PREBRANCH live branches) and the package's mode (fourth lane review LOW 15): what the run itself recorded must
@@ -285,14 +533,20 @@ def fixture_check(d, system, plan, dry):
     if plan.get("age") is None or plan.get("live") is None:
         return ["the plan row has no age/live columns"]
     if system == "ours":
-        try:
-            fx = json.load(open(os.path.join(d, "result", "summary.json"))).get("fixture")
-        except (OSError, ValueError):
-            fx = None
+        # ours writes result/fixture.json in the competitors' schema (fastest_profile --seed-sql/--age-sql/--live):
+        # gen_seed's parent, aged, with the live branches made before the cells, its live count MEASURED
+        fx = parent_record(d)
         if not isinstance(fx, dict):
-            return ["ours records no fixture record (fastest_profile does not yet build the plan's parent: gen_seed "
-                    "rows, the age's single-row UPDATEs, the live branches)"]
-        got = {"age": fx.get("age"), "live": fx.get("live")}
+            return ["ours records no fixture record (result/fixture.json: fastest_profile builds the plan's parent "
+                    "only under --seed-sql, --age-sql and --live)"]
+        for k in ("rows", "age_updates", "prebranch", "live_branches"):
+            if type(fx.get(k)) is not int or fx[k] < 0:
+                bad.append(f"fixture.json {k} {fx.get(k)!r} is not a count")
+        if bad:
+            return bad
+        if fx["live_branches"] != fx["prebranch"]:
+            bad.append(f"fixture.json live_branches {fx['live_branches']} (measured), prebranch {fx['prebranch']}")
+        got = {"age": fx["age_updates"], "live": fx["prebranch"]}
     else:
         try:
             line = open(os.path.join(d, "result", "run-info.txt")).readline()
@@ -306,6 +560,24 @@ def fixture_check(d, system, plan, dry):
     for k in ("age", "live"):
         if got[k] != plan[k]:
             bad.append(f"fixture {k} {got[k]!r}, planned {plan[k]!r}")
+    return bad + readback_problems(parent_record(d))
+
+
+def readback_problems(fx):
+    """fixture.py write's own comparison, judged here from its record (every system): the engine's read-back of t
+    (count|sum|row_hash) must equal the generator's facts and the fed streams' digests the generator's; a missing
+    record or field is a refusal, never a pass"""
+    if not isinstance(fx, dict):
+        return ["no fixture.json (the parent's read-back is unknown)"]
+    bad = []
+    rb, want = fx.get("readback"), fx.get("expected_readback")
+    if not isinstance(rb, dict) or not isinstance(want, dict):
+        bad.append(f"fixture.json has no read back of t ({rb!r}) beside the generator's ({want!r})")
+    elif rb != want:
+        bad.append(f"the engine read back {rb}, the generator wrote {want} (fixture.json)")
+    st, est = fx.get("stream_sha256"), fx.get("expected_streams")
+    if not isinstance(st, dict) or st != est:
+        bad.append(f"fed stream digests {st!r} are not the generator's {est!r} (fixture.json)")
     return bad
 
 
@@ -337,6 +609,10 @@ def summarize(out, sha, dry, manifest):
     wtext = open(wt).read().split() if os.path.exists(wt) else []
     rule = wtext[2] if len(wtext) > 2 and wtext[:2] == ["warm-up", "rule"] else None
     runs, incomplete, failed_checks, parity, fixture = [], [], [], [], []
+    warm = []  # every warm-up refusal (A23): the credit field is derived from all of them (review 7 finding 7)
+    parents = {}  # block -> [(label, fixture.json)] of its measured runs, for the one-parent rule
+    uncredited = []  # every nonzero exception-counter delta inside a window: labels its cell uncredited
+    sweeper_bad = []  # every sweeper refusal (MED 12 ruling): sweeper_creditable is derived from them and the windows
     for fs, cell, system in planned:
         a = attempts.get((fs, cell), [])
         last = a[-1] if a else None
@@ -357,10 +633,11 @@ def summarize(out, sha, dry, manifest):
                 # the verdict is the LAST 'VERDICT ' line (T3 runner review LOW 21). run_system.sh exits 0 on PASS and
                 # 1 on FAIL, so a FAIL arrives at rc 1: complete raws of a failed check, its FAIL lines kept (fourth
                 # lane review LOW 21); any other rc (a kill, a refusal) is an incomplete run (LOW 12)
+                fv = functional_verdict(text)
                 vl = [l.strip() for l in text.splitlines() if l.startswith("VERDICT ")]
                 verdict = vl[-1] if vl else None
                 rc_ = last["adapter_rc"]
-                if verdict == "VERDICT PASS":
+                if fv == "PASS":
                     result = rc_ == 0
                 elif verdict is not None:
                     result = rc_ in (0, 1)
@@ -368,7 +645,7 @@ def summarize(out, sha, dry, manifest):
                     result = False
                 why = verdict if result else f"no functional VERDICT (adapter rc {rc_})" if verdict is None else \
                     f"functional {verdict} written but the adapter exited {rc_}"
-                if result and verdict != "VERDICT PASS":
+                if result and fv != "PASS":
                     failed_checks.append(f"{fs}/{cell}: " + "; ".join(
                         l for l in text.splitlines() if l.startswith("FAIL ")))
         st = os.path.join(d, "settle.txt") if d else None
@@ -377,16 +654,18 @@ def summarize(out, sha, dry, manifest):
         r = {"fs": fs, "cell": cell, "system": system, "attempts": a, "complete": result, "note": why,
              "measured": measured, "settle": settle, "plan": prow.get((fs, cell))}
         if measured:
-            r.update(run_parity(d, system))
+            r.update(run_parity(d, system, last["adapter_rc"]))
             want = (prow.get((fs, cell)) or {}).get("ops")
             # timedrun.py's own verdict first: it names why a competitor's timed run cannot stand
             for tcell, v in r.get("timed_verdicts") or []:
-                if v != "ok":
+                if not timed_verdict_ok(v, dry):
                     what = v if v == "no timed.json" else f"timedrun verdict {v!r}"
                     parity.append(f"{fs}/{cell}: timed run {tcell}: {what}")
             for x in r["warmup_rules"] or [None]:
                 if x is None or x != rule:
                     parity.append(f"{fs}/{cell}: warm-up rule {x!r}, the package's {rule!r}")
+                    # C27 LOW: a rule refusal is a warm-up refusal too, so warmup_creditable reads it (finding 7)
+                    warm.append(f"{fs}/{cell}: warm-up rule {x!r}, the package's {rule!r}")
             for x in r["ops_measured"] or [None]:
                 if x is None or x != want:
                     parity.append(f"{fs}/{cell}: measured {x!r} ops, planned {want!r}")
@@ -394,16 +673,33 @@ def summarize(out, sha, dry, manifest):
                 parity.append(f"{fs}/{cell}: ops_total_asked {r.get('ops_total_asked')!r}, planned {want!r}")
             for x in r.get("expected_missing") or []:
                 parity.append(f"{fs}/{cell}: {x}")
+            # the engine's branch exception counters (routing ruling 05:16:51Z): recorded for every run of ours; a
+            # missing or unreadable record refuses, a nonzero delta in any (credited) window labels the cell uncredited
+            for x in r.get("exception_counter_problems") or []:
+                parity.append(f"{fs}/{cell}: {x}")
+            if system == "ours":
+                hot = [f"{fs}/{cell}: window {wn}: {k} +{v}" for wn, dd in (r.get("exception_counter_deltas") or {}).items()
+                       for k, v in dd.items() if v]
+                r["counters_credited"] = r.get("exception_counter_deltas") is not None and not hot
+                uncredited += hot
+            # MED 12 ruling: the shared sweeper's cost is known for every timed run (ours re-derived, theirs read)
+            for x in r.get("sweeper_problems") or []:
+                parity.append(f"{fs}/{cell}: sweeper (MED 12): {x}")
+                sweeper_bad.append(parity[-1])
             # A23: no claim judged out of time order, in either loop mode (the lead's ruling, DECISIONS 0be36a068b);
             # the loop is reported in runs[].warmup_loops, never used to excuse one
             for tcell, b in r.get("warmup_backsteps") or []:
                 if type(b) is not int or b != 0:
-                    parity.append(f"{fs}/{cell}: timed run {tcell}: warm-up backsteps {b!r}: claims judged out of time "
-                                  "order (PREREG annex A23; refused in either loop mode)")
+                    warm.append(f"{fs}/{cell}: timed run {tcell}: warm-up backsteps {b!r}: claims judged out of time "
+                                "order (PREREG annex A23; refused in either loop mode)")
+                    parity.append(warm[-1])
             fixture += [f"{fs}/{cell}: {x}" for x in fixture_check(d, system, prow.get((fs, cell)) or {}, dry)]
+            parents.setdefault(fs, []).append((f"{fs}/{cell}", parent_record(d)))
         runs.append(r)
         if not result:
             incomplete.append(f"{fs}/{cell}: {why}")
+    for fs_ in sorted(parents):
+        fixture += one_parent(parents[fs_])
     # No cross-system equal-total rule (fourth lane review HIGH 2; the PREREG sizes n_run per system from that
     # system's own t-hat, overriding gate-6 item 12): each run is held to its own plan row above, nothing more.
     fl = os.path.join(out, "fslist.txt")
@@ -412,7 +708,7 @@ def summarize(out, sha, dry, manifest):
     mt0 = os.path.join(out, "mode.txt")
     if os.path.exists(mt0):
         plp = dict(l.split("=", 1) for l in open(mt0).read().splitlines() if "=" in l).get("plp") or "no"
-    blocks = [block_record(out, fs, plp) for fs in fslist]
+    blocks = [block_record(out, fs, plp, dry) for fs in fslist]
     # each run is normalised by its own block's pooled V3L p50 (PREREG line 180; gate-6 review 9)
     pooled = {b["fs"]: b.get("v3l_pooled_by_block") or {} for b in blocks}
     verdicts = {b["fs"]: {pr["k"]: pr["verdict"] for pr in (b.get("v3l") or {}).get("blocks") or []} for b in blocks}
@@ -427,6 +723,9 @@ def summarize(out, sha, dry, manifest):
     unquiet = [f"{r['fs']}/{r['cell']}: " + (r["settle"] or "no settle.txt") for r in runs
                if r["measured"] and (not r["settle"] or "quiet=yes" not in r["settle"].split())]
     failed_blocks = [f"{b['fs']}: " + " | ".join(b["why"]) for b in blocks if not b["ok"]]
+    # the lead's DATA_GIB ruling: any ENOSPC or btrfs allocation failure in any step of a block refuses it
+    for fs in fslist:
+        failed_blocks += [f"{fs}: ENOSPC refuses the block (DATA_GIB ruling): {x}" for x in enospc_problems(out, fs)]
     if not fslist:
         failed_blocks.append("fslist.txt missing or empty: no block was planned")
     mode = {}
@@ -443,18 +742,80 @@ def summarize(out, sha, dry, manifest):
                "complete_runs": sum(r["complete"] for r in runs), "incomplete": incomplete,
                "failed_checks": failed_checks, "failed_blocks": failed_blocks, "warmup_rule": rule,
                "parity_refusals": parity, "fixture_refusals": fixture, "normaliser_missing": normaliser,
-               "unquiet_runs": unquiet,
+               "unquiet_runs": unquiet, "uncredited_cells": uncredited,
+               # every measured ours run's exception counters read and unchanged in every window (None: no ours run)
+               "counters_creditable": (None if not any(r["measured"] and r["system"] == "ours" for r in runs) else
+                                       not uncredited and all(r.get("counters_credited") is True for r in runs
+                                                              if r["measured"] and r["system"] == "ours")),
                "failed_stages": failed, "blocks": blocks, "runs": runs}
     # review 5 MED 6: the warm-up is creditable only with a bound three-driver conformance record (PREREG annex A23)
     conf = conformance_problems(out)
     parity += [f"warm-up (A23): {x}" for x in conf]
-    summary["warmup_creditable"] = not conf
+    # creditable only when NO warm-up refusal stands: the conformance binding, every backstep (review 7 finding 7) and
+    # every warm-up rule refusal (C27 LOW)
+    summary["warmup_creditable"] = not conf and not warm
     summary["loud_owed"] = (["the three-driver warm-up conformance run (PREREG annex A23), on this package's own "
                              "bbload, clonebench and fastest_profile"] if conf else [])
+    # MED 12 ruling: an ours-vs-competitor timed ratio credits only when every measured run's sweeper_cpu_s is known
+    # over the same kind of window, its measured one (ours_sweeper refuses any other window for ours)
+    wins = [x for r in runs if r["measured"] for x in r.get("sweeper_windows") or [None]]
+    summary["sweeper_creditable"] = bool(wins) and not sweeper_bad and all(x == "measured" for x in wins)
+    # the lead's ruling on f2abbc8cb: until fastest_profile emits the counters every ours run is refused above, and the
+    # gap is owed here, beside the window stamps, from the record's absence (a structural flag, not the refusal text)
+    if any(r.get("exception_counters_absent") for r in runs if r["measured"]):
+        summary["loud_owed"].append("fastest_profile must emit exception_counters {before, after} in every window "
+                                    "(Database::branch_exception_counters() read at each window's open and close; "
+                                    "a driver built with the engine that has it, fastest-linux-exc): until then "
+                                    "every ours run is refused (routing ruling 05:16:51Z)")
     # lane review LOW 7 and 10: a failed competitor check and a package that measured nothing both fail the run
     summary["measured_runs"] = sum(r["measured"] for r in runs)
+    # the lead's --dry-block ruling (2026-10-15): a dry run on a VM's virtual disk is stamped DRY-VIRT (mode.txt stamp,
+    # OUT/STAMP). The only stamp there is; a DRY-VIRT stamp on a run that is not a dry run is a contradiction
+    stamp = mode.get("stamp") or None
+    mode_refusals = []
+    if stamp not in (None, "DRY-VIRT"):
+        mode_refusals.append(f"mode.txt names the stamp {stamp!r}; DRY-VIRT is the only stamp a run carries")
+    if stamp == "DRY-VIRT" and (dry != "1" or mode.get("dry") != "1"):
+        mode_refusals.append(f"a DRY-VIRT run says dry={mode.get('dry')!r} (package dry={dry!r}): a run on a virtual "
+                             "disk is a dry run, never a real one")
+    # the lead's DATA_GIB ruling: a DRY-VIRT run discloses how it differs from the T3 box (t3run --dry-block writes
+    # dry-virt.txt: today the data device's size); a DRY-VIRT run without it has its differences undisclosed
+    if stamp == "DRY-VIRT":
+        dv = os.path.join(out, "dry-virt.txt")
+        lines = [l.strip() for l in open(dv).read().splitlines() if l.strip()] if os.path.exists(dv) else []
+        summary["dry_virt_differences"] = lines
+        if not lines:
+            mode_refusals.append("a DRY-VIRT run with no dry-virt.txt: its differences from the T3 box are undisclosed")
+    summary["stamp"], summary["mode_refusals"] = stamp, mode_refusals
+    # credit: every reason this package's numbers cannot be credited, so one field answers (False for any dry run)
+    credit = []
+    if dry == "1":
+        credit.append("a dry run is never credited")
+    if stamp == "DRY-VIRT":
+        credit.append("DRY-VIRT: a dry run on a VM's virtual disk, behind a hypervisor whose flush path is unknown")
+    for k in ("warmup_creditable", "sweeper_creditable", "counters_creditable"):
+        if summary.get(k) is not True:
+            credit.append(f"{k} is {summary.get(k)!r}")
+    # the lead's rule-3 condition (b): a V3 fire-check rule judged NOT APPLICABLE (v3/check.py check(..., na=True); today
+    # only F4:R_leaf_remote on a virtio_blk leaf the probe ruled virtualized) is marked in the package and refuses credit.
+    # An unreadable verdict is not read here: blockgate binds the verdict, and refuses the block without it
+    na = []
+    for fs_ in sorted(os.listdir(out)):
+        vp = os.path.join(out, fs_, "v3-firecheck", "verdict.json")
+        if fs_.startswith("fs-") and os.path.isfile(vp):
+            try:
+                checks_ = json.load(open(vp)).get("checks") or []
+            except (OSError, ValueError, AttributeError):
+                continue
+            na += [f"{fs_[3:]}: {c['id']}" for c in checks_ if isinstance(c, dict) and c.get("na") is True]
+    summary["na_rules"] = na
+    if na:
+        credit.append(f"the V3 fire-check judged {len(na)} rule(s) N/A, and a package holding an N/A rule is never "
+                      f"credited: {', '.join(na)}")
+    summary["credit_refusals"], summary["creditable"] = credit, not credit
     ok = bool(planned) and not incomplete and not failed and not failed_blocks and not failed_checks \
-        and summary["measured_runs"] > 0 and not parity and not fixture and not normaliser and not unquiet
+        and summary["measured_runs"] > 0 and not parity and not fixture and not normaliser and not unquiet \
+        and not mode_refusals
     summary["ok"] = ok  # the one verdict the workflow reads (fourth lane review LOW 23)
     return summary, ok
 
@@ -472,6 +833,7 @@ def main(out, sha, dry, manifest):
 def self_test():
     """Synthetic packages, the V3 batches in the probe's c225124ae shape: one good block, then each way a block or the
     package can be incomplete."""
+    na_cases = []  # the cases this host cannot run (each printed as N/A-on-<cause>)
     def w(path, text):
         os.makedirs(os.path.dirname(path), exist_ok=True)
         open(path, "w").write(text)
@@ -479,7 +841,7 @@ def self_test():
     N = v3l.N
     RULE = "1000:10:180"
 
-    def v3lj(verdict="VALID", lie=False, bins=(10000, 5), block="loop"):
+    def v3lj(verdict="VALID", lie=False, bins=(10000, 5), block="loop", mode="dry"):
         """A full V3L record: VALID arms, or VOID arms (5,000 fsyncs, as the fsync-half plant); lie=True records VALID
         over VOID arms (review L5). A brd block's record is a ram disk's, as the real one is (ram0, write through, the
         probe's 'none (RAM)', no flush counted: fourth lane review HIGH 3's second half); any other is a write-back
@@ -503,9 +865,17 @@ def self_test():
                                          "iostats": "1"},
              "published": {"fsync_p50_us": 10.0, "fsync_over_control_write_p50": 5.0},
              "arms": {"fsync": arm(fs, fs - 1), "control": arm(0, 0)}}
-        # the sync before each run, as v3l.py measure() records it since annex A24
+        # TEST EDIT, flagged (review 7 / C21 findings 4, 5): the record names its mode (these packages are dry) and the
+        # sync path resolve_leaf named, as v3l.py measure() records them; new required fields at their passing values
+        r["mode"], r["slack_registered"] = mode, "A27"
+        r["leaf"]["sync_paths"] = ["/mnt/t3-x/v3l"]
+        # the sync before each run, as v3l.py measure() records it since annex A24. TEST EDIT, flagged (repairs an
+        # unseen break of b7de8cb22, review 6 MED 2 / annex A24-AM1): the record also carries its one `sync -f` entry
+        # (DIR's filesystem; no loop layer), rc 0, a new required field at its passing value. Without it v3l.block()'s
+        # gates re-run VOIDs every VALID fixture here on the coverage rule ("synced no filesystems")
         for a in r["arms"].values():
-            a["sync"] = {"labelling": {"ran": True, "rc": 0}, "timed": {"ran": True, "rc": 0}}
+            a["sync"] = {run: {"ran": True, "rc": 0, "layers": [{"path": "/mnt/t3-x/v3l", "rc": 0, "secs": 0.0}]}
+                         for run in ("labelling", "timed")}
         return json.dumps(r)
 
     def v3sum(rc, block, plp="no", a25=300.0, void=None):
@@ -533,6 +903,83 @@ def self_test():
 
     SHAS = {"bbload": "b" * 64, "clonebench": "c" * 64, "fastest_profile": "f" * 64}
 
+    EXC = ("hardcap_upgrades", "header_raise_exclusive", "inline_compaction_syncs", "compaction_waits")
+
+    def ours_windows(kind="ok"):
+        """fastest_profile's summary.json windows with the engine's four branch exception counters read at each window's
+        open and close (the lead's routing ruling, DECISIONS 2026-10-15T05:16:51Z; Database::branch_exception_counters()).
+        TEST EDIT, flagged (fresh read of 4529742d8, finding 1): the windows are now what --mode phases with 4 phases
+        measures (create, connect, write, delete; fastest_profile main.rs PHASES), so the coverage rule can hold them
+        to it; the ok case's expected deltas follow (unruled, unrun red f2abbc8cb).
+        kind: ok (four windows, every counter 7 -> 7), nonzero (the write window's compaction_waits 7 -> 9, the delete
+        window's 9 -> 9), missing (the
+        write window has no exception_counters), noname (its after lacks compaction_waits), backwards (hardcap_upgrades
+        4 -> 2), notint (inline_compaction_syncs after is "9"), boolean (header_raise_exclusive before is true),
+        nowindows (no windows at all), dropwin (no delete window), extrawin (a cycle window too), unnamed (the connect
+        window has no name), crossback (create reads hardcap_upgrades 8 -> 8, then connect 7 -> 7: the engine's counter
+        fell between windows), short (the run says phases_run 1 and lists create alone)"""
+        if kind == "nowindows":
+            return []
+        out = []
+        for name in (("create",) if kind == "short" else ("create", "connect", "write", "delete")
+                     + (("cycle",) if kind == "extrawin" else ())):
+            if name == "delete" and kind == "dropwin":
+                continue
+            before, after = {k: 7 for k in EXC}, {k: 7 for k in EXC}
+            if name == "delete" and kind == "nonzero":  # the counter never falls: delete opens where write closed
+                before["compaction_waits"] = after["compaction_waits"] = 9
+            if name == "create" and kind == "crossback":
+                before["hardcap_upgrades"] = after["hardcap_upgrades"] = 8
+            win = {"window": name, "secs": 1.0}
+            if name == "connect" and kind == "unnamed":
+                del win["window"]
+            if name == "write":
+                if kind == "nonzero":
+                    before["compaction_waits"], after["compaction_waits"] = 7, 9
+                elif kind == "noname":
+                    del after["compaction_waits"]
+                elif kind == "backwards":
+                    before["hardcap_upgrades"], after["hardcap_upgrades"] = 4, 2
+                elif kind == "notint":
+                    after["inline_compaction_syncs"] = "9"
+                elif kind == "boolean":
+                    before["header_raise_exclusive"] = True
+            if not (name == "write" and kind == "missing"):
+                win["exception_counters"] = {"before": before, "after": after}
+            out.append(win)
+        return out
+
+    def sweeper_files(a1, kind="ok"):
+        """ours' timed-run records under the shared sweeper (the lead's MED 12 ruling; t3lib.sh ours_timed_run and
+        ours_timed_record): timed.tracer.tsv in gates/sweeper.sh's format and timed.json. By hand: sweeps every 0.05 s
+        from 100.00 with cpu = index at clk_tck 100; the window [100.1, 100.3] is bracketed by the sweeps at 100.10
+        (cpu 2) and 100.30 (cpu 6): 4 ticks / 100 = 0.04 s. kind: ok, None (no timed.json), nice0 (the reader refuses
+        the record), stored (timed.json says 0.5, not the 0.04 its record gives), notracer (no timed.tracer.tsv),
+        traced (a sweep found a task with TracerPid 4321), gap (0.45 s with no sweep, the window still bracketed),
+        window (timed.window says t0 100.15, timed.json 100.1), rc (timed.json rc 1, the cell's adapter rc 0).
+        TEST EDIT, flagged as a SPEC CHANGE (fastest_profile stamps its measured span since bb96279f3): the window is the
+        run's MEASURED span, summary.json's tm0/tm1_realtime_s [100.1, 100.3], inside the wrapper's process window
+        [100.05, 100.4] (timed.window; timed.json process_t0/process_t1). Kinds added: processwin (timed.json still
+        names the 'process' window), outside (the process window ends at 100.25, before the measured span does)"""
+        if kind is None:
+            return
+        nice = 0 if kind == "nice0" else 19
+        if kind != "notracer":
+            sweeps = "".join(f"SWEEP {'start' if i == 0 else 'mid'} {100.0 + 0.05 * i + (0.4 if kind == 'gap' and i > 6 else 0):.6f}"
+                             f" cmd=3:{4321 if kind == 'traced' and i == 4 else 0} srv=0:0 cpu={i}\n" for i in range(10))
+            w(f"{a1}/timed.tracer.tsv", f"roles cmd=500 srv=none tree=children\nsweeper pid=600 nice={nice} clk_tck=100\n"
+              + ("TRACED mid cmd 501 501 4321\n" if kind == "traced" else "") + sweeps)
+        # TEST EDIT, flagged (the MED 12 fix list): t3lib.sh's own window record, which timed.json must agree with
+        pt0, pt1 = (100.15 if kind == "window" else 100.05), (100.25 if kind == "outside" else 100.4)
+        w(f"{a1}/timed.window", f"t0={pt0} t1={pt1} rc=0\n")
+        w(f"{a1}/timed.json", json.dumps({"system": "ours", "sweeper_window": "process" if kind == "processwin"
+                                          else "measured", "t0": 100.1, "t1": 100.3, "process_t0": 100.05,
+                                          "process_t1": 100.25 if kind == "outside" else 100.4,
+                                          "rc": 1 if kind == "rc" else 0,
+                                          "sweeper_cpu_s": 0.5 if kind == "stored" else 0.04,
+                                          "sweeper_cpu_span_s": [100.1, 100.3], "sweeper_nice": nice,
+                                          "sweeper_clk_tck": 100, "sweeper_refused": None}))
+
     def conformance_files(out, kind="match"):
         """what t3run's build and envchecks stages write: binaries.txt (sha256sum of the package's binaries) and
         warmup-conformance.json (warmup_conformance.py run --record, review 5 MED 6, 7). kind: match, None (no
@@ -553,7 +1000,8 @@ def self_test():
              plan_ops=None, plan_cols=9, drift_json_us=None, bound=False, timed=None, age=200, live=20,
              ours_fixture="plan", comp_info="plan", expected=("c1-create", "c1-m1"), verdict_text=None,
              boundary_bins=None, garbage_v3l=None, v3l_plants_record=None, conformance="match", backsteps=0,
-             loop="closed"):
+             loop="closed", v3l_mode="dry", ours_sweeper="ok", comp_sweeper=0.04, ours_counters="ok", ours_tm="ok", ours_tp="ok",
+             stamp=None, mode_dry="1", fire_na=None, enospc=None, dryvirt="auto"):
         out = os.path.join(root, "out")
         conformance_files(out, conformance)
         w(f"{out}/stages.tsv", "stage\tstart_utc\tend_utc\tseconds\trc\nfs-xfs\ta\tb\t5\t0\nTOTAL\ta\tb\t9\t0\n")
@@ -565,7 +1013,13 @@ def self_test():
             rows.append(f"xfs\t{c}\t{system}\t1\t1\t{rc_}\t{v_}")
         w(f"{out}/cells.tsv", "fs\tcell\tsystem\tclients\tattempt\tadapter_rc\tvoid\n" + "\n".join(rows) + "\n")
         w(f"{out}/fslist.txt", fslist + "\n")
-        w(f"{out}/mode.txt", f"dry=1\nblock={block}\nplant=\nplp={plp}\n")
+        w(f"{out}/mode.txt", f"dry={mode_dry}\nblock={block}\nplant=\nplp={plp}\n"
+          + (f"stamp={stamp}\n" if stamp is not None else ""))
+        # TEST EDIT, flagged (the lead's DATA_GIB ruling, DECISIONS 2026-10-16): a DRY-VIRT run discloses how it differs
+        # from the T3 box (dry-virt.txt, t3run --dry-block); "auto" writes it for a DRY-VIRT stamp
+        if (dryvirt == "auto" and stamp == "DRY-VIRT") or dryvirt is True:
+            w(f"{out}/dry-virt.txt", "data device: vdb, 17179869184 bytes (16 GiB, the VM's DATA_GIB); the T3 box's is its "
+                                     "NVMe's full size\n")
         if rule is not None:
             w(f"{out}/warmup.txt", f"warm-up rule {rule} (cap 1800s)\n")
         f = f"{out}/fs-xfs"
@@ -577,16 +1031,43 @@ def self_test():
             if settle is not None:
                 w(f"{a1}/settle.txt", f"dev=loop0 settle_s=2.2 {settle} inflight=0 dirty_kb=10 writes/discards/flushes=1/0/1\n")
             if system == "ours":
-                fx = {"age": age, "live": live} if ours_fixture == "plan" else ours_fixture
-                w(f"{a1}/result/summary.json", json.dumps({"warmup_rule": ours_rule, "ops_total": ours_ops[0],
-                                                           "ops_total_asked": ours_ops[1]}
-                                                          | ({"fixture": fx} if fx is not None else {})))
+                # TEST EDIT, flagged (the owed ours fixture record, 2026-10-16): ours writes result/fixture.json in the
+                # competitors' schema (one parent for every system), so "plan" writes it there at the plan's values;
+                # a dict overrides its fields; None writes none
+                fx = None
+                if ours_fixture is not None:
+                    # (and the read-back and stream digests beside the generator's, as fixture.py write records them)
+                    fx = {"system": "ours", "rows": 10000, "age_updates": age, "prebranch": live, "live_branches": live,
+                          "gen_seed_sha256": "d" * 64, "readback": {"count": 10000, "sum": 7, "row_hash": 9}, "expected_readback": {"count": 10000, "sum": 7, "row_hash": 9}, "stream_sha256": {"sql": "a", "age": "b"}, "expected_streams": {"sql": "a", "age": "b"}}
+                    if ours_fixture != "plan":
+                        fx.update(ours_fixture)
+                    w(f"{a1}/result/fixture.json", json.dumps(fx))
+                # TEST EDIT, flagged (the lead's routing ruling, DECISIONS 2026-10-15T05:16:51Z): ours' summary.json
+                # gains its windows with the four exception counters, a new required record at its passing value
+                w(f"{a1}/result/summary.json", "[]" if ours_counters == "notobject" else json.dumps(
+                    {"warmup_rule": ours_rule, "ops_total": ours_ops[0], "ops_total_asked": ours_ops[1],
+                     "mode": "phases", "phases_run": 1 if ours_counters == "short" else 4,
+                     "windows": ours_windows(ours_counters)}
+                    # TEST EDIT, flagged (SPEC CHANGE, bb96279f3): the measured span ours' sweeper is read over
+                    | ({} if ours_tm == "absent" else {"tm0_realtime_s": 100.12 if ours_tm == "differs" else 100.1,
+                                                       "tm1_realtime_s": 100.3})
+                    # TEST EDIT, flagged: fastest_profile's own TracerPid at the measured span's open and close, as
+                    # the competitors' load generator records it (the checks summarize used to drop for ours)
+                    | ({} if ours_tp == "absent" else {"tracerpid_tm0": 0,
+                                                       "tracerpid_tm1": 4321 if ours_tp == "traced" else 0})
+                    ))
                 w(f"{a1}/adapter.txt", "NOT AVAILABLE: no async class\n" if cell == "na" else "")
+                # TEST EDIT, flagged (the lead's MED 12 ruling, DECISIONS 2026-10-15T04:21:48Z): ours' timed run now
+                # leaves the shared sweeper's record and timed.json; a new required record at its passing value
+                sweeper_files(a1, ours_sweeper)
             else:
                 verdict = verdict_text or ("FAIL F1: something\nVERDICT FAIL\n" if cell == "compfail"
-                                           else "PASS F1\nVERDICT PASS\n")
+                                           else "PASS F1\nVERDICT PASS (dolt)\n")
                 w(f"{a1}/result/functional.txt", verdict)
                 info = f"dry=1 age={age} prebranch={live}" if comp_info == "plan" else comp_info
+                w(f"{a1}/result/fixture.json", json.dumps({"system": "dolt", "rows": 10000, "age_updates": age,
+                                                           "prebranch": live, "live_branches": live,
+                                                           "gen_seed_sha256": "d" * 64, "readback": {"count": 10000, "sum": 7, "row_hash": 9}, "expected_readback": {"count": 10000, "sum": 7, "row_hash": 9}, "stream_sha256": {"sql": "a", "age": "b"}, "expected_streams": {"sql": "a", "age": "b"}}))
                 if info is not None:
                     w(f"{a1}/result/run-info.txt", f"system=dolt kind=dolt rows=10000 cap_s=1800 warmup={RULE} {info} "
                                                    "parent_sum=1\n")
@@ -594,13 +1075,20 @@ def self_test():
                     w(f"{a1}/result/expected-cells.txt", "".join(e + "\n" for e in expected))
                 for cc in ("c1-create", "c1-m1"):
                     # timed: None (an uncapped run of comp_ops), or (measured_ops, capped, timedrun's verdict)
-                    mo, cap, tv = timed if timed else (comp_ops, False, "ok")
+                    # TEST EDIT, flagged (the writer-format class, 2026-10-15): the fixtures write the competitors'
+                    # records as timedrun.py and run_system.sh now write them: a dry package's verdict 'ok-smoke', the
+                    # measured count timed_measured_ops, functional.txt ending "VERDICT PASS (dolt)"
+                    mo, cap, tv = timed if timed else (comp_ops, False, "ok-smoke")
                     w(f"{a1}/result/cells/{cc}/timed/summary.json",
                       json.dumps({"warmup_rule": RULE, "measured_ops": mo, "capped": cap, "verdict": "ok", "rc": 0}
                                  | ({"warmup_backsteps": backsteps} if backsteps is not None else {})
                                  | ({"loop": loop} if loop is not None else {})))
+                    # TEST EDIT, flagged (MED 12 ruling): timedrun.py's timed.json carries sweeper_cpu_s (comp
+                    # 44f272499); a new required field at its passing value (None: the field absent)
                     if tv is not None:
-                        w(f"{a1}/result/cells/{cc}/timed.json", json.dumps({"verdict": tv, "ops": comp_ops}))
+                        w(f"{a1}/result/cells/{cc}/timed.json", json.dumps(
+                            {"verdict": tv, "timed_measured_ops": comp_ops}
+                            | ({"sweeper_cpu_s": comp_sweeper} if comp_sweeper != "absent" else {})))
                 w(f"{a1}/adapter.txt", "")
         w(f"{f}/block.txt", f"cell={'xfs' if block == 'brd' else 'xfsloop'}\nblock={block}\n")
         w(f"{f}/v3.rc", f"before rc={before_rc}\nafter rc=0\n")
@@ -617,6 +1105,13 @@ def self_test():
                 w(f"{f}/v3-firecheck/verdict.json", vt)
                 w(f"{f}/v3-{when}/binary.txt", f"v3floor_sha256={'e' * 64}\nbound=fire-checked: /runner/fs-xfs/v3-firecheck/"
                                                f"verdict.json\nverdict_sha256={hashlib.sha256(vt.encode()).hexdigest()}\n")
+        if fire_na is not None:  # the V3 fire-check's verdict, one rule marked N/A when fire_na names it (rule-3 (b))
+            chk_ = [{"id": "F1b:real-all", "pass": True}, {"id": "F4:R_leaf_remote", "pass": True}]
+            for c_ in chk_:
+                if c_["id"] == fire_na:
+                    c_.update(na=True, detail={"why": "not applicable: a virtio_blk leaf has no SCSI host or NVMe "
+                                                      "transport, and the probe ruled it virtualized"})
+            w(f"{f}/v3-firecheck/verdict.json", json.dumps({"v3floor_sha256": "e" * 64, "checks": chk_}))
         if drift is not None:
             d = round(a25_after - 300.0, 1) if drift_json_us is None else drift_json_us
             dj = {"outcome": drift, "arms": {"append25": {"start_p50_us": 300.0, "end_p50_us": a25_after, "drift_us": d}},
@@ -632,7 +1127,7 @@ def self_test():
             w(f"{f}/blockgate-plants.json", json.dumps({"plants": res, "all_fired": ok and plants_fired}))
         bounds = [f"b{i}" for i in range(k + 1)]
         bb = boundary_bins or [(10000, 5)] * (k + 1)
-        w(f"{f}/v3l-b0/v3l.json", v3lj(before_v3l, lie, bb[0], block))
+        w(f"{f}/v3l-b0/v3l.json", v3lj(before_v3l, lie, bb[0], block, v3l_mode))
         for i, b in enumerate(bounds[1:], 1):
             if i == 1 and after_v3l is None:
                 continue
@@ -647,6 +1142,10 @@ def self_test():
             os.unlink(f"{f}/{drop}")
         if garbage_v3l:  # an unreadable measurement, written after its plants record
             w(f"{f}/{garbage_v3l}/v3l.json", "{not json")
+        # ENOSPC (the same ruling): ENOSPC=(relative path under fs-xfs, text) plants an out-of-space line in the block,
+        # last, so no record written above overwrites it
+        if enospc is not None:
+            w(f"{out}/fs-xfs/{enospc[0]}", enospc[1])
         return out
 
     def first(s, key):
@@ -658,6 +1157,10 @@ def self_test():
         ("item 5 red test: the BEFORE batch refused (rc 2, no out dir) fails the package", {"before_rc": 2}, False, None),
         ("an AFTER batch with rc 0 but no raw.tsv fails the package", {"drop": "v3-after/raw.tsv"}, False, None),
         ("item 6: a VOID V3L after fails the package", {"after_v3l": "VOID"}, False, None),
+        # review 7 / C21 finding 4: a V3L record's mode must be its package's (an explicit dry label is kept; a record
+        # saying real inside a dry package, or the reverse, cannot stand for that package)
+        ("finding 4: a V3L record labelled real inside a dry package fails its block, naming the mode",
+         {"v3l_mode": "real"}, False, lambda s: "mode" in s["failed_blocks"][0]),
         ("item 6: a missing V3L after fails the package", {"after_v3l": None}, False, None),
         ("item 6: a VOID V3L before with no after (the run stopped) reads VOID, not MISSING",
          {"before_v3l": "VOID", "after_v3l": None}, False,
@@ -681,8 +1184,10 @@ def self_test():
         ("A14: the plants record missing fails the block", {"plants": False}, False, None),
         ("A14: a plant that did not fire fails the block", {"plants_fired": False}, False, None),
         ("review L5: a VALID recorded over VOID arms fails the block", {"lie": True}, False, None),
-        # T3 runner review item 6: with a stored plants record that passes, the block fails through block()'s own
-        # re-derivation, on its text (the case above also fails through the plants path, so it could not see L5 go)
+        # T3 runner review item 6: the block must fail on block()'s own re-derivation, on its text. Corrected (review 5
+        # LOW 26): a passing stored plants record does not take the plants path out. summarize re-derives the plants
+        # from the record, the lie record's VOID arms fail plants()' control, and its recorded VALID keeps that reason,
+        # so this case fails on BOTH paths. Only the text lambda below sees L5's re-derivation go (it kills mutant 6a)
         ("item 6: a VALID recorded over VOID arms, stored plants passing, fails on block()'s re-derivation text",
          {"lie": True, "v3l_plants_record": {"plants": [], "all_fired": True}}, False,
          lambda s: "disagrees with the gates re-run" in s["failed_blocks"][0]),
@@ -709,7 +1214,7 @@ def self_test():
         ("MED 3: a competitor's timed run at other than the planned ops fails (parity)", {"cell": "comp", "comp_ops": 199},
          False, lambda s: "199" in first(s, "parity_refusals")),
         ("MED 4: a competitor run ended by the cap (150 of 200 ops) that timedrun ok'd is complete, with reduced n",
-         {"cell": "comp", "timed": (150, True, "ok")}, True,
+         {"cell": "comp", "timed": (150, True, "ok-smoke")}, True,
          lambda s: s["runs"][0].get("reduced_n") == {"c1-create": 150, "c1-m1": 150}),
         ("MED 4: a capped run timedrun refused (fewer than 1000 ok ops) fails",
          {"cell": "comp", "timed": (80, True, "REFUSED: capped with 80 ok ops (< 1000)")}, False,
@@ -721,6 +1226,15 @@ def self_test():
          lambda s: "no timed.json" in first(s, "parity_refusals")),
         ("MED 3: no package warm-up rule (warmup.txt) fails (parity)", {"rule": None}, False,
          lambda s: "the package's None" in first(s, "parity_refusals")),
+        # C27 LOW: warmup_creditable is derived from EVERY warm-up refusal (review 7 finding 7), the rule's included:
+        # it read True while "warm-up rule X, the package's Y" stood (ours, a competitor, no warmup.txt rule)
+        ("C27 LOW: ours recording another warm-up rule makes warmup_creditable False",
+         {"ours_rule": "1000:10:999"}, False, lambda s: s.get("warmup_creditable") is False
+         and "warm-up rule '1000:10:999'" in first(s, "parity_refusals")),
+        ("C27 LOW: a competitor whose rule is not the package's makes warmup_creditable False",
+         {"cell": "comp", "rule": "1000:10:999"}, False, lambda s: s.get("warmup_creditable") is False),
+        ("C27 LOW: no package warm-up rule (warmup.txt) makes warmup_creditable False",
+         {"rule": None}, False, lambda s: s.get("warmup_creditable") is False),
         ("MED 3: ours planned 150 ops, asked and measured 150 passes", {"plan_ops": [150], "ours_ops": (150, 150)}, True, None),
         # TEST EDIT, flagged (fourth lane review MED 5 / T3 runner review item 9, gating chosen by the lane): this case
         # said a run that did not settle is "listed, not gated" (ok True); it now fails the package, still listed
@@ -737,7 +1251,24 @@ def self_test():
         ("HIGH 4 (fixture parity): ours recording no fixture fails", {"ours_fixture": None}, False,
          lambda s: any("no fixture record" in x for x in s["fixture_refusals"])),
         ("HIGH 4: ours whose fixture differs from its plan row (live 10 vs 20) fails",
-         {"ours_fixture": {"age": 200, "live": 10}}, False, lambda s: any("live" in x for x in s["fixture_refusals"])),
+         {"ours_fixture": {"prebranch": 10, "live_branches": 10}}, False,
+         lambda s: any("live" in x for x in s["fixture_refusals"])),
+        # the owed ours fixture record: ours' fixture.json, in the competitors' schema, holds its MEASURED live count
+        ("ours fixture: a measured live_branches 19 under a planned prebranch of 20 fails, naming live_branches",
+         {"ours_fixture": {"live_branches": 19}}, False,
+         lambda s: any("live_branches" in x for x in s["fixture_refusals"])),
+        # fixture.py write records the engine's read-back and the fed streams' digests beside the generator's; summarize
+        # reads that comparison for every system rather than trusting write's exit code
+        ("ours fixture: a read-back that differs from the generator's fails, naming the read-back",
+         {"ours_fixture": {"readback": {"count": 10000, "sum": 8, "row_hash": 9}}}, False,
+         lambda s: any("read back" in x for x in s["fixture_refusals"])),
+        ("ours fixture: no read-back fails, naming it", {"ours_fixture": {"readback": None}}, False,
+         lambda s: any("read back" in x for x in s["fixture_refusals"])),
+        ("ours fixture: stream digests that are not the generator's fail, naming them",
+         {"ours_fixture": {"stream_sha256": {"sql": "a", "age": "x"}}}, False,
+         lambda s: any("stream" in x for x in s["fixture_refusals"])),
+        ("ours fixture: a fixture.json that is not an object fails as no fixture record",
+         {"ours_fixture": {"rows": None}}, False, lambda s: any("rows" in x for x in s["fixture_refusals"])),
         ("HIGH 4: a competitor whose run-info age differs from its plan row fails",
          {"cell": "comp", "comp_info": "dry=1 age=0 prebranch=20"}, False,
          lambda s: any("age" in x for x in s["fixture_refusals"])),
@@ -794,21 +1325,232 @@ def self_test():
          lambda s: s.get("warmup_creditable") is False and any("rc 3" in x for x in s["parity_refusals"])),
         ("MED 6: a record whose fastest_profile sha256 is not the package's refuses, naming it", {"conformance": "badsha"},
          False, lambda s: any("fastest_profile" in x and "sha256" in x for x in s["parity_refusals"])),
+        # TEST EDIT, flagged (review 7 / C21 finding 7; a strengthening): each backstep negative also requires
+        # warmup_creditable false, as A23 and the field's docstring say; it read true while the backstep refused
         ("MED 6: a competitor timed run with a warm-up backstep refuses", {"cell": "comp", "backsteps": 1}, False,
-         lambda s: any("backstep" in x for x in s["parity_refusals"])),
+         lambda s: any("backstep" in x for x in s["parity_refusals"]) and s.get("warmup_creditable") is False),
         ("MED 6: a backstep refuses in open loop too (loop is only reported)", {"cell": "comp", "backsteps": 2,
                                                                                "loop": "open"}, False,
-         lambda s: any("backstep" in x for x in s["parity_refusals"])),
+         lambda s: any("backstep" in x for x in s["parity_refusals"]) and s.get("warmup_creditable") is False),
         ("MED 6: a competitor timed run that records no warmup_backsteps refuses", {"cell": "comp", "backsteps": None},
-         False, lambda s: any("backstep" in x for x in s["parity_refusals"])),
+         False, lambda s: any("backstep" in x for x in s["parity_refusals"]) and s.get("warmup_creditable") is False),
         ("MED 6: a clean competitor run (closed loop, 0 backsteps) passes and reports its loop", {"cell": "comp"}, True,
          lambda s: s["runs"][0].get("warmup_loops") == ["closed", "closed"]),
+        # the lead's MED 12 ruling (DECISIONS 2026-10-15T04:21:48Z): SAME INSTRUMENT FOR EVERY SYSTEM. Every measured
+        # run's timed.json records sweeper_cpu_s; ours' is re-derived from its own tracer record over its own window by
+        # the one reader (gates/sweeper_record.py), never read from the stored value. Ours' window is its whole process
+        # (before bb96279f3 ours' window was its whole process, so no ratio credited: sweeper_creditable false)
+        # TEST EDIT, flagged as a SPEC CHANGE (bb96279f3: fastest_profile stamps its measured span, so ours' sweeper is
+        # read over it as the competitors' is; the lead's 05:24:11Z ruling tied sweeper_creditable false to that gap)
+        ("MED 12: ours with its sweeper record passes, carries sweeper_cpu_s 0.04 over its MEASURED span, creditable",
+         {}, True, lambda s: s["runs"][0].get("sweeper_cpu_s") == [0.04] and s["runs"][0].get("sweeper_windows")
+         == ["measured"] and s.get("sweeper_creditable") is True
+         and not any("sweeper" in x and "process" in x for x in s.get("loud_owed") or [])),
+        # the tracer checks summarize dropped for ours (fastest_profile recorded no TracerPid of its own): it records
+        # them now, at the measured span's open and close, so the competitors' rule applies whole
+        ("tracerpid: ours whose own TracerPid at tm1 is 4321 fails, naming tracerpid_tm1", {"ours_tp": "traced"}, False,
+         lambda s: any("tracerpid_tm1" in x for x in s["parity_refusals"])),
+        ("tracerpid: ours recording no TracerPid of its own fails, naming tracerpid_tm0", {"ours_tp": "absent"}, False,
+         lambda s: any("tracerpid_tm0" in x for x in s["parity_refusals"])),
+        ("measured span: a timed.json still naming the process window fails", {"ours_sweeper": "processwin"}, False,
+         lambda s: any("'process'" in x for x in s["parity_refusals"])),
+        ("measured span: summary.json's tm0 (100.12) other than timed.json's t0 (100.1) fails, naming tm0",
+         {"ours_tm": "differs"}, False, lambda s: any("tm0_realtime_s" in x for x in s["parity_refusals"])),
+        ("measured span: a summary.json with no tm0/tm1_realtime_s fails", {"ours_tm": "absent"}, False,
+         lambda s: any("tm0_realtime_s" in x for x in s["parity_refusals"])),
+        ("measured span: a measured span outside the wrapper's process window fails", {"ours_sweeper": "outside"},
+         False, lambda s: any("outside" in x for x in s["parity_refusals"])),
+        # the lead's --dry-block ruling (DECISIONS, 2026-10-15): a dry run on a VM's virtual disk is stamped DRY-VIRT, and
+        # summarize refuses it for credit; every dry run is uncreditable, and a DRY-VIRT stamp on a run that says it
+        # is real is a contradiction that fails the package
+        # the lead's rule-3 condition (b), 2026-10-15: a fire-check rule judged not applicable (F4:R_leaf_remote on a
+        # virtio_blk leaf the probe ruled virtualized) is marked N/A in the package (na_rules) and refuses credit
+        ("rule-3 (b): a fire-check verdict holding an N/A rule lists it in na_rules and refuses credit, naming it",
+         {"fire_na": "F4:R_leaf_remote"}, True,
+         lambda s: s.get("na_rules") == ["xfs: F4:R_leaf_remote"] and s.get("creditable") is False
+         and any("N/A" in x and "F4:R_leaf_remote" in x for x in s.get("credit_refusals") or [])),
+        ("rule-3 (b) control: a fire-check verdict with no N/A rule lists none and adds no N/A credit refusal",
+         {"fire_na": "none"}, True,
+         lambda s: s.get("na_rules") == [] and not any("N/A" in x for x in s.get("credit_refusals") or [])),
+        # the lead's DATA_GIB ruling (DECISIONS 2026-10-16): the VM's data device is 16 GiB, so any ENOSPC or btrfs
+        # allocation failure in any step REFUSES the block (never credited, never retried smaller); and a DRY-VIRT run
+        # discloses its differences from the T3 box
+        ("DATA_GIB: a cell whose adapter says 'No space left on device' refuses the block, naming ENOSPC",
+         {"enospc": ("cells/ours-full-c1-r1/a1/adapter.txt", "fio: write: No space left on device\n")}, False,
+         lambda s: any("ENOSPC" in x and "adapter.txt" in x for x in s["failed_blocks"])),
+        ("DATA_GIB: a block kernel log with a btrfs allocation failure (errno=-28) refuses the block",
+         {"enospc": ("kernel-log.txt", "BTRFS: error (device vdb state A) in btrfs_alloc_chunk: errno=-28 No space left\n")},
+         False, lambda s: any("ENOSPC" in x and "kernel-log.txt" in x for x in s["failed_blocks"])),
+        ("DATA_GIB: a strace line returning ENOSPC refuses the block",
+         {"enospc": ("cells/ours-full-c1-r1/a1/load.strace", "4100 pwrite64(3, \"\"..., 4096, 0) = -1 ENOSPC (No space left on device)\n")},
+         False, lambda s: any("ENOSPC" in x for x in s["failed_blocks"])),
+        ("DATA_GIB control: words that only name the condition (a count of 0, 'enospc_count') do not refuse",
+         {"enospc": ("cells/ours-full-c1-r1/a1/notes.txt", "enospc_count=0 retries_on_space=0\n")}, True, None),
+        ("DATA_GIB: a DRY-VIRT run discloses its data device size (dry_virt_differences)", {"stamp": "DRY-VIRT"}, True,
+         lambda s: any("16 GiB" in x for x in s.get("dry_virt_differences") or [])),
+        ("DATA_GIB: a DRY-VIRT run with no dry-virt.txt fails, its differences undisclosed",
+         {"stamp": "DRY-VIRT", "dryvirt": False}, False,
+         lambda s: any("dry-virt.txt" in x for x in s.get("mode_refusals") or [])),
+        ("dry-block: a DRY-VIRT dry package passes as a dry run and is refused for credit, naming DRY-VIRT",
+         {"stamp": "DRY-VIRT"}, True, lambda s: s.get("stamp") == "DRY-VIRT" and s.get("creditable") is False
+         and any("DRY-VIRT" in x for x in s.get("credit_refusals") or [])),
+        ("dry-block: an ordinary dry package is refused for credit as a dry run", {}, True,
+         lambda s: s.get("creditable") is False and any("dry run" in x for x in s.get("credit_refusals") or [])),
+        ("dry-block: a DRY-VIRT stamp on a package whose mode says dry=0 fails it, naming DRY-VIRT",
+         {"stamp": "DRY-VIRT", "mode_dry": "0"}, False,
+         lambda s: any("DRY-VIRT" in x for x in s.get("failed_stages", []) + s.get("parity_refusals", [])
+                       + s.get("fixture_refusals", []) + s.get("mode_refusals", []))),
+        ("dry-block: a stamp other than DRY-VIRT (an unknown label) fails the package", {"stamp": "DRY-VM"}, False,
+         lambda s: any("DRY-VM" in x for x in s.get("mode_refusals", []))),
+        ("MED 12: ours with no timed.json fails, naming the sweeper", {"ours_sweeper": None}, False,
+         lambda s: any("sweeper" in x and "timed.json" in x for x in s["parity_refusals"])),
+        ("MED 12: ours with no timed.tracer.tsv fails, naming it", {"ours_sweeper": "notracer"}, False,
+         lambda s: any("timed.tracer.tsv" in x for x in s["parity_refusals"])),
+        ("MED 12: ours whose sweeper ran at nice 0 fails on the reader's refusal", {"ours_sweeper": "nice0"}, False,
+         lambda s: any("nice 0" in x for x in s["parity_refusals"])),
+        ("MED 12: ours whose timed.json says 0.5 where its record gives 0.04 fails on the re-derivation",
+         {"ours_sweeper": "stored"}, False, lambda s: any("0.5" in x and "0.04" in x for x in s["parity_refusals"])),
+        ("MED 12: a competitor timed.json without sweeper_cpu_s fails, naming it", {"cell": "comp",
+                                                                                     "comp_sweeper": "absent"},
+         False, lambda s: any("sweeper_cpu_s" in x for x in s["parity_refusals"])),
+        ("MED 12: a competitor timed.json with sweeper_cpu_s null fails", {"cell": "comp", "comp_sweeper": None},
+         False, lambda s: any("sweeper_cpu_s" in x for x in s["parity_refusals"])),
+        # the MED 12 fix list (fresh read of 44083dd2f..fac30eeec): ours' tracer record is held to the competitors'
+        # untraced-run rules by their own implementation (timedrun.py tracer_problems), timed.json agrees with the
+        # run's own window record and rc, and a competitor's sweeper_cpu_s must be finite
+        ("MED 12 fix 1: ours whose tracer record shows a traced task fails, naming it", {"ours_sweeper": "traced"},
+         False, lambda s: any("traced during the timed run" in x for x in s["parity_refusals"])
+         and any("saw a TracerPid" in x for x in s["parity_refusals"])),
+        ("MED 12 fix 1: ours whose sweeps leave a 0.45 s gap fails, naming the gap", {"ours_sweeper": "gap"}, False,
+         lambda s: any("stretch with no sweep" in x for x in s["parity_refusals"])),
+        ("MED 12 fix 1: the clean ours record raises no tracer refusal (its own TracerPid 0 at tm0 and tm1)",
+         {}, True, lambda s: not any("tracer" in x.lower() for x in s["parity_refusals"])),
+        ("MED 12 fix 3: ours whose timed.json window is not its timed.window fails", {"ours_sweeper": "window"}, False,
+         lambda s: any("timed.window" in x for x in s["parity_refusals"])),
+        ("MED 12 fix 3: ours whose timed.json rc (1) is not the cell's adapter rc (0) fails", {"ours_sweeper": "rc"},
+         False, lambda s: any("adapter rc" in x for x in s["parity_refusals"])),
+        ("MED 12 fix 4: a competitor timed.json with sweeper_cpu_s NaN fails", {"cell": "comp",
+                                                                               "comp_sweeper": float("nan")},
+         False, lambda s: any("sweeper_cpu_s" in x for x in s["parity_refusals"])),
+        ("MED 12 fix 4: a competitor timed.json with sweeper_cpu_s Infinity fails", {"cell": "comp",
+                                                                                    "comp_sweeper": float("inf")},
+         False, lambda s: any("sweeper_cpu_s" in x for x in s["parity_refusals"])),
+        # the lead's routing ruling (DECISIONS 2026-10-15T05:16:51Z): every Linux T3 run records the engine's four branch
+        # exception counters; summarize records each window's delta (after - before, re-derived), and a nonzero delta
+        # inside a credited window labels the cell uncredited. A missing or unreadable record is a refusal
+        ("exception counters: ours with every window's counters unchanged passes, credited, with each window's deltas",
+         {}, True, lambda s: s["runs"][0].get("exception_counter_deltas") == {w: {k: 0 for k in EXC}
+                                                                             for w in ("create", "connect", "write",
+                                                                                       "delete")}
+         and s["runs"][0].get("counters_credited") is True and s.get("uncredited_cells") == []
+         and s.get("counters_creditable") is True),
+        ("exception counters: compaction_waits 7 -> 9 in the write window labels the cell uncredited, naming it; the "
+         "package still passes", {"ours_counters": "nonzero"}, True,
+         lambda s: s["runs"][0].get("counters_credited") is False
+         and s["runs"][0]["exception_counter_deltas"]["write"]["compaction_waits"] == 2
+         and any("write" in x and "compaction_waits" in x and "+2" in x for x in s.get("uncredited_cells") or [])
+         and s.get("counters_creditable") is False),
+        # fresh read of 4529742d8: the windows must be the ones the run measured, each named, and no counter may fall
+        # between windows; a package-level counters_creditable; a summary.json that is not an object refuses
+        ("exception counters f1: a phases-4 run whose summary lists no delete window fails, naming it",
+         {"ours_counters": "dropwin"}, False, lambda s: any("delete" in x and "window" in x for x in s["parity_refusals"])),
+        ("exception counters f1: a window the run did not measure (cycle in a phases run) fails, naming it",
+         {"ours_counters": "extrawin"}, False, lambda s: any("cycle" in x for x in s["parity_refusals"])),
+        # second fresh read (975bba2cb) finding 1: coverage is judged against what t3run asked for (--mode phases, every
+        # phase), not against the run's own claim, so a run saying phases_run 1 cannot hide a hot write
+        ("exception counters r2 f1: a run saying phases_run 1 with create alone fails (t3run asks for all 4 phases)",
+         {"ours_counters": "short"}, False, lambda s: any("phases_run" in x for x in s["parity_refusals"])),
+        ("exception counters f2: a window with no name fails", {"ours_counters": "unnamed"}, False,
+         lambda s: any("no name" in x for x in s["parity_refusals"])),
+        ("exception counters f3: hardcap_upgrades falling between windows (create after 8, connect before 7) fails",
+         {"ours_counters": "crossback"}, False,
+         lambda s: any("hardcap_upgrades" in x and "between" in x for x in s["parity_refusals"])),
+        ("exception counters f5: a summary.json that is not an object refuses instead of crashing",
+         {"ours_counters": "notobject"}, False, lambda s: any("not an object" in x for x in s["parity_refusals"])),
+        ("exception counters: a window with no exception_counters fails, naming it", {"ours_counters": "missing"}, False,
+         lambda s: any("exception_counters" in x and "write" in x for x in s["parity_refusals"])),
+        ("exception counters: a counter missing from a window's after fails, naming it", {"ours_counters": "noname"},
+         False, lambda s: any("compaction_waits" in x for x in s["parity_refusals"])),
+        ("exception counters: a counter that went backwards (4 -> 2) fails", {"ours_counters": "backwards"}, False,
+         lambda s: any("hardcap_upgrades" in x and "backwards" in x for x in s["parity_refusals"])),
+        ("exception counters: a counter that is not an integer (\"9\") fails", {"ours_counters": "notint"}, False,
+         lambda s: any("inline_compaction_syncs" in x for x in s["parity_refusals"])),
+        ("exception counters: a counter that is a bool (true) fails", {"ours_counters": "boolean"}, False,
+         lambda s: any("header_raise_exclusive" in x for x in s["parity_refusals"])),
+        ("exception counters: ours whose summary.json has no windows fails", {"ours_counters": "nowindows"}, False,
+         lambda s: any("windows" in x for x in s["parity_refusals"])),
+        # the lead's ruling on f2abbc8cb (fail closed until fastest_profile emits the counters; Rust HELD): the gap is
+        # LOUD-OWED in summary.json next to the sweeper window stamps, and only while some run lacks the record
+        ("exception counters: no windows puts the fastest_profile emission on loud_owed", {"ours_counters": "nowindows"},
+         False, lambda s: any("exception_counters" in x and "fastest_profile" in x for x in s.get("loud_owed") or [])),
+        ("exception counters: a window without exception_counters puts it on loud_owed", {"ours_counters": "missing"},
+         False, lambda s: any("exception_counters" in x and "fastest_profile" in x for x in s.get("loud_owed") or [])),
+        ("exception counters: a complete record owes nothing", {}, True,
+         lambda s: not any("exception_counters" in x for x in s.get("loud_owed") or [])),
+        ("exception counters: a competitor run (not the turso engine) carries none and is not refused for it",
+         {"cell": "comp"}, True, lambda s: s["runs"][0].get("exception_counter_deltas") is None
+         and s.get("uncredited_cells") == []),
+        ("MED 12: a clean competitor run carries each timed run's sweeper_cpu_s over its measured window",
+         {"cell": "comp"}, True, lambda s: s["runs"][0].get("sweeper_cpu_s") == [0.04, 0.04]
+         and s["runs"][0].get("sweeper_windows") == ["measured", "measured"]),
     ]:
         root = tempfile.mkdtemp(prefix="summarize-st-")
         try:
             s, ok = summarize(make(root, **kw), "sha", "1", "m")
             good = ok == want_ok and (extra is None or bool(extra(s)))
             cases.append((name, good, s["failed_blocks"] + s["parity_refusals"] + s["incomplete"]))
+        finally:
+            shutil.rmtree(root)
+    # DATA_GIB's refusal fired by a REAL out-of-space error, not a typed string: a write to /dev/full fails with the
+    # kernel's own ENOSPC, its text goes into a cell's adapter.txt, and the block must refuse (Linux only: macOS has no
+    # /dev/full, so the case is N/A there, never a pass)
+    if sys.platform.startswith("linux") and os.path.exists("/dev/full"):
+        try:
+            fd = os.open("/dev/full", os.O_WRONLY)
+            try:
+                os.write(fd, b"x")
+                real = None
+            finally:
+                os.close(fd)
+        except OSError as e:
+            real = f"write /dev/full: {e}\n"
+        root = tempfile.mkdtemp(prefix="summarize-st-")
+        try:
+            s_, ok_ = summarize(make(root, enospc=("cells/ours-full-c1-r1/a1/adapter.txt", real or "")), "sha", "1", "m")
+            cases.append(("DATA_GIB fired by a real ENOSPC (/dev/full): the kernel's own error text refuses the block",
+                          real is not None and not ok_ and any("ENOSPC" in x for x in s_["failed_blocks"]),
+                          [real] + s_["failed_blocks"]))
+        finally:
+            shutil.rmtree(root)
+    else:
+        print(f"N/A-on-{sys.platform}: DATA_GIB fired by a real ENOSPC (/dev/full is Linux's)", flush=True)
+        na_cases.append("DATA_GIB real ENOSPC")
+    # the owed ours fixture record: ONE parent for every system in a block (gen_seed's rows and digest), so ours at
+    # fastest_profile's old default 1000 rows beside the competitors' 10000 fails (run 11 measured exactly that)
+    for name, ofx, cfx, want in (
+            ("one parent: ours and a competitor with the same rows and gen_seed digest pass", {}, {}, []),
+            ("one parent: ours at 1000 rows beside a competitor's 10000 fails, naming the rows", {"rows": 1000}, {},
+             ["rows"]),
+            ("one parent: another gen_seed digest fails, naming it", {}, {"gen_seed_sha256": "e" * 64},
+             ["gen_seed_sha256"])):
+        root = tempfile.mkdtemp(prefix="summarize-st-")
+        try:
+            out = make(root, ours_fixture=ofx or "plan")
+            with open(f"{out}/fs-xfs/plan.tsv", "a") as fh:
+                fh.write("dolt-full-c1-r1\tdolt\t1\t200\t1\tfull\t1\t200\t20\n")
+            with open(f"{out}/cells.tsv", "a") as fh:
+                fh.write("xfs\tdolt-full-c1-r1\tdolt\t1\t1\t0\tVALID\n")
+            a1 = f"{out}/fs-xfs/cells/dolt-full-c1-r1/a1"
+            w(f"{a1}/result/functional.txt", "VERDICT PASS (dolt)\n")
+            w(f"{a1}/result/run-info.txt", f"system=dolt kind=dolt rows=10000 cap_s=1800 warmup={RULE} dry=1 age=200 "
+                                           "prebranch=20 parent_sum=1\n")
+            w(f"{a1}/result/fixture.json", json.dumps({"system": "dolt", "rows": 10000, "age_updates": 200,
+                                                       "prebranch": 20, "live_branches": 20,
+                                                       "gen_seed_sha256": "d" * 64, "readback": {"count": 10000, "sum": 7, "row_hash": 9}, "expected_readback": {"count": 10000, "sum": 7, "row_hash": 9}, "stream_sha256": {"sql": "a", "age": "b"}, "expected_streams": {"sql": "a", "age": "b"}} | cfx))
+            s, _ok = summarize(out, "sha", "1", "m")
+            fr = s["fixture_refusals"]
+            good = (fr == []) if not want else any("one parent" in x and all(k in x for k in want) for x in fr)
+            cases.append((name, good, fr))
         finally:
             shutil.rmtree(root)
     # the cross-system rule needs two systems in one block: ours and a competitor planned other totals
@@ -824,7 +1566,9 @@ def self_test():
         w(f"{a1}/result/cells/c1-create/timed/summary.json", json.dumps({"warmup_rule": RULE, "measured_ops": 300,
                                                                          "warmup_backsteps": 0, "loop": "closed"}))
         # the records a competitor run writes (comp b49fb656a+): timedrun's verdict and the cells it had to produce
-        w(f"{a1}/result/cells/c1-create/timed.json", json.dumps({"verdict": "ok", "ops": 300}))
+        # TEST EDIT, flagged (MED 12 ruling): timed.json carries sweeper_cpu_s, at its passing value
+        w(f"{a1}/result/cells/c1-create/timed.json", json.dumps({"verdict": "ok-smoke", "timed_measured_ops": 300,
+                                                                  "sweeper_cpu_s": 0.04}))
         w(f"{a1}/result/expected-cells.txt", "c1-create\n")
         s, ok = summarize(out, "sha", "1", "m")
         # TEST EDIT, flagged (fourth lane review HIGH 2): this case pinned the withdrawn cross-system rule (it
@@ -853,13 +1597,19 @@ def self_test():
                 a1 = f"{out}/fs-{fs}/cells/{cell}/a1"
                 if system == "ours":
                     w(f"{a1}/result/summary.json", json.dumps({"warmup_rule": RULE, "ops_total": int(ops),
-                                                               "ops_total_asked": int(ops)}))
+                                                               "ops_total_asked": int(ops), "mode": "phases",
+                                                               "phases_run": 4, "tm0_realtime_s": 100.1,
+                                                               "tm1_realtime_s": 100.3, "tracerpid_tm0": 0,
+                                                               "tracerpid_tm1": 0,
+                                                               "windows": ours_windows()}))  # TEST EDIT, flagged
+                    sweeper_files(a1)  # TEST EDIT, flagged (MED 12 ruling): ours' sweeper record, passing
                 else:
                     w(f"{a1}/result/functional.txt", "VERDICT PASS\n")
                     w(f"{a1}/result/cells/c1/timed/summary.json", json.dumps({"warmup_rule": RULE,
                                                                               "measured_ops": int(ops),
                                                                               "warmup_backsteps": 0, "loop": "closed"}))
-                    w(f"{a1}/result/cells/c1/timed.json", json.dumps({"verdict": "ok", "ops": int(ops)}))
+                    w(f"{a1}/result/cells/c1/timed.json", json.dumps({"verdict": "ok-smoke", "timed_measured_ops": int(ops),
+                                                                      "sweeper_cpu_s": 0.04}))  # TEST EDIT, flagged
                     w(f"{a1}/result/expected-cells.txt", "c1\n")
         w(f"{out}/cells.tsv", "\n".join(rows) + "\n")
         s, _ = summarize(out, "sha", "1", "m")
@@ -876,11 +1626,40 @@ def self_test():
                       and b["v3l"]["published"]["pooled_fsync_p50_us"] == 10.0, None))
     finally:
         shutil.rmtree(root)
+    # PIN (not a red): RUNNER_MODE/RUNNER_PHASES are what t3run.sh asks fastest_profile for, read from its source, so a
+    # runner that changed --mode or added --phases fails here instead of every package
+    runner = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "t3run.sh")).read()
+    fp = [ln for ln in runner.splitlines() if "fastest_profile" in ln or "--mode" in ln or "--phases" in ln]
+    cases.append(("exception counters: t3run.sh runs fastest_profile with --mode phases and no --phases "
+                  f"(RUNNER_MODE {RUNNER_MODE!r}, RUNNER_PHASES {RUNNER_PHASES})",
+                  RUNNER_MODE == "phases" and RUNNER_PHASES == len(PHASES)
+                  and any("--mode phases" in ln for ln in fp) and not any("--phases" in ln for ln in fp), fp))
+    # CLASS (Ryan's class rule): summarize re-parsed records whose writers had changed, with nothing tying the two. The
+    # first full --dry-block run (2026-10-15) showed three instances on every competitor cell: timed.json's measured
+    # ops are "timed_measured_ops" now (summarize read "ops": "measured None ops"); a dry package's timedrun verdict is
+    # "ok-smoke" (summarize required "ok"); functional.txt's last line is "VERDICT PASS (dolt)" (summarize required the
+    # bare "VERDICT PASS", so a passing cell was listed in failed_checks with no FAIL line). The fix reads the
+    # writers' own format, and this case runs it on a REAL cell's records from that run (testdata, bytes as run)
+    td = os.path.join(os.path.dirname(os.path.abspath(__file__)), "testdata", "dryblock-20261015-dolt-xfs")
+    rp = run_parity(td, "dolt")
+    cases.append(("writer formats: a real dolt cell's timed runs measure 30 ops each, as its plan row asks",
+                  bool(rp["ops_measured"]) and all(x == 30 for x in rp["ops_measured"]), rp["ops_measured"]))
+    cases.append(("writer formats: 'ok-smoke' stands in a dry package and never in a real one",
+                  timed_verdict_ok("ok-smoke", "1") and not timed_verdict_ok("ok-smoke", "0") and timed_verdict_ok("ok", "0")
+                  and not timed_verdict_ok("REFUSED: x", "1"), None))
+    fv = functional_verdict(open(os.path.join(td, "result", "functional.txt")).read())
+    cases.append(("writer formats: the real functional.txt's 'VERDICT PASS (dolt)' reads as PASS", fv == "PASS", fv))
+    cases.append(("writer formats: a last VERDICT FAIL (dolt) after a PASS reads as FAIL; no VERDICT line reads as None",
+                  functional_verdict("VERDICT PASS (dolt)\nFAIL F1\nVERDICT FAIL (dolt): 1 check(s) failed\n") == "FAIL"
+                  and functional_verdict("PASS F1\n") is None, None))
     bad = [c for c in cases if not c[1]]
     for n, ok, fb in cases:
         print(f"SUMMARIZE self-test {'PASS' if ok else 'FAIL'}: {n}" + (f" (why {fb})" if fb and not ok else ""))
-    print(f"SUMMARIZE SELF-TEST {len(cases) - len(bad)}/{len(cases)} {'PASS' if not bad else 'FAIL'}")
-    return 0 if not bad else 1
+    print(f"TALLY ran={len(cases)} pass={len(cases) - len(bad)} na={len(na_cases)} fail={len(bad)}")  # gates/tally.py
+    print(f"SUMMARIZE SELF-TEST {len(cases) - len(bad)}/{len(cases)} {'PASS' if not bad else 'FAIL'}"
+          + (f" ({len(na_cases)} N/A)" if na_cases else ""))
+    # an N/A is its own outcome, exit 3, never a pass (linux-rev-uw1 HIGH 1)
+    return 1 if bad else 3 if na_cases else 0
 
 
 if __name__ == "__main__":
