@@ -196,9 +196,11 @@ def selftest():
     sys.path.insert(0, HERE)
     import test_reduce_concurrency as t
     r = unittest.TextTestRunner(verbosity=2, stream=sys.stdout).run(unittest.defaultTestLoader.loadTestsFromModule(t))
-    n, bad = r.testsRun, len(r.failures) + len(r.errors)
-    print(f"TALLY ran={n} pass={n - bad} na=0 fail={bad}")
-    return 1 if bad or not n else 0
+    # linux-rev-fc20226b9 LOW 4: a skipped case is N/A (rc 3), never a pass, and an unexpected success is a failure
+    n, na = r.testsRun, len(r.skipped)
+    bad = len(r.failures) + len(r.errors) + len(r.unexpectedSuccesses)
+    print(f"TALLY ran={n} pass={n - bad - na} na={na} fail={bad}")
+    return 1 if bad or not n else 3 if na else 0
 
 
 def main(argv):
