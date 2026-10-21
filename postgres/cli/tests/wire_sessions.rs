@@ -16436,6 +16436,35 @@ fn a_decimal_past_15_digits_is_refused_on_every_path() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// wire-rev-7128c6f73 L6 (its PG 18.6 probe4 #50, #62-#64): a type change whose stored form is the same is not one the
+/// engine would keep unconverted: numeric(10,2) to numeric(12,2) (the scale kept, the precision widened), float8 to double
+/// precision and boolean to boolean. They were refused 0A000 with "the engine would keep the column's values
+/// unconverted", which is false for them; they pass the wire and meet the engine's same-name refusal
+/// (PGDIV-ALTER-COLUMN-SAME-NAME). A scale change still changes the values and is still refused 0A000.
+#[test]
+fn an_alter_column_type_that_keeps_the_stored_form_is_not_refused_as_unconverted() {
+    let dir = Scratch::new("alter-same-form");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE sf(id int, n numeric(10,2), f float8, b boolean)").ok("create");
+    let mut wrong = Vec::new();
+    for sql in [
+        "ALTER TABLE sf ALTER COLUMN n TYPE numeric(12,2)",
+        "ALTER TABLE sf ALTER COLUMN f TYPE double precision",
+        "ALTER TABLE sf ALTER COLUMN b TYPE boolean",
+    ] {
+        let r = a.q(sql);
+        if r.error.as_ref().is_some_and(|e| e.code == "0A000") {
+            wrong.push(format!("{sql}: {:?}, not refused as unconverted (the stored form is the same)", r.error));
+        }
+    }
+    let r = a.q("ALTER TABLE sf ALTER COLUMN n TYPE numeric(10,3)");
+    if r.error.as_ref().map(|e| e.code.as_str()) != Some("0A000") {
+        wrong.push(format!("numeric(10,2) to numeric(10,3): {:?}, refused 0A000 (the scale changes the values)", r.error));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// wire-rev-cfdebc06d MED-3 (its PG 18.6 probe #109-#136): the engine's ALTER COLUMN keeps every stored value as it
 /// was, so the only type changes it could make as PostgreSQL does are those whose stored form is the same: within text
 /// and varchar, and an integer to a wider one. The allowlist also let through int to numeric (raw integers under a
