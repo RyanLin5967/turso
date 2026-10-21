@@ -27,7 +27,7 @@ pub(crate) fn resolve_scalar(name: &str, arg_count: usize) -> bool {
         "format_type" | "pg_get_constraintdef" | "pg_get_indexdef" | "obj_description" => &[1, 2],
         "pg_get_expr" => &[2, 3],
         "to_char" | "pg_input_is_valid" | "booleq" | "boolne" | "col_description" | "bpchareq"
-        | "encode" | "bpcharlt" => &[2],
+        | "encode" | "bpcharlt" | "pg_text_int" => &[2],
         "version" | "current_database" | "current_schema" | "pg_backend_pid" => &[0],
         "now" | "transaction_timestamp" | "statement_timestamp" => &[0],
         "make_date" => &[3],
@@ -70,6 +70,17 @@ pub(crate) fn exec_scalar(conn: &Connection, name: &str, args: &[Value]) -> Resu
             args.first().unwrap_or(&Value::Null),
             &text_arg(1),
         )),
+        // A text column's value cast to an integer type, read as int2in/int4in/int8in read it:
+        // 22P02 for anything but an integer, 22003 past the type (wire-rev-1de981755-numeric MED-1).
+        // Any other value passes to the cast unchanged.
+        "pg_text_int" => match args.first() {
+            Some(Value::Text(t)) => match validate_pg_input(t.as_str(), &text_arg(1)) {
+                Some((message, kind)) => Err(LimboError::Constraint(SqlErrorMessage::classified(kind, message))),
+                None => Ok(t.as_str().trim().parse::<i64>().map(Value::from_i64).unwrap_or_else(|_| Value::build_text(t.as_str().to_string()))),
+            },
+            Some(other) => Ok(other.clone()),
+            None => Ok(Value::Null),
+        },
         // character(n)'s `=` and `<` (catalog.rs BPCHAR_TYPE_SQL): trailing blanks are not
         // significant, as PostgreSQL's bpchareq and bpcharlt (wire review 2 item 3). Both sides
         // are trimmed, so an operand the engine did not encode compares the same.

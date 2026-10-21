@@ -232,6 +232,10 @@ pub struct PostgreSQLTranslator {
     /// lowercased ([`PostgreSQLTranslator::with_known_types`]): a cast to one is kept by name, so
     /// the engine runs its checks.
     known_types: Option<std::collections::HashSet<String>>,
+    /// The casts to an integer type (by their parse locations) whose operand is a column the caller
+    /// knows is declared text ([`PostgreSQLTranslator::with_text_integer_casts`]): read as int4in
+    /// reads text, where a numeric(p, s) column's decimal text rounds.
+    text_integer_casts: Option<std::collections::HashSet<i32>>,
     /// The cast targets this translation met that are neither built-in nor known, lowercased, for
     /// the caller to look up ([`PostgreSQLTranslator::unmapped_cast_types`]). A cast to a domain
     /// was dropped here, so `CAST(-5 AS dm)` skipped dm's CHECK and returned -5 (the domain CHECK
@@ -309,6 +313,15 @@ impl PostgreSQLTranslator {
     /// its name, so the engine runs the type's checks and coercion.
     pub fn with_known_types(mut self, names: std::collections::HashSet<String>) -> Self {
         self.known_types = Some(names);
+        self
+    }
+
+    /// The translator, told which casts to an integer type read a column declared text (by the
+    /// TypeCast's parse location): each reads its text as int2in/int4in/int8in do, 22P02 for '2.5'
+    /// (wire-rev-1de981755-numeric MED-1: the decimal-text arm rounded it to 3, being unable to
+    /// tell a text column from a numeric(p, s) column's decimal text).
+    pub fn with_text_integer_casts(mut self, locations: std::collections::HashSet<i32>) -> Self {
+        self.text_integer_casts = Some(locations);
         self
     }
 
@@ -3931,6 +3944,27 @@ impl PostgreSQLTranslator {
                         arg.node.as_ref(),
                         Some(pg_query::protobuf::node::Node::ColumnRef(_) | pg_query::protobuf::node::Node::ParamRef(_))
                     );
+                    if integer && self.text_integer_casts.as_ref().is_some_and(|l| l.contains(&type_cast.location)) {
+                        let label = match t.names.last().and_then(|n| match &n.node {
+                            Some(pg_query::protobuf::node::Node::String(s)) => Some(s.sval.to_ascii_lowercase()),
+                            _ => None,
+                        }).as_deref() {
+                            Some("int2" | "smallint") => "smallint",
+                            Some("int8" | "bigint") => "bigint",
+                            _ => "integer",
+                        };
+                        return Ok(ast::Expr::Cast {
+                            expr: Box::new(ast::Expr::FunctionCall {
+                                name: pg_name("pg_text_int"),
+                                distinctness: None,
+                                args: vec![Box::new(self.translate_expr(arg)?), Box::new(ast::Expr::Literal(sql_string(label)))],
+                                order_by: vec![],
+                                within_group: vec![],
+                                filter_over: ast::FunctionTail { filter_clause: None, over_clause: None },
+                            }),
+                            type_name: pg_type_name_to_ast_type(t),
+                        });
+                    }
                     if integer && rereadable {
                         let x = || self.translate_expr(arg);
                         let ty = pg_type_name_to_ast_type(t);
