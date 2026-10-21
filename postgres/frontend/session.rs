@@ -2152,6 +2152,7 @@ fn prepare_statement_parsed(
             types.inconsistent = walked.inconsistent;
             types.arithmetic_operands = walked.arithmetic_operands;
             types.compared_operands = walked.compared_operands;
+            types.column_assignments = walked.column_assignments;
             types.assignments = walked.assignments;
             types.columns = crate::result_types::aggregate_types(&aggregates, &walked.columns);
         }
