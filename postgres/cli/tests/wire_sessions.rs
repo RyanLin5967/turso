@@ -16790,6 +16790,83 @@ fn interval_time_and_timestamp_values_are_never_computed_over_text() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// wire-rev-1de981755-rest MED-3 and MED-2 (its PG 18.6 probe2 #1-#19, #26-#29 and probe #48, #56-#65): a relation
+/// named in another database is 0A000 'cross-database references are not implemented: "db.schema.name"' wherever it
+/// stands: REFERENCES (column and table constraint, ALTER ... ADD FOREIGN KEY), SELECT INTO, CREATE and ALTER SEQUENCE,
+/// and COMMENT ON COLUMN's four names; the reads missed them, so each acted on this database (a foreign key onto the
+/// local nu, a table, a sequence). A list naming this database's relation and a member of it (COMMENT ON COLUMN
+/// public.n.a, COMMENT ON CONSTRAINT c ON public.n, DROP TRIGGER t ON public.n) is no cross-database reference: b159ce8b8
+/// refused those 0A000.
+#[test]
+fn every_cross_database_reference_is_refused_and_only_those() {
+    let dir = Scratch::new("xdb-all");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let this = a.q("SELECT current_database()").single("current_database");
+    for sql in [
+        "CREATE TABLE nu(a int primary key)",
+        "INSERT INTO nu VALUES (1)",
+        "CREATE TABLE z3 (a int)",
+        "CREATE TABLE n(a int)",
+        "ALTER TABLE n ADD CONSTRAINT nck CHECK (a > 0)",
+    ] {
+        a.q(sql).ok(sql);
+    }
+    let refused = |name: &str| Err(format!("0A000 cross-database references are not implemented: \"{name}\""));
+    let cases: Vec<(String, Result<&str, String>)> = vec![
+        ("CREATE TABLE z (a int REFERENCES otherdb.public.nu(a))".into(), refused("otherdb.public.nu")),
+        ("CREATE TABLE z2 (a int, FOREIGN KEY (a) REFERENCES otherdb.public.nu(a))".into(), refused("otherdb.public.nu")),
+        ("ALTER TABLE z3 ADD FOREIGN KEY (a) REFERENCES otherdb.public.nu(a)".into(), refused("otherdb.public.nu")),
+        ("ALTER TABLE z3 ADD CONSTRAINT fk2 FOREIGN KEY (a) REFERENCES otherdb.public.nu".into(), refused("otherdb.public.nu")),
+        ("INSERT INTO z3 VALUES (98)".into(), Ok("INSERT 0 1")),
+        ("SELECT 1 AS a INTO otherdb.public.si".into(), refused("otherdb.public.si")),
+        ("CREATE TABLE otherdb.public.ctas AS SELECT 1 AS a".into(), refused("otherdb.public.ctas")),
+        ("CREATE SEQUENCE otherdb.public.s2".into(), refused("otherdb.public.s2")),
+        ("ALTER SEQUENCE otherdb.public.s2 RESTART".into(), refused("otherdb.public.s2")),
+        ("COMMENT ON COLUMN otherdb.public.nu.a IS 'x'".into(), refused("otherdb.public.nu")),
+        ("COMMENT ON COLUMN public.nu.a IS 'x'".into(), Ok("COMMENT")),
+        ("COMMENT ON COLUMN nu.a IS 'see v1.2.3'".into(), Ok("COMMENT")),
+        ("COMMENT ON CONSTRAINT nu_pkey ON public.nu IS 'see 1.2'".into(), Ok("COMMENT")),
+        ("COMMENT ON COLUMN public.n.a IS 'col'".into(), Ok("COMMENT")),
+        (format!("COMMENT ON COLUMN {this}.public.n.a IS 'col4'"), Ok("COMMENT")),
+        (format!("COMMENT ON TABLE {this}.public.n IS 'tbl'"), Ok("COMMENT")),
+        ("COMMENT ON CONSTRAINT nck ON public.n IS 'ck'".into(), Ok("COMMENT")),
+    ];
+    let mut wrong = Vec::new();
+    for (sql, want) in &cases {
+        let r = a.q(sql);
+        let got = match &r.error {
+            Some(e) => Err(format!("{} {}", e.code, e.message)),
+            None => Ok(r.tags.last().cloned().unwrap_or_default()),
+        };
+        let agrees = match (want, &got) {
+            (Ok(tag), Ok(g)) => g == tag,
+            (Err(w), Err(g)) => w == g,
+            _ => false,
+        };
+        if !agrees {
+            wrong.push(format!("{sql}: PG {want:?}, got {got:?}"));
+        }
+    }
+    // Nothing acted on this database: no table z, z2, si or ctas, no sequence s2, and no foreign key on z3 (98 went in).
+    for name in ["z", "z2", "si", "ctas"] {
+        let sql = format!("SELECT * FROM {name}");
+        let r = a.q(&sql);
+        if r.error.as_ref().map(|e| e.code.as_str()) != Some("42P01") {
+            wrong.push(format!("{sql}: {:?} {:?}, wanted 42P01 (no such relation)", r.rows, r.error));
+        }
+    }
+    let r = a.q("SELECT nextval('s2')");
+    if r.error.is_none() {
+        wrong.push(format!("nextval('s2'): {:?}, wanted no sequence s2", r.rows));
+    }
+    let got = a.q("SELECT count(*) FROM z3").single("count z3");
+    if got != "1" {
+        wrong.push(format!("count z3: {got}, wanted 1"));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// wire-rev-351702a43 LOW-6 (its PG 18.6 probe3 #161): a CASE is typed by its results (an int4 constant and an int4
 /// function: 23); the walk never typed a CASE column, and the engine announced it text (25).
 #[test]
