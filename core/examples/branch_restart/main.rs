@@ -198,6 +198,15 @@ struct Ru {
 }
 
 impl Ru {
+    /// Off macOS there is no proc_pid_rusage or Mach timebase, so these counters are not measured
+    /// there and the example refuses (the Linux workspace build broke on this function: the ELF
+    /// gate's build, artie raw uw-elfgate3-gate-d416dbda6.txt).
+    #[cfg(not(target_os = "macos"))]
+    fn now() -> Ru {
+        not_a_result("this process's counters are read with proc_pid_rusage, which only macOS has")
+    }
+
+    #[cfg(target_os = "macos")]
     fn now() -> Ru {
         static TIMEBASE: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
         // libc marks its binding deprecated (in favour of the mach2 crate); declared here instead.

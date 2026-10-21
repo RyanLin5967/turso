@@ -1,3 +1,4 @@
+use crate::connection::{EngineSql, Origin};
 use crate::alloc::{
     ConcurrentAllocator, DynAllocator, DynVec, TryReserveError, TursoAllocator,
     TursoTryWithCapacityExt, TursoVecInExt, ALLOC_ERR_MSG,
@@ -4595,18 +4596,18 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         loop {
             match st {
                 InitMetadataTableState::Start => {
-                    let stmt = connection.prepare(format!(
+                    let stmt = connection.prepare_engine(EngineSql::new(format!(
                         "CREATE TABLE IF NOT EXISTS {MVCC_META_TABLE_NAME}(k TEXT, v INTEGER NOT NULL)"
-                    ))?;
+                    )), Origin::Root)?;
                     *st = InitMetadataTableState::CreateTable {
                         stmt: Box::new(stmt),
                     };
                 }
                 InitMetadataTableState::CreateTable { stmt } => {
                     return_if_io!(stmt.run_ignore_rows_nonblock());
-                    let stmt = connection.prepare(format!(
+                    let stmt = connection.prepare_engine(EngineSql::new(format!(
                         "INSERT OR IGNORE INTO {MVCC_META_TABLE_NAME}(rowid, k, v) VALUES (1, '{MVCC_META_KEY_PERSISTENT_TX_TS_MAX}', 0)"
-                    ))?;
+                    )), Origin::Root)?;
                     *st = InitMetadataTableState::Insert {
                         stmt: Box::new(stmt),
                     };
@@ -4649,10 +4650,17 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         loop {
             match st {
                 ReadPersistentTxTsMaxState::Start => {
-                    let query_result = connection.query(format!(
-                        "SELECT v FROM {MVCC_META_TABLE_NAME}
+                    // Engine SQLite text, whatever the dialect (review dialect HIGH-1: it went through the
+                    // client parser, so a strict dialect read a valid MVCC database as Corrupt).
+                    let query_result = connection
+                        .prepare_engine(
+                            EngineSql::new(format!(
+                                "SELECT v FROM {MVCC_META_TABLE_NAME}
                          WHERE k = '{MVCC_META_KEY_PERSISTENT_TX_TS_MAX}'"
-                    ));
+                            )),
+                            Origin::Root,
+                        )
+                        .map(Some);
                     let maybe_stmt = match query_result {
                         Ok(stmt) => stmt,
                         Err(LimboError::ParseError(msg)) if msg.contains("no such table") => {
@@ -6620,7 +6628,16 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         }
 
         if let Some(connection) = connection {
+            // Or the transaction was marked as a schema change before its version moved (a DDL
+            // that failed between its ParseSchema or AddType and its SetCookie: adversary of
+            // 5650219c0, MED 3).
             if connection.schema.read().schema_version > connection.db.schema.lock().schema_version
+                || matches!(
+                    connection.get_tx_state(),
+                    crate::connection::TransactionState::Write {
+                        schema_did_change: true
+                    }
+                )
             {
                 // Connection made schema changes during tx and rolled back -> revert connection-local schema.
                 *connection.schema.write() = connection.db.clone_schema();
@@ -8703,6 +8720,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             materialized_view_info,
             dbsp_state_roots,
             dbsp_state_index_roots,
+            &connection.dialect(),
         )?;
         Self::rehydrate_table_valued_functions(&mut fresh, preserved_table_valued_functions);
 
@@ -8821,11 +8839,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     else {
                         unreachable!("state is ReadCookie");
                     };
-                    let stmt = connection
-                        .query(
-                            "SELECT rowid, type, name, tbl_name, rootpage, sql FROM sqlite_schema",
-                        )?
-                        .map(Box::new);
+                    // Engine SQLite text (review dialect HIGH-1: the recovery scan used the client parser).
+                    let stmt = Some(Box::new(connection.prepare_engine(
+                        EngineSql::new("SELECT rowid, type, name, tbl_name, rootpage, sql FROM sqlite_schema"),
+                        Origin::Root,
+                    )?));
                     *st = RecoverLogicalLogState::QuerySchema {
                         reader,
                         preserved_tvfs,
@@ -9655,6 +9673,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             materialized_view_info,
             dbsp_state_roots,
             dbsp_state_index_roots,
+            &connection.dialect(),
         )?;
         Self::rehydrate_table_valued_functions(&mut fresh, preserved_table_valued_functions);
 

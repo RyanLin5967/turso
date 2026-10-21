@@ -2739,8 +2739,15 @@ impl Session {
         // none of the store's, so no client could force or count it (PREREG section 5 M2; wire
         // review 14 item 13). It waits for a fuzzy checkpoint in flight, which is why a block's
         // CHECKPOINT, which never waits, leaves the store alone.
-        self.waiting(|| self.shared.db.branch_compact_now())
-            .map_err(|e| engine_info(&e))?;
+        // Bounded by the session's lock wait and ended by its cancel or statement_timeout
+        // (C42-M1): the store's wait for a flight in progress had no deadline.
+        let until = std::time::Instant::now() + self.lock_wait();
+        self.waiting(|| {
+            self.shared
+                .db
+                .branch_compact_now_within(until, &|| self.interrupts.should_stop())
+        })
+        .map_err(|e| engine_info(&e))?;
         Ok(Response::Execution(Tag::new("CHECKPOINT")))
     }
 
@@ -8880,6 +8887,85 @@ mod tests {
             returned,
             "a create waited for the CHECKPOINT's store checkpoint"
         );
+    }
+
+    /// Review C42-M1, the server side (lead order; the engine's every-build hold, fastest-engine
+    /// d4cfcd1df, here by its stage numbers 2 and 0x80): a client's CHECKPOINT that meets a fuzzy
+    /// checkpoint's flight held in the air ends, with 57014, at its statement_timeout and at its
+    /// cancel, and its session stays usable. It waited for the flight with no bound, so a CHECKPOINT
+    /// behind a stalled flight hung its session. Each CHECKPOINT runs on a thread bounded at 10 s,
+    /// so the red reports instead of hanging.
+    #[test]
+    fn a_checkpoint_meeting_a_held_flight_ends_at_its_timeout_and_its_cancel() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let s = session(&dir);
+        ok(&s, "CREATE TABLE t(id INT PRIMARY KEY)");
+        ok(&s, "INSERT INTO t VALUES (1)");
+        ok(&s, "SELECT turso_branch_create('b0')");
+        let db = s.shared.db.clone();
+        struct Release(Arc<turso_core::Database>);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                self.0.branch_checkpoint_hold(0);
+            }
+        }
+        let release = Release(db.clone());
+        db.branch_checkpoint_hold(2);
+        assert!(db.branch_checkpoint_fuzzy_now().unwrap(), "premise: a fuzzy checkpoint started");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while db.branch_checkpoint_held() & 0x80 == 0 {
+            assert!(std::time::Instant::now() < deadline, "premise: the flight never reached the hold");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let mut wrong = Vec::new();
+        for arm in ["statement_timeout", "cancel"] {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let (itx, irx) = std::sync::mpsc::channel();
+            let shared = s.shared.clone();
+            std::thread::spawn(move || {
+                let s2 = Session::new(shared);
+                let _ = itx.send(s2.interrupts.clone());
+                if arm == "statement_timeout" {
+                    ok(&s2, "SET statement_timeout = 300");
+                }
+                let started = std::time::Instant::now();
+                let code = s2.simple("CHECKPOINT").into_iter().find_map(|r| match r {
+                    Response::Error(e) => Some(e.code.clone()),
+                    _ => None,
+                });
+                let took = started.elapsed();
+                let usable = s2
+                    .simple("SELECT 1")
+                    .iter()
+                    .all(|r| !matches!(r, Response::Error(_)));
+                let _ = tx.send((code, took, usable));
+            });
+            let interrupts = irx.recv().unwrap();
+            if arm == "cancel" {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                interrupts.request_cancel();
+            }
+            match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+                Ok((code, took, usable)) => {
+                    if code.as_deref() != Some("57014") {
+                        wrong.push(format!("{arm}: CHECKPOINT answered {code:?}, not 57014"));
+                    }
+                    if took < std::time::Duration::from_millis(250) {
+                        wrong.push(format!("{arm}: it ended after {took:?}, before its bound"));
+                    }
+                    if !usable {
+                        wrong.push(format!("{arm}: the session was not usable after it"));
+                    }
+                }
+                Err(_) => {
+                    wrong.push(format!("{arm}: CHECKPOINT did not end in 10 s behind the held flight"));
+                    break;
+                }
+            }
+        }
+        drop(release);
+        db.branch_checkpoint_wait();
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
     /// Wire review 18 item 14 and its appendix: the parameter-type walk opens a view chain of any

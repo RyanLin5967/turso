@@ -65,6 +65,28 @@ static HELD_SYSCALLS: AtomicU64 = AtomicU64::new(0);
 /// Holds whose syscalls could not be attributed to the holding thread: another thread ran during
 /// the hold (`hold_attributed`); their syscalls are in neither `HELD_SYSCALLS` count.
 static HELD_UNATTRIBUTED: AtomicU64 = AtomicU64::new(0);
+
+/// One store-mutex hold, as the lifecycle audit records it (class (e), DECISIONS 994f7d41e0): where
+/// it was taken (`#[track_caller]` through `StoreMutex::lock` and its wrappers), on which thread,
+/// and what it did: its syscalls (attributed to the holder, `attribute`; `None` when they could not
+/// be), allocations and bytes, and catalog statements, each this thread's own.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct HoldRec {
+    pub(crate) site: &'static std::panic::Location<'static>,
+    pub(crate) thread: u64,
+    pub(crate) syscalls: Option<u64>,
+    pub(crate) allocs: u64,
+    pub(crate) alloc_bytes: u64,
+    pub(crate) cat_stmts: u64,
+}
+
+/// The audit's log, recorded while `AUDIT` is set; the test reserves its room first, so recording
+/// allocates nothing (a push past the room is counted in `AUDIT_LOST` instead).
+pub(crate) static AUDIT: AtomicBool = AtomicBool::new(false);
+pub(crate) static AUDIT_LOG: std::sync::Mutex<Vec<HoldRec>> = std::sync::Mutex::new(Vec::new());
+pub(crate) static AUDIT_LOST: AtomicU64 = AtomicU64::new(0);
+/// Holds `attribute` refused (any thread), observation only.
+pub(crate) static HOLD_REFUSALS: AtomicU64 = AtomicU64::new(0);
 /// Threads that declared themselves syscall-free while they spin (`spinning`): their CPU time does
 /// not make a window or a hold foreign. At most 8 at once; 0 is a free slot.
 static SPINNERS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
@@ -79,6 +101,10 @@ thread_local! {
     static T_CAT_ROWS: Cell<u64> = const { Cell::new(0) };
     /// `(held allocation bytes, catalog rows)` of this thread when it took its outermost store mutex.
     static HOLD_START: Cell<(u64, u64)> = const { Cell::new((0, 0)) };
+    /// The outermost hold's site, and this thread's (held allocations, catalog statements) at its
+    /// start (the lifecycle audit).
+    static HOLD_SITE: Cell<Option<&'static std::panic::Location<'static>>> = const { Cell::new(None) };
+    static HOLD_START2: Cell<(u64, u64)> = const { Cell::new((0, 0)) };
     /// Whether this thread is the measuring (foreground) thread (`mark_foreground`).
     static FOREGROUND: Cell<bool> = const { Cell::new(false) };
     static T_FREE_BYTES: Cell<u64> = const { Cell::new(0) };
@@ -96,6 +122,12 @@ thread_local! {
     static WINDOW_C0: Cell<[u64; 48]> = const { Cell::new([0; 48]) };
     static WINDOW_S0: Cell<Option<u64>> = const { Cell::new(None) };
     static HOLD_C0: Cell<[u64; 48]> = const { Cell::new([0; 48]) };
+    /// How many threads `thread_table` reported at the window's and the hold's start, and the
+    /// shim's lost count then (probe-adversary items 1 and 4).
+    static WINDOW_N0: Cell<Option<usize>> = const { Cell::new(None) };
+    static HOLD_N0: Cell<Option<usize>> = const { Cell::new(None) };
+    static WINDOW_LOST0: Cell<u64> = const { Cell::new(0) };
+    static HOLD_LOST0: Cell<u64> = const { Cell::new(0) };
     /// Store-mutex guards this thread holds now.
     static DEPTH: Cell<u32> = const { Cell::new(0) };
     /// The task's syscall count when this thread took its first store mutex (while armed).
@@ -401,6 +433,11 @@ unsafe impl GlobalAlloc for Counting {
 
 /// A branch store's mutex was just granted to this thread (`StoreMutex::lock`).
 pub(crate) fn store_locked() {
+    store_locked_at(std::panic::Location::caller());
+}
+
+/// `store_locked`, with the site that took the mutex (the lifecycle audit's record).
+pub(crate) fn store_locked_at(site: &'static std::panic::Location<'static>) {
     LOCKS.fetch_add(1, Relaxed);
     bump(&T_LOCKS, 1);
     let depth = DEPTH.with(|d| {
@@ -410,17 +447,29 @@ pub(crate) fn store_locked() {
     if depth == 1 {
         let get = |c: &'static std::thread::LocalKey<Cell<u64>>| c.with(|c| c.get());
         HOLD_START.with(|h| h.set((get(&T_HELD_ALLOC_BYTES), get(&T_CAT_ROWS))));
+        HOLD_SITE.with(|h| h.set(Some(site)));
+        HOLD_START2.with(|h| h.set((get(&T_HELD_ALLOCS), get(&T_CAT_STMTS))));
         if ARMED.load(Relaxed) {
             // The table first, then the count: the hold's counted syscalls lie inside the table's
             // window (`hold_attributed`).
+            // The table, then the kernel's count, then the shim's: a call between the kernel's read
+            // and the shim's is in the shim's start and in the kernel's span, so it can only make
+            // the shim's span smaller than the kernel's (a refusal), never inflate it (probe-
+            // adversary row 6: the shim read before the kernel let a foreign call in that gap
+            // compensate an unseen call of the hold's own).
             HOLD_T0.with(|t| {
                 if let Ok(mut t) = t.try_borrow_mut() {
                     *t = [ThreadCpu::EMPTY; 48];
-                    let _ = thread_table(&mut t[..]);
-                    HOLD_C0.with(|c| c.set(shim_counts(&t[..])));
+                    HOLD_N0.with(|n| n.set(thread_table(&mut t[..])));
                 }
             });
             HELD_SINCE.with(|s| s.set(unix_syscalls()));
+            HOLD_LOST0.with(|l| l.set(shim_lost()));
+            HOLD_T0.with(|t| {
+                if let Ok(t) = t.try_borrow() {
+                    HOLD_C0.with(|c| c.set(shim_counts(&t[..])));
+                }
+            });
         }
     }
 }
@@ -448,26 +497,55 @@ pub(crate) fn store_unlocked() {
         // Class (b): the hold's syscalls are this thread's only if no other thread ran during it
         // (`hold_attributed`); otherwise the hold is counted as unattributable, never as held.
         if let Some(since) = HELD_SINCE.with(|s| s.take()) {
-            if let Some(now) = unix_syscalls() {
+            // The shim's counts (of the threads at the start), then the kernel's, then the table:
+            // the mirror of the start's order (see `store_locked_at`).
+            let c1 = HOLD_T0.with(|t0| t0.try_borrow().map(|t0| shim_counts(&t0[..])).unwrap_or([0; 48]));
+            let lost1 = shim_lost();
+            // probe-adversary-2 L1: a hold whose end count cannot be read is unattributable, never
+            // silently dropped from both counts.
+            let now = unix_syscalls();
+            if now.is_none() {
+                HELD_UNATTRIBUTED.fetch_add(1, Relaxed);
+                bump(&T_HELD_UNATTRIBUTED, 1);
+            }
+            if let Some(now) = now {
                 let held = now.wrapping_sub(since) & u64::from(u32::MAX);
                 let mut t1 = [ThreadCpu::EMPTY; 48];
-                let listed = thread_table(&mut t1).is_some();
-                let c1 = shim_counts(&t1);
-                let attributed = if listed {
-                    HOLD_T0.with(|t0| {
-                        t0.try_borrow()
-                            .ok()
-                            .and_then(|t0| attribute(held, &t0[..], &HOLD_C0.with(|c| c.get()), &t1, &c1, &[], false).0)
-                    })
-                } else {
-                    None
-                };
+                let n1 = thread_table(&mut t1);
+                let ends = Ends { n0: HOLD_N0.with(|n| n.get()), n1, lost0: HOLD_LOST0.with(|l| l.get()), lost1 };
+                let attributed = HOLD_T0.with(|t0| {
+                    t0.try_borrow()
+                        .ok()
+                        .and_then(|t0| attribute(held, &t0[..], &HOLD_C0.with(|c| c.get()), &t1, &c1, ends, &[], false).0)
+                });
+                if attributed.is_none() {
+                    HOLD_REFUSALS.fetch_add(1, Relaxed);
+                }
                 if let Some(held) = attributed {
                     HELD_SYSCALLS.fetch_add(held, Relaxed);
                     bump(&T_HELD_SYSCALLS, held);
                 } else {
                     HELD_UNATTRIBUTED.fetch_add(1, Relaxed);
                     bump(&T_HELD_UNATTRIBUTED, 1);
+                }
+                if AUDIT.load(Relaxed) {
+                    let get = |c: &'static std::thread::LocalKey<Cell<u64>>| c.with(|c| c.get());
+                    let (allocs0, stmts0) = HOLD_START2.with(|h| h.get());
+                    let me = t1.iter().find(|t| t.me).map_or(0, |t| t.id);
+                    let rec = HoldRec {
+                        site: HOLD_SITE.with(|h| h.get()).unwrap_or(std::panic::Location::caller()),
+                        thread: me,
+                        syscalls: attributed,
+                        allocs: get(&T_HELD_ALLOCS).wrapping_sub(allocs0),
+                        alloc_bytes: bytes,
+                        cat_stmts: get(&T_CAT_STMTS).wrapping_sub(stmts0),
+                    };
+                    match AUDIT_LOG.try_lock() {
+                        Ok(mut log) if log.len() < log.capacity() => log.push(rec),
+                        _ => {
+                            AUDIT_LOST.fetch_add(1, Relaxed);
+                        }
+                    }
                 }
             }
         }
@@ -477,8 +555,9 @@ pub(crate) fn store_unlocked() {
 /// A catalog statement ran on this thread (`catalog::Stmt::{rows, each_row, exec}`; `write` for
 /// `exec`), touching `rows` rows (read, or 1 written), on ANY of the store's catalog connections —
 /// the store's own, the checkpoint writer's, the name filter's reader — unlike the catalog's own
-/// counters, which see one connection each. BLIND SPOT: transaction control and pragmas
-/// (`conn.execute("BEGIN")`, `wal_checkpoint`) are not statements of `Stmt` and are not counted.
+/// counters, which see one connection each. BLIND SPOT: transaction control and pragmas run through
+/// `conn.execute` (`wal_checkpoint`, a write transaction's BEGIN) are not statements of `Stmt` and
+/// are not counted; the fuzzy checkpoint's read snapshot BEGIN and COMMIT are, since 177f007c8.
 pub(crate) fn catalog_statement(write: bool, rows: u64) {
     CAT_STMTS.fetch_add(1, Relaxed);
     CAT_ROWS.fetch_add(rows, Relaxed);
@@ -567,6 +646,12 @@ pub(crate) struct Snapshot {
     pub(crate) full_fsync: u64,
     pub(crate) barrier: u64,
     pub(crate) syscalls: Option<u64>,
+    /// Whether the per-thread counter was loaded, and its lost count at this snapshot (probe-
+    /// adversary item 1: every sample records its mode).
+    pub(crate) shim_loaded: bool,
+    pub(crate) shim_lost: u64,
+    /// Why `attributed_syscalls` is `None`, if it is (`Refusal`).
+    pub(crate) refusal: Refusal,
 }
 
 /// Take a snapshot to open a window (see [`Snapshot`]): every thread's CPU time is read just
@@ -579,11 +664,14 @@ pub(crate) fn begin() -> Snapshot {
     WINDOW_T0.with(|t| {
         let mut t = t.borrow_mut();
         *t = [ThreadCpu::EMPTY; 48];
-        let _ = thread_table(&mut t[..]);
-        WINDOW_C0.with(|c| c.set(shim_counts(&t[..])));
+        WINDOW_N0.with(|n| n.set(thread_table(&mut t[..])));
     });
     s.syscalls = unix_syscalls();
     WINDOW_S0.with(|c| c.set(s.syscalls));
+    // The shim after the kernel (see `store_locked_at`), then nothing more that counts.
+    WINDOW_LOST0.with(|l| l.set(shim_lost()));
+    WINDOW_T0.with(|t| WINDOW_C0.with(|c| c.set(shim_counts(&t.borrow()[..]))));
+    s.shim_loaded = shim().is_some();
     s
 }
 
@@ -604,9 +692,34 @@ fn shim() -> Option<unsafe extern "C" fn(u64) -> u64> {
     (addr != 0).then(|| unsafe { std::mem::transmute::<usize, unsafe extern "C" fn(u64) -> u64>(addr) })
 }
 
-/// Look the shim up now (see `shim`), outside any window.
+/// The shim's count of calls it could put in no thread's slot (`feshim_lost`); 0 without the shim.
+/// Looked up once, as `shim`.
+fn shim_lost() -> u64 {
+    static LOST: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    #[cfg(target_vendor = "apple")]
+    let addr = *LOST.get_or_init(|| {
+        // SAFETY: a symbol lookup by a NUL-terminated name in every loaded image.
+        unsafe { libc::dlsym(libc::RTLD_DEFAULT, b"feshim_lost\0".as_ptr().cast()) as usize }
+    });
+    #[cfg(not(target_vendor = "apple"))]
+    let addr = *LOST.get_or_init(|| 0);
+    if addr == 0 {
+        return 0;
+    }
+    // SAFETY: the shim exports `uint64_t feshim_lost(void)`, a read-only load.
+    unsafe { std::mem::transmute::<usize, unsafe extern "C" fn() -> u64>(addr)() }
+}
+
+/// Look the shim up now (see `shim`), outside any window. A run labelled a shim run (`FE_SHIM_RUN`,
+/// set by the feshim-run runner) whose shim is not loaded is REFUSED here, a panic, rather than
+/// measured as if it were one (probe-adversary item 1: a run with the shim stripped passed exactly as
+/// a shim run did, and nothing recorded the mode).
 pub(crate) fn prime() {
-    let _ = shim();
+    let loaded = shim().is_some();
+    let _ = shim_lost();
+    if !loaded && std::env::var_os("FE_SHIM_RUN").is_some() {
+        panic!("budget_probe: REFUSED: this run is labelled a shim run (FE_SHIM_RUN) but feshim is not loaded");
+    }
 }
 
 /// Whether the per-thread counter is loaded (budgets that cannot be attributed by exclusion need it).
@@ -628,40 +741,149 @@ fn shim_counts(t: &[ThreadCpu]) -> [u64; 48] {
     out
 }
 
+/// The two ends of a span, beyond the threads' own readings: how many threads `thread_table`
+/// reported at each, and the shim's lost count at each.
+#[derive(Clone, Copy)]
+struct Ends {
+    n0: Option<usize>,
+    n1: Option<usize>,
+    lost0: u64,
+    lost1: u64,
+}
+
+/// Why a span has no count (`attribute`), recorded in every sample (probe-adversary-2 L4: a refused
+/// table and a foreign thread used to look the same, `foreign_threads = 1`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub(crate) enum Refusal {
+    #[default]
+    None = 0,
+    /// The thread table could not be read, or held more than the 48 threads it has room for.
+    Table = 1,
+    /// A thread present at the start is gone at the end.
+    ThreadGone = 2,
+    /// A thread not present at the start is still there at the end (one the span spawned that
+    /// outlives it, or any new thread during a hold).
+    ThreadNew = 3,
+    /// Another thread ran, and there is no shim to tell its calls apart.
+    ForeignNoShim = 4,
+    /// The shim lost a call (`feshim_lost`).
+    ShimLost = 5,
+    /// Another thread made calls in the span.
+    ForeignCalls = 6,
+    /// The shim's deltas do not sum to the kernel's count.
+    SumMismatch = 7,
+    /// The kernel's count could not be read.
+    NoKernelCount = 8,
+}
+
 /// Class (b)'s attribution, one rule for windows and holds: `kernel` is the task's count over the
-/// span; `(t0, c0)` and `(t1, c1)` every thread's CPU time and shim count at its two ends. With no
-/// other thread running (`foreign` 0), the kernel count is the span's own. With some, the shim's
-/// per-thread deltas decide, and only where the shim saw every call the kernel counted (the sum of
-/// every listed thread's shim delta equals `kernel`): then the span's count is the shim delta of
-/// its own threads (`own`: the reading thread, plus, for a window, the threads it spawned and those
-/// named in `owned`). Otherwise `None`: unattributable, a refusal.
-fn attribute(kernel: u64, t0: &[ThreadCpu], c0: &[u64; 48], t1: &[ThreadCpu], c1: &[u64; 48], owned: &[&str], window: bool) -> (Option<u64>, u64) {
+/// span; `(t0, c0)` every thread's CPU time and shim count at its start, `t1` every thread's CPU
+/// time at its end and `c1` the shim counts at its end of the threads in `t0`, in `t0`'s order.
+/// Returns the count (or `None`), the foreign threads, and why a count was refused (`Refusal`).
+///
+/// Refused on both paths (probe-adversary items 4, probe-adversary-2 M1): a thread table that could
+/// not be read or holds more than the 48 threads it has room for (a 49th thread is invisible); a
+/// thread present at the start that is gone at the end (its calls, its exit included, would be
+/// charged to the span); and a thread new at the end, still running (a thread the window spawned
+/// that outlives it would have its later calls dropped: probe-adversary-2 row 11, Some(7) against
+/// truth 22. This also covers a persistent store thread the operation spawned, which the callers'
+/// `threads()` checks do not see, since `threads()` leaves out `PERSISTENT_LIVE`).
+///
+/// With no other thread running (`foreign` 0), the kernel count is the span's own: the EXCLUSION
+/// path, trusted as an upper bound (it can only overcount).
+///
+/// With some, the SHIM path, which may only accept a span in which no thread but its own made a
+/// call (probe-adversary items 2 and 3). It refuses when: the shim is not loaded; it lost a call
+/// (`feshim_lost` above 0); any thread other than the span's own (the reading thread, and for a
+/// window those named in `owned`) has a shim delta above 0; or the shim's deltas do not sum to
+/// `kernel` (a foreign thread's call the shim cannot see). An accepted span's count is `kernel`,
+/// so the shim path too can only overcount.
+///
+/// BLIND SPOTS, measured (probe-adversary rows 2c and 9, probe-adversary-2 rows 5-14, and
+/// artie frontier/fastest/lanes/wire/budget/scshim/probe_contended.c):
+/// - A thread's CPU time is stale while it runs: a continuously spinning foreign thread read as
+///   not running in 346 of 500 windows (probe-adversary-2 row 14), and its resolution is 1 µs. Such a
+///   thread is not foreign, and on the exclusion path its calls, if any, are charged to the span:
+///   an overcount, never an undercount.
+/// - Calls the kernel counts and the shim does not: `syscall(2)` and a raw `svc` (10 of 10), the
+///   `posix_spawn` call, a thread's creation (2 unseen calls) and its exit (1 unseen); lock waits
+///   (`__psynch_*`) ARE seen (probe_contended: 2449 of 2452 kernel calls seen with two threads
+///   contending a mutex, 3 uncovered against the uncontended control's 2). They can only cause
+///   refusals.
+/// - Calls the shim counts and the kernel does not: `kdebug_trace`, `kdebug_trace_string` and
+///   `kdebug_typefilter` after its first call (tracing off: shim +10, kernel 0), so the sum check
+///   can be balanced by one of them against an unseen call (probe-adversary-2 rows 6-7: a span
+///   holding a foreign call accepted, at one over the truth). The count is still the kernel's, so
+///   the error is OVER only, a false red. A call whose shim increment lands before the end's shim
+///   read and whose kernel entry after the kernel's read does the same (source-only).
+/// - Work done by a child process (posix_spawn, vfork) is counted by neither counter: it is
+///   another task. Mach traps are not BSD syscalls and are counted by neither.
+/// - A thread the span spawned that is BLOCKED at its end is accepted (the open's persistent
+///   threads, parked): work it does after waking is not the span's count, even when the span queued
+///   it. Only a spawned thread still running at the end is refused.
+fn attribute(kernel: u64, t0: &[ThreadCpu], c0: &[u64; 48], t1: &[ThreadCpu], c1: &[u64; 48], ends: Ends, owned: &[&str], window: bool) -> (Option<u64>, u64, Refusal) {
+    // Mutants (test builds only), each a rule this replaced or a check it makes:
+    // `probe_full_table_trusted` (a table past its room is read as complete),
+    // `probe_gone_thread_charged` (a thread gone at the end is ignored), `probe_new_thread_kept`
+    // (a thread new at the end refused on the shim path only, as before probe-adversary-2 M1),
+    // `probe_shim_excludes_foreign` (the shim path as before: the own threads' deltas, a foreign
+    // thread's calls excluded, only the total checked), `probe_sum_unchecked` (no sum check).
+    let mutant = |m: &str| crate::branch::store::fe_mutant(m);
+    let room = t0.len().min(t1.len());
+    match (ends.n0, ends.n1) {
+        (Some(n0), Some(n1)) if (n0 <= room && n1 <= room) || mutant("probe_full_table_trusted") => {}
+        _ => return (None, 0, Refusal::Table),
+    }
+    let present = |t: &[ThreadCpu], id: u64| t.iter().any(|x| x.id == id);
+    if t0.iter().any(|x| x.id != 0 && !present(t1, x.id)) && !mutant("probe_gone_thread_charged") {
+        return (None, 0, Refusal::ThreadGone);
+    }
+    // A thread new at the end and still RUNNING then: its work goes on past the end, so the span
+    // would miss it. One the span spawned that is blocked at the end (a persistent store thread
+    // parked, the open's confirmation writer) is the span's, and what it does later is a later
+    // span's work.
+    let new_at_end = t1.iter().any(|x| x.id != 0 && !present(t0, x.id));
+    let new_running = t1.iter().any(|x| x.id != 0 && !x.waiting && !present(t0, x.id));
+    let keep_new = mutant("probe_new_thread_kept");
+    if new_running && !keep_new {
+        return (None, 0, Refusal::ThreadNew);
+    }
     let foreign = foreign_threads(t0, t1, owned, !window);
     if foreign == 0 {
-        return (Some(kernel), 0);
+        return (Some(kernel), 0, Refusal::None);
     }
     if shim().is_none() {
-        return (None, foreign);
+        return (None, foreign, Refusal::ForeignNoShim);
+    }
+    if ends.lost0 != 0 || ends.lost1 != 0 {
+        return (None, foreign, Refusal::ShimLost);
+    }
+    if new_at_end {
+        return (None, foreign, Refusal::ThreadNew);
     }
     let me = t1.iter().find(|t| t.me).map_or(0, |t| t.id);
     let owned_name = |t: &ThreadCpu| {
         let end = t.name.iter().position(|c| *c == 0).unwrap_or(t.name.len());
         owned.iter().any(|o| o.as_bytes() == &t.name[..end])
     };
-    let (mut all, mut own) = (0u64, 0u64);
-    for (i, t) in t1.iter().enumerate().filter(|(_, t)| t.id != 0) {
-        let before = t0.iter().position(|x| x.id == t.id);
-        let d = c1[i].wrapping_sub(before.map_or(0, |j| c0[j]));
-        all = all.wrapping_add(d);
-        let mine = t.id == me || (window && (before.is_none() || owned_name(t)));
-        if mine {
-            own = own.wrapping_add(d);
+    let mut all = 0u64;
+    let mut own_sum = 0u64;
+    let excludes = mutant("probe_shim_excludes_foreign");
+    for (i, t) in t0.iter().enumerate().filter(|(_, t)| t.id != 0) {
+        let d = c1[i].wrapping_sub(c0[i]);
+        let own = t.id == me || (window && owned_name(t));
+        if d > 0 && !own && !excludes {
+            return (None, foreign, Refusal::ForeignCalls);
         }
+        if own {
+            own_sum = own_sum.wrapping_add(d);
+        }
+        all = all.wrapping_add(d);
     }
-    if all == kernel {
-        (Some(own), foreign)
+    if all == kernel || mutant("probe_sum_unchecked") {
+        (Some(if excludes { own_sum } else { kernel }), foreign, Refusal::None)
     } else {
-        (None, foreign)
+        (None, foreign, Refusal::SumMismatch)
     }
 }
 
@@ -679,21 +901,28 @@ pub(crate) fn end() -> Snapshot {
 /// CPU time below the kernel's accounting resolution in the window is not seen; a declared spinner
 /// (`spinning`) is trusted to make no syscall.
 pub(crate) fn end_owning(owned: &[&str]) -> Snapshot {
+    // The shim's counts (of the threads at `begin`) and lost count, then the kernel's, then the
+    // table: the mirror of `begin` (see `store_locked_at`).
+    let c1 = WINDOW_T0.with(|t0| shim_counts(&t0.borrow()[..]));
+    let lost1 = shim_lost();
     let syscalls = unix_syscalls();
     let mut t1 = [ThreadCpu::EMPTY; 48];
-    let listed = thread_table(&mut t1).is_some();
-    let c1 = shim_counts(&t1);
-    let (attributed, foreign) = match (listed, WINDOW_S0.with(|c| c.get()), syscalls) {
-        (true, Some(s0), Some(s1)) => {
+    let n1 = thread_table(&mut t1);
+    let ends = Ends { n0: WINDOW_N0.with(|n| n.get()), n1, lost0: WINDOW_LOST0.with(|l| l.get()), lost1 };
+    let (attributed, foreign, refusal) = match (WINDOW_S0.with(|c| c.get()), syscalls) {
+        (Some(s0), Some(s1)) => {
             let kernel = s1.wrapping_sub(s0) & u64::from(u32::MAX);
-            WINDOW_T0.with(|t0| attribute(kernel, &t0.borrow()[..], &WINDOW_C0.with(|c| c.get()), &t1, &c1, owned, true))
+            WINDOW_T0.with(|t0| attribute(kernel, &t0.borrow()[..], &WINDOW_C0.with(|c| c.get()), &t1, &c1, ends, owned, true))
         }
-        _ => (None, 1),
+        _ => (None, 0, Refusal::NoKernelCount),
     };
     let mut s = user_counts();
     s.foreign = foreign;
+    s.refusal = refusal;
     s.syscalls = syscalls;
     s.attributed_syscalls = attributed;
+    s.shim_loaded = shim().is_some();
+    s.shim_lost = lost1;
     s.instructions = instructions();
     // Diagnostics only (FE_BUDGET_FOREIGN_NAMES set): name the foreign threads on stderr, after every
     // count of the window is taken.
@@ -757,6 +986,16 @@ pub(crate) fn thread_locks() -> u64 {
     T_LOCKS.with(|c| c.get())
 }
 
+/// Catalog statements this thread ran, on any catalog connection (`catalog_statement`).
+pub(crate) fn thread_cat_stmts() -> u64 {
+    T_CAT_STMTS.with(|c| c.get())
+}
+
+/// This thread's `(frees, bytes freed)`, exact per thread.
+pub(crate) fn thread_frees() -> (u64, u64) {
+    (T_FREES.with(|c| c.get()), T_FREE_BYTES.with(|c| c.get()))
+}
+
 /// This thread's `(allocations, bytes, allocations under a store mutex, bytes under one)`: exact
 /// per thread however many others run.
 pub(crate) fn thread_allocs() -> (u64, u64, u64, u64) {
@@ -796,6 +1035,9 @@ fn user_counts() -> Snapshot {
         full_fsync: syncs.full_fsync,
         barrier: syncs.barrier,
         syscalls: None,
+        shim_loaded: false,
+        shim_lost: 0,
+        refusal: Refusal::None,
     }
 }
 
@@ -1070,10 +1312,12 @@ pub(crate) struct ThreadCpu {
     pub(crate) cpu_ns: u64,
     pub(crate) me: bool,
     pub(crate) name: [u8; 32],
+    /// The kernel's `TH_STATE_WAITING` for it when read (blocked: parked, sleeping, or in a wait).
+    pub(crate) waiting: bool,
 }
 
 impl ThreadCpu {
-    pub(crate) const EMPTY: ThreadCpu = ThreadCpu { id: 0, cpu_ns: 0, me: false, name: [0; 32] };
+    pub(crate) const EMPTY: ThreadCpu = ThreadCpu { id: 0, cpu_ns: 0, me: false, name: [0; 32], waiting: false };
 
     pub(crate) fn name(&self) -> String {
         let end = self.name.iter().position(|b| *b == 0).unwrap_or(self.name.len());
@@ -1130,6 +1374,7 @@ pub(crate) fn thread_table(out: &mut [ThreadCpu]) -> Option<usize> {
                     cpu_ns: if kr == 0 { ext.pth_user_time + ext.pth_system_time } else { 0 },
                     me: port == me,
                     name,
+                    waiting: kr == 0 && ext.pth_run_state == libc::TH_STATE_WAITING as i32,
                 };
             }
             // SAFETY: as `each_thread`.
@@ -1179,9 +1424,145 @@ pub(crate) fn threads() -> Option<u64> {
 /// (review 2 M6).
 pub(crate) fn others_blocked() -> Option<bool> {
     let mut all = true;
-    each_thread(|me, blocked| all &= me || blocked)?;
-    Some(all)
+    if each_thread(|me, blocked| all &= me || blocked).is_some() {
+        return Some(all);
+    }
+    linux_others_blocked()
 }
+
+/// Linux: whether every thread but the caller is blocked, from each `/proc/self/task/<tid>/stat`'s
+/// state (field 3): anything but `R` (running) counts as blocked, as a Mach thread off the run queue
+/// does above. Read by raw syscalls into stack buffers (getdents64 for the task list): no
+/// allocation, so it can be read inside a window whose allocations are counted (its syscalls are
+/// not counted off Apple). `None` where any part cannot be read: the window refuses (review 2 M6).
+/// Blind spot, stated: a thread that is runnable but not yet on a CPU reads `R` and counts as not
+/// blocked, which only makes a window refuse or wait, never settle early.
+fn linux_others_blocked() -> Option<bool> {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: gettid(2) has no preconditions (not libc::gettid: glibc 2.30+, see budget_tests).
+        let me = unsafe { libc::syscall(libc::SYS_gettid) } as u64;
+        // SAFETY: a NUL-terminated path; the descriptor is closed below.
+        let dir = unsafe { libc::open(b"/proc/self/task\0".as_ptr().cast(), libc::O_RDONLY | libc::O_DIRECTORY) };
+        if dir < 0 {
+            return None;
+        }
+        let mut all = Some(true);
+        let mut buf = [0u8; 4096];
+        'read: loop {
+            // SAFETY: `buf` is writable for its length; the descriptor is a directory.
+            let n = unsafe { libc::syscall(libc::SYS_getdents64, dir, buf.as_mut_ptr(), buf.len()) };
+            if n < 0 {
+                all = None;
+                break;
+            }
+            if n == 0 {
+                break;
+            }
+            let mut off = 0usize;
+            while off + 19 <= n as usize {
+                // linux_dirent64: d_ino u64, d_off i64, d_reclen u16, d_type u8, d_name NUL-terminated.
+                let reclen = u16::from_ne_bytes([buf[off + 16], buf[off + 17]]) as usize;
+                if reclen == 0 {
+                    all = None;
+                    break 'read;
+                }
+                let name = &buf[off + 19..off + reclen];
+                let name = &name[..name.iter().position(|&b| b == 0).unwrap_or(name.len())];
+                off += reclen;
+                let Some(tid) = std::str::from_utf8(name).ok().and_then(|t| t.parse::<u64>().ok()) else {
+                    continue; // "." and ".."
+                };
+                if tid == me {
+                    continue;
+                }
+                match linux_task_running(tid) {
+                    TaskState::Running(false) => {}
+                    TaskState::Running(true) => all = all.map(|_| false),
+                    // A thread that exited between the list and its read is not running.
+                    TaskState::Gone => {}
+                    // Any other failure refuses: unread is not "not running" (engine-rev-qaf-fix
+                    // MED-8: it failed open).
+                    TaskState::Unreadable => all = None,
+                }
+            }
+        }
+        // SAFETY: the descriptor opened above.
+        unsafe { libc::close(dir) };
+        all
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+/// Whether thread `tid` of this process is running (`R`), from `/proc/self/task/<tid>/stat`; `None`
+/// when it cannot be read (it exited).
+#[cfg(target_os = "linux")]
+fn linux_task_running(tid: u64) -> TaskState {
+    // engine-rev-qaf-fix MED-8's red: a read that cannot be understood, as a test hook.
+    if STAT_UNREADABLE_FOR_TEST.load(Relaxed) {
+        return TaskState::Unreadable;
+    }
+    // "/proc/self/task/" + digits + "/stat" + NUL, built in a stack buffer.
+    let mut path = [0u8; 64];
+    let head = b"/proc/self/task/";
+    path[..head.len()].copy_from_slice(head);
+    let mut digits = [0u8; 20];
+    let (mut d, mut v) = (0usize, tid);
+    loop {
+        digits[d] = b'0' + (v % 10) as u8;
+        d += 1;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    let mut at = head.len();
+    for i in (0..d).rev() {
+        path[at] = digits[i];
+        at += 1;
+    }
+    let tail = b"/stat\0";
+    path[at..at + tail.len()].copy_from_slice(tail);
+    // SAFETY: a NUL-terminated path; the descriptor is closed below.
+    let fd = unsafe { libc::open(path.as_ptr().cast(), libc::O_RDONLY) };
+    if fd < 0 {
+        // ENOENT/ESRCH: the thread exited after the listing. Anything else is unread.
+        let errno = std::io::Error::last_os_error().raw_os_error();
+        return if matches!(errno, Some(libc::ENOENT) | Some(libc::ESRCH)) {
+            TaskState::Gone
+        } else {
+            TaskState::Unreadable
+        };
+    }
+    let mut buf = [0u8; 512];
+    // SAFETY: `buf` is writable for its length.
+    let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+    // SAFETY: the descriptor opened above.
+    unsafe { libc::close(fd) };
+    let Some(text) = usize::try_from(n).ok().and_then(|n| buf.get(..n)) else {
+        return TaskState::Unreadable;
+    };
+    // The command name (field 2) is parenthesised and may hold spaces: the state follows its ')'.
+    let Some(state) = text.iter().rposition(|&b| b == b')').and_then(|close| text.get(close + 2)) else {
+        return TaskState::Unreadable;
+    };
+    TaskState::Running(*state == b'R')
+}
+
+/// One thread's state as `/proc/self/task/<tid>/stat` gives it.
+#[cfg(target_os = "linux")]
+enum TaskState {
+    Running(bool),
+    Gone,
+    Unreadable,
+}
+
+/// Test hook (engine-rev-qaf-fix MED-8): every per-thread stat read fails to be understood.
+#[cfg(target_os = "linux")]
+pub(crate) static STAT_UNREADABLE_FOR_TEST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn linux_threads() -> Option<u64> {
     #[cfg(target_os = "linux")]
@@ -1207,4 +1588,25 @@ fn linux_threads() -> Option<u64> {
     {
         None
     }
+}
+
+/// engine-rev-qaf-fix MED-8: a per-thread stat that cannot be read or parsed makes the probe
+/// refuse (None), never read as "not running": failing open let a window read "every other thread
+/// blocked" over threads it could not see.
+#[cfg(all(test, target_os = "linux"))]
+#[test]
+fn others_blocked_refuses_when_a_threads_stat_cannot_be_read() {
+    let spinner_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop = spinner_stop.clone();
+    let spinner = std::thread::spawn(move || {
+        while !stop.load(Relaxed) {
+            std::hint::spin_loop();
+        }
+    });
+    STAT_UNREADABLE_FOR_TEST.store(true, Relaxed);
+    let read = others_blocked();
+    STAT_UNREADABLE_FOR_TEST.store(false, Relaxed);
+    spinner_stop.store(true, Relaxed);
+    spinner.join().unwrap();
+    assert_eq!(read, None, "CLAIM: unreadable thread states refuse the probe");
 }

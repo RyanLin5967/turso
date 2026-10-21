@@ -345,13 +345,19 @@ pub(super) fn numeric_base_without_encode<'a>(
     resolver: &'a Resolver,
     ty: &'a str,
 ) -> Option<&'a str> {
+    base_without_encode(resolver, ty)
+        .filter(|base| matches!(Affinity::affinity(base), Affinity::Integer | Affinity::Real))
+}
+
+/// The primitive base `ty` stands for (the first name in its chain that is no type of the schema)
+/// when neither it nor any type it is declared over has an ENCODE; None otherwise.
+pub(super) fn base_without_encode<'a>(resolver: &'a Resolver, ty: &'a str) -> Option<&'a str> {
     // A type is declared over an existing one and a cycle is refused at CREATE, so the chain
     // ends, as resolve_base_type_chain's does.
     let mut ty = ty;
     loop {
         let Some(type_def) = resolver.schema().get_type_def_unchecked(ty) else {
-            return matches!(Affinity::affinity(ty), Affinity::Integer | Affinity::Real)
-                .then_some(ty);
+            return Some(ty);
         };
         if type_def.encode().is_some() {
             return None;

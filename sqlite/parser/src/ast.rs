@@ -3,7 +3,7 @@ pub mod fmt;
 
 use std::{num::NonZeroU32, sync::Arc};
 
-use crate::lexer::is_quotable_keyword;
+use crate::lexer::identifier_needs_quotes;
 use strum_macros::{EnumIter, EnumString};
 
 /// `?` or `$` Prepared statement arg placeholder(s)
@@ -1295,9 +1295,7 @@ impl Name {
                 + self.value.replace(&single, &double).as_str()
                 + quote.to_string().as_str();
         }
-        let value = self.value.as_bytes();
-        let safe_char = |&c: &u8| c.is_ascii_alphanumeric() || c == b'_';
-        if !value.is_empty() && value.iter().all(safe_char) && !is_quotable_keyword(value) {
+        if !identifier_needs_quotes(self.value.as_bytes()) {
             self.value.clone()
         } else {
             format!("\"{}\"", self.value.replace("\"", "\"\""))

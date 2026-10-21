@@ -1,3 +1,4 @@
+use crate::connection::{EngineSql, Origin};
 use crate::sync::{Arc, Weak};
 use crate::{
     index_method::{
@@ -1550,49 +1551,52 @@ impl FtsIndexAttachment {
         // Pattern 1: SELECT fts_score(col1, col2, ..., 'query') as score FROM table WHERE fts_match(col1, col2, ..., 'query')
         //            (combined: both score and match with same query - must come before pattern 2)
         // Pattern 2: SELECT * FROM table WHERE fts_match(col1, col2, ..., 'query')
+        // Quoted (wire: ONE QUOTING FUNCTION class): the patterns are SQL text the planner parses, so a
+        // table or column named `f x` broke them.
         let cols = cfg
             .columns
             .iter()
-            .map(|c| c.name.as_str())
+            .map(|c| quote_identifier(&c.name))
             .collect::<Vec<_>>()
             .join(", ");
+        let table = quote_identifier(&cfg.table_name);
         // Build all FTS patterns - more specific patterns first
         // Use explicit ?1 for shared parameters between fts_score and fts_match
 
         // Pattern 0: score with ORDER BY DESC LIMIT
         let score_pattern = format!(
             "SELECT fts_score({}, ?) as score FROM {} ORDER BY score DESC LIMIT ?",
-            cols, cfg.table_name
+            cols, table
         );
         // Pattern 1: combined + ORDER BY DESC + LIMIT (most specific)
         let combined_ordered_limit = format!(
             "SELECT fts_score({}, ?1) as score FROM {} WHERE fts_match({}, ?1) ORDER BY score DESC LIMIT ?",
-            cols, cfg.table_name, cols
+            cols, table, cols
         );
         // Pattern 2: combined + ORDER BY DESC (no LIMIT)
         let combined_ordered = format!(
             "SELECT fts_score({}, ?1) as score FROM {} WHERE fts_match({}, ?1) ORDER BY score DESC",
-            cols, cfg.table_name, cols
+            cols, table, cols
         );
         // Pattern 3: combined + LIMIT (no ORDER BY)
         let combined_limit = format!(
             "SELECT fts_score({}, ?1) as score FROM {} WHERE fts_match({}, ?1) LIMIT ?",
-            cols, cfg.table_name, cols
+            cols, table, cols
         );
         // Pattern 4: combined (no ORDER BY, no LIMIT)
         let combined = format!(
             "SELECT fts_score({}, ?1) as score FROM {} WHERE fts_match({}, ?1)",
-            cols, cfg.table_name, cols
+            cols, table, cols
         );
         // Pattern 5: match + LIMIT
         let match_limit = format!(
             "SELECT * FROM {} WHERE fts_match({}, ?) LIMIT ?",
-            cfg.table_name, cols
+            table, cols
         );
         // Pattern 6: match (no LIMIT)
         let match_pattern = format!(
             "SELECT * FROM {} WHERE fts_match({}, ?)",
-            cfg.table_name, cols
+            table, cols
         );
         let patterns = parse_patterns(&[
             &score_pattern,          // 0
@@ -1677,7 +1681,7 @@ fn initialize_btree_storage_table(
     // (we're already inside a transaction from the parent CREATE INDEX statement)
     {
         conn.start_nested();
-        let mut stmt = conn.prepare(create_table_sql)?;
+        let mut stmt = conn.prepare_engine(EngineSql::new(create_table_sql), Origin::Root)?;
         stmt.program
             .prepared
             .needs_stmt_subtransactions
@@ -1688,7 +1692,7 @@ fn initialize_btree_storage_table(
     }
     {
         conn.start_nested();
-        let mut stmt = conn.prepare(create_index_sql)?;
+        let mut stmt = conn.prepare_engine(EngineSql::new(create_index_sql), Origin::Root)?;
         stmt.program
             .prepared
             .needs_stmt_subtransactions
@@ -3380,7 +3384,7 @@ impl IndexMethodCursor for FtsCursor {
             quote_identifier(&self.dir_table_name)
         );
         conn.start_nested();
-        let mut stmt = conn.prepare(drop_table_sql)?;
+        let mut stmt = conn.prepare_engine(EngineSql::new(drop_table_sql), Origin::Root)?;
         // Disable subtransactions since we're already inside a transaction from the parent DROP INDEX
         stmt.program
             .prepared

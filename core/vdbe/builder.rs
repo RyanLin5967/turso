@@ -299,6 +299,10 @@ pub struct ProgramBuilder {
     capture_data_changes_info: Option<CaptureDataChangesInfo>,
     /// Whether the main database uses MVCC journal mode, set once at translation time from the connection.
     mvcc_enabled: bool,
+    /// The connection's prepare generation read BEFORE translation (review c42b MED-4): the key
+    /// the program is compiled under. Read at `build` instead, a journal switch landing during
+    /// translation keyed a program compiled under the old mode at the new generation.
+    prepare_generation: Option<u64>,
     // TODO: when we support multiple dbs, this should be a write mask to track which DBs need to be written
     txn_mode: TransactionMode,
     /// Set of database IDs that need write transactions (for attached databases).
@@ -755,6 +759,7 @@ impl ProgramBuilder {
             start_offset: BranchOffset::Placeholder,
             capture_data_changes_info,
             mvcc_enabled: false,
+            prepare_generation: None,
             txn_mode: TransactionMode::None,
             write_databases: BitSet::default(),
             read_databases: BitSet::default(),
@@ -966,6 +971,12 @@ impl ProgramBuilder {
 
     pub fn set_mvcc_enabled(&mut self, enabled: bool) {
         self.mvcc_enabled = enabled;
+    }
+
+    /// The prepare generation this program is compiled under, read before translation reads any
+    /// state it keys (review c42b MED-4).
+    pub fn set_prepare_generation(&mut self, generation: u64) {
+        self.prepare_generation = Some(generation);
     }
 
     pub fn extend(&mut self, opts: &ProgramBuilderOpts) {
@@ -2303,7 +2314,10 @@ impl ProgramBuilder {
         change_cnt_on: bool,
         sql: &str,
     ) -> crate::Result<Program> {
-        let prepare_context = PrepareContext::from_connection(&connection);
+        let prepare_context = match self.prepare_generation {
+            Some(generation) => PrepareContext::from_connection_at(&connection, generation),
+            None => PrepareContext::from_connection(&connection),
+        };
         let prepared = self.build_prepared_program(prepare_context, change_cnt_on, sql)?;
         Ok(Program::from_prepared(Arc::new(prepared), connection))
     }

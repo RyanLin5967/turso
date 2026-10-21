@@ -1,4 +1,5 @@
 use crate::error::{SqlErrorKind, SqlErrorMessage};
+use crate::connection::{EngineSql, Origin};
 use crate::sync::Arc;
 use crate::{Connection, LimboError, Statement, StepResult, Value};
 use bitflags::bitflags;
@@ -450,14 +451,16 @@ impl PragmaVirtualTableCursor {
 
         let mut sql = format!("PRAGMA {}", self.pragma_name);
         if let Some(arg) = &self.arg {
-            sql.push_str(&format!("=\"{arg}\""));
+            // Quoted with its own `"` doubled (engine-rev-quote42 H1: `pragma_table_info('a"b')`).
+            sql.push('=');
+            sql.push_str(&crate::util::double_quote_identifier(arg));
         }
 
         // Table-valued pragma helpers execute inside the parent statement's VM step.
         // For example, UPDATE ... FROM pragma_table_info('dst') runs this helper while the
         // outer UPDATE still has an active MVCC transaction and write cursor open on `dst`.
         // The helper must stay nested so it does not disturb the parent's transaction state.
-        self.stmt = Some(self.conn.prepare_internal(sql)?);
+        self.stmt = Some(self.conn.prepare_engine(EngineSql::new(sql), Origin::Nested)?);
 
         self.next()
     }

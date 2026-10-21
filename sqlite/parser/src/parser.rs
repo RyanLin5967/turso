@@ -707,6 +707,8 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_stmt(&mut self) -> Result<Stmt> {
+        // Stack-guard class (fastest-engine): a recursive entry is a nested step (`turso_stack_guard::NestGuard`).
+        let _nest = turso_stack_guard::NestGuard::enter().map_err(|_| Error::StackDepthLimitExceeded)?;
         let tok = peek_expect!(
             self,
             TK_BEGIN,
@@ -1674,6 +1676,10 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_expr_operand(&mut self) -> Result<Box<Expr>> {
+        // Stack-guard class (fastest-engine): a recursive entry is a nested step (`turso_stack_guard::NestGuard`).
+        // Between parse_expr and a nested parse_select these frames held 143,456 B with no check
+        // (core stack::tests::two_consecutive_nested_checks_are_less_than_one_level_cost_apart).
+        let _nest = turso_stack_guard::NestGuard::enter().map_err(|_| Error::StackDepthLimitExceeded)?;
         // Height of the operand. Leaves keep this default; branches that recurse
         // into sub-expressions overwrite it with `1 + max(child heights)` so the
         // enclosing chain guard (see `parse_expr_inner`) sees their true depth.
@@ -2094,6 +2100,8 @@ impl<'a> Parser<'a> {
     /// height of the resulting tree by [`MAX_EXPR_DEPTH`]. On return,
     /// `last_expr_height` holds the height of the returned expression.
     fn parse_expr(&mut self, precedence: u8) -> Result<Box<Expr>> {
+        // Stack-guard class (fastest-engine): a recursive entry is a nested step (`turso_stack_guard::NestGuard`).
+        let _nest = turso_stack_guard::NestGuard::enter().map_err(|_| Error::StackDepthLimitExceeded)?;
         self.expr_nesting_depth += 1;
         if self.expr_nesting_depth as usize > MAX_EXPR_DEPTH {
             self.expr_nesting_depth -= 1;
@@ -2107,6 +2115,10 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_expr_inner(&mut self, precedence: u8) -> Result<Box<Expr>> {
+        // Stack-guard class (fastest-engine): a recursive entry is a nested step (`turso_stack_guard::NestGuard`).
+        // Between parse_expr and a nested parse_select these frames held 143,456 B with no check
+        // (core stack::tests::two_consecutive_nested_checks_are_less_than_one_level_cost_apart).
+        let _nest = turso_stack_guard::NestGuard::enter().map_err(|_| Error::StackDepthLimitExceeded)?;
         let mut result = self.parse_expr_operand()?;
         // Running height of `result`, maintained bottom-up so that a left-deep
         // chain (`a OR b OR c ...`), which this loop consumes iteratively, is
@@ -3003,6 +3015,8 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_from_clause(&mut self) -> Result<FromClause> {
+        // Stack-guard class (fastest-engine): a recursive entry is a nested step (`turso_stack_guard::NestGuard`).
+        let _nest = turso_stack_guard::NestGuard::enter().map_err(|_| Error::StackDepthLimitExceeded)?;
         let tok = peek_expect!(
             self,
             TK_ID,
@@ -3167,6 +3181,8 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_one_select(&mut self) -> Result<OneSelect> {
+        // Stack-guard class (fastest-engine): a recursive entry is a nested step (`turso_stack_guard::NestGuard`).
+        let _nest = turso_stack_guard::NestGuard::enter().map_err(|_| Error::StackDepthLimitExceeded)?;
         let tok = eat_expect!(self, TK_SELECT, TK_VALUES);
         match tok.token_type {
             TK_SELECT => {
@@ -3215,6 +3231,8 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_select_body(&mut self) -> Result<SelectBody> {
+        // Stack-guard class (fastest-engine): a recursive entry is a nested step (`turso_stack_guard::NestGuard`).
+        let _nest = turso_stack_guard::NestGuard::enter().map_err(|_| Error::StackDepthLimitExceeded)?;
         let select = self.parse_one_select()?;
         let mut compounds = vec![];
         while let Some(tok) = self.peek()? {
@@ -3348,6 +3366,8 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_select_without_cte(&mut self, with: Option<With>) -> Result<Select> {
+        // Stack-guard class (fastest-engine): a recursive entry is a nested step (`turso_stack_guard::NestGuard`).
+        let _nest = turso_stack_guard::NestGuard::enter().map_err(|_| Error::StackDepthLimitExceeded)?;
         let body = self.parse_select_body()?;
         let order_by = self.parse_order_by()?;
         let limit = self.parse_limit()?;
@@ -3386,6 +3406,8 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_select(&mut self) -> Result<Select> {
+        // Stack-guard class (fastest-engine): a recursive entry is a nested step (`turso_stack_guard::NestGuard`).
+        let _nest = turso_stack_guard::NestGuard::enter().map_err(|_| Error::StackDepthLimitExceeded)?;
         let with = self.parse_with()?;
         self.parse_select_without_cte(with)
     }
@@ -4787,18 +4809,32 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// The name of CREATE TYPE and DROP TYPE as written: an identifier token with its quotes kept,
+    /// or a bracket-quoted name given as the double-quoted token naming the same identifier
+    /// (`[m x]` as `"m x"`), the one quoted form the type registry's key, the stored SQL and its
+    /// reparse all read alike (`schema::type_key`, `build_create_type_sql`). Queue a-f review L1:
+    /// `CREATE TYPE [m x]` was refused; kept as `[m x]` (7870317a3) it was stored as `"[m x]"`,
+    /// another type, so `"m x"` on a column was unknown (lane raw uw-glibc228-lib-branch-83450678a).
+    fn parse_type_name(&mut self) -> Result<String> {
+        if let Some(tok) = self.peek()? {
+            if tok.token_type == TK_LBRACKET && !self.peeked_empty_brackets() {
+                let name = self.parse_bracket_quoted_name()?;
+                return Ok(format!("\"{}\"", name.as_str().replace('"', "\"\"")));
+            }
+        }
+        match self.eat()? {
+            Some(tok) if tok.token_type == TK_ID => Ok(from_bytes(tok.as_bytes())),
+            _ => Err(Error::ParseError("expected type name".to_owned())),
+        }
+    }
+
     /// Parse `CREATE TYPE [IF NOT EXISTS] name AS STRUCT(...) | UNION(...)`
     /// or `CREATE TYPE [IF NOT EXISTS] name[(param, ...)] BASE base_type ...`
     fn parse_create_type(&mut self) -> Result<Stmt> {
         eat_assert!(self, TK_TYPE);
         let if_not_exists = self.parse_if_not_exists()?;
 
-        // Parse type name
-        let name_tok = self.eat()?;
-        let type_name = match name_tok {
-            Some(tok) if tok.token_type == TK_ID => from_bytes(tok.as_bytes()),
-            _ => return Err(Error::ParseError("expected type name".to_owned())),
-        };
+        let type_name = self.parse_type_name()?;
 
         // Check for AS STRUCT/UNION syntax
         if let Some(tok) = self.peek()? {
@@ -5259,11 +5295,7 @@ impl<'a> Parser<'a> {
             TK_TYPE => {
                 eat_assert!(self, TK_TYPE);
                 let if_exists = self.parse_if_exists()?;
-                let name_tok = self.eat()?;
-                let type_name = match name_tok {
-                    Some(tok) if tok.token_type == TK_ID => from_bytes(tok.as_bytes()),
-                    _ => return Err(Error::ParseError("expected type name".to_owned())),
-                };
+                let type_name = self.parse_type_name()?;
                 Ok(Stmt::DropType {
                     if_exists,
                     type_name,

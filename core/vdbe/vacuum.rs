@@ -1,3 +1,4 @@
+use crate::connection::{EngineSql, Origin};
 use rustc_hash::FxHashMap;
 use std::sync::{atomic::Ordering, Arc};
 
@@ -583,7 +584,7 @@ pub(crate) fn vacuum_target_build_step(
 
                 // Enable MVCC on targets that should persist as MVCC.
                 if config.target_mvcc_enabled {
-                    state.target_conn.execute("PRAGMA journal_mode = 'mvcc'")?;
+                    state.target_conn.execute_engine(EngineSql::new("PRAGMA journal_mode = 'mvcc'"), Origin::Root)?;
                 }
 
                 // Performance optimizations for the target database (matches SQLite vacuum.c):
@@ -599,7 +600,9 @@ pub(crate) fn vacuum_target_build_step(
                 // Wrap all operations in a single write transaction so helper
                 // statements share one durable target build and cleanup can
                 // roll it back reliably on error.
-                state.target_conn.execute("BEGIN IMMEDIATE")?;
+                // Engine helper text: SQLite whatever the dialect (the wire's NO SILENT DIALECT
+                // SWITCH class), as are the target's other helper statements below.
+                state.target_conn.execute_engine(EngineSql::new("BEGIN IMMEDIATE"), Origin::Root)?;
 
                 // Query sqlite_schema with rootpage, ordered by rowid.
                 // Decide whether schema replay should include the internal MVCC metadata table.
@@ -621,7 +624,7 @@ pub(crate) fn vacuum_target_build_step(
                         crate::mvcc::database::MVCC_META_TABLE_NAME
                     )
                 };
-                let schema_stmt = config.source_conn.prepare_internal(schema_sql.as_str())?;
+                let schema_stmt = config.source_conn.prepare_engine(EngineSql::new(schema_sql.as_str()), Origin::Nested)?;
 
                 state.phase = VacuumTargetBuildPhase::CollectSchemaRows {
                     schema_stmt: Box::new(schema_stmt),
@@ -695,7 +698,6 @@ pub(crate) fn vacuum_target_build_step(
 
                 let entry_ordinal = state.tables_to_create[idx];
                 let entry = &state.schema_entries[entry_ordinal];
-                let sql = table_sql_for_vacuum_replay(&state.target_conn, &entry.sql)?;
 
                 // System tables (sqlite_stat1, __turso_internal_types, etc.) have
                 // reserved name prefixes that translate_create_table rejects for
@@ -708,7 +710,8 @@ pub(crate) fn vacuum_target_build_step(
                 if is_system {
                     state.target_conn.start_nested();
                 }
-                let target_stmt = state.target_conn.prepare(&sql);
+                // The row's own bytes are kept, its text parsed as the dialect reports (REVISION 2).
+                let target_stmt = state.target_conn.prepare_replay(entry, Origin::Root);
                 if is_system {
                     state.target_conn.end_nested();
                 }
@@ -785,7 +788,7 @@ pub(crate) fn vacuum_target_build_step(
                     }
                 }
 
-                let escaped_table_name = table_name.replace('"', "\"\"");
+                let escaped_table_name = crate::util::escape_identifier(table_name);
                 // Derive copy-column list from BTreeTable.columns in schema,
                 // filtering out virtual generated columns so the SELECT and
                 // INSERT arities stay aligned.
@@ -811,7 +814,7 @@ pub(crate) fn vacuum_target_build_step(
                 )?;
 
                 // SELECT from source, INSERT into the target.
-                let select_stmt = config.source_conn.prepare_internal(&select_sql)?;
+                let select_stmt = config.source_conn.prepare_engine(EngineSql::new(&select_sql), Origin::Nested)?;
 
                 // System tables need nested mode during prepare() to bypass
                 // "may not be modified" checks. Can't use prepare_internal()
@@ -821,7 +824,7 @@ pub(crate) fn vacuum_target_build_step(
                 if is_system {
                     state.target_conn.start_nested();
                 }
-                let target_insert_stmt = state.target_conn.prepare(&insert_sql);
+                let target_insert_stmt = state.target_conn.prepare_engine(EngineSql::new(&insert_sql), Origin::Root);
                 if is_system {
                     state.target_conn.end_nested();
                 }
@@ -934,7 +937,8 @@ pub(crate) fn vacuum_target_build_step(
                 // Backing-btree indexes for custom index methods were filtered
                 // out when indexes_to_create was built. The remaining CREATE
                 // INDEX statements are user-visible and can use ordinary prepare.
-                let target_stmt = state.target_conn.prepare(&entry.sql)?;
+                // Canonical SQLite text, its bytes kept (REVISION 2; it went through the client parser).
+                let target_stmt = state.target_conn.prepare_replay(entry, Origin::Root)?;
                 state.phase = VacuumTargetBuildPhase::StepCreateIndex {
                     target_schema_stmt: Box::new(target_stmt),
                     idx,
@@ -980,7 +984,7 @@ pub(crate) fn vacuum_target_build_step(
 
                 let entry_ordinal = state.post_data_entries[idx];
                 let entry = &state.schema_entries[entry_ordinal];
-                let target_stmt = state.target_conn.prepare(&entry.sql)?;
+                let target_stmt = state.target_conn.prepare_replay(entry, Origin::Root)?;
                 state.phase = VacuumTargetBuildPhase::StepPostData {
                     target_schema_stmt: Box::new(target_stmt),
                     idx,
@@ -1031,16 +1035,13 @@ pub(crate) fn vacuum_target_build_step(
 
             VacuumTargetBuildPhase::Done => {
                 // Commit the target transaction started in Init phase.
-                state.target_conn.execute("COMMIT")?;
+                state.target_conn.execute_engine(EngineSql::new("COMMIT"), Origin::Root)?;
                 return Ok(crate::IOResult::Done(()));
             }
         }
     }
 }
 
-fn table_sql_for_vacuum_replay(target_conn: &Arc<Connection>, sql: &str) -> Result<String> {
-    target_conn.dialect().table_sql_for_replay(sql)
-}
 
 // Build the SELECT and INSERT SQL strings for copying a table's data.
 //
@@ -1089,8 +1090,7 @@ pub(crate) fn build_copy_sql(
                 "missing column name for table \"{escaped_table_name}\""
             )));
         };
-        let escaped = name.replace('"', "\"\"");
-        data_columns.push(format!("\"{escaped}\""));
+        data_columns.push(crate::util::double_quote_identifier(name));
     }
 
     if data_columns.is_empty() {
@@ -3298,7 +3298,7 @@ mod tests {
         target_conn.execute("CREATE TABLE seed(x)")?;
 
         let mut context = VacuumTargetBuildContext::new(target_conn.clone());
-        let helper_stmt = target_conn.prepare_internal("SELECT 1")?;
+        let helper_stmt = target_conn.prepare_engine(EngineSql::new("SELECT 1"), Origin::Nested)?;
         context.phase = VacuumTargetBuildPhase::CollectSchemaRows {
             schema_stmt: Box::new(helper_stmt),
         };

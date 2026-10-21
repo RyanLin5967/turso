@@ -330,6 +330,16 @@ pub enum TxEvent {
     RollbackTo,
 }
 
+/// The PostgreSQL parser's and translator's error as the engine's: its stack-guard refusal is the
+/// engine's own (`LimboError::StackDepthLimitExceeded`, 54001 on the wire), anything else a parse
+/// error as before.
+pub(crate) fn pg_parse_error(e: turso_pg_parser::ParseError) -> LimboError {
+    match e {
+        turso_pg_parser::ParseError::StackDepthLimitExceeded => LimboError::StackDepthLimitExceeded,
+        e => LimboError::ParseError(e.into()),
+    }
+}
+
 /// Open a database with the PostgreSQL schema dialect, resolving the IO
 /// backend from `vfs` or the path like [`turso_core::Database::open_new`].
 pub fn open_database(
@@ -1092,7 +1102,7 @@ pub fn read_parse_message(sql: &str) -> Result<ParseMessage> {
     // The trimmed text, as the prepare reads it: the tree's locations must index the text the
     // prepare holds (a leading blank shifted every $n's location by one).
     let parse =
-        turso_pg_parser::parse(trimmed).map_err(|e| LimboError::ParseError(e.into()))?;
+        turso_pg_parser::parse(trimmed).map_err(crate::session::pg_parse_error)?;
     let numbers = turso_pg_parser::checked_param_numbers(&parse, trimmed);
     let prefix = BRANCH_FUNCTION_PREFIX.as_bytes();
     let mentions = sql
@@ -1577,7 +1587,7 @@ fn prepare_statement_parsed(
     // message's serves its classification too (C53).
     let parse_result = match parsed {
         Some(parsed) => parsed,
-        None => turso_pg_parser::parse(sql).map_err(|e| LimboError::ParseError(e.into()))?,
+        None => turso_pg_parser::parse(sql).map_err(crate::session::pg_parse_error)?,
     };
     // One statement per prepare, as PostgreSQL's Parse takes one (42601): the translator reads the
     // first, so `COMMIT; INSERT ...` in one Parse committed and skipped the INSERT, answering
@@ -1595,7 +1605,7 @@ fn prepare_statement_parsed(
         // Read from the text as PostgreSQL 18 reads them: a number above i32::MAX is 42601, never
         // libpg_query's 32-bit wrap (wire review 12 item 1).
         let numbers = turso_pg_parser::checked_param_numbers(&parse_result, sql)
-            .map_err(|e| LimboError::ParseError(e.into()))?;
+            .map_err(crate::session::pg_parse_error)?;
         if let Some(n) = numbers
             .iter()
             .find(|n| !(1..=crate::result_types::MAX_PARAMETER as i32).contains(*n))
@@ -1799,7 +1809,7 @@ fn prepare_statement_parsed(
         let _planning = enter(Phase::Plan);
         let prepared = pg_conn
             .conn
-            .prepare_translated_cmd_with_options(translated.cmd, sql, &options);
+            .prepare_translated_cmd_with_options(translated.cmd, sql, options.clone());
         // A positional INSERT whose VALUES lists are of another length than the table's is refused
         // by the engine, which takes only the full length; PostgreSQL fills a shorter list's
         // leading columns. Asked again, the translator reads the table's columns and names them, on
@@ -1808,7 +1818,7 @@ fn prepare_statement_parsed(
             let retried = session_translation(pg_conn, sql, &parse_result, true)?;
             return pg_conn
                 .conn
-                .prepare_translated_cmd_with_options(retried.cmd, sql, &options)
+                .prepare_translated_cmd_with_options(retried.cmd, sql, options.clone())
                 .map(Some);
         }
         return prepared.map(Some);
@@ -1824,12 +1834,12 @@ fn prepare_statement_parsed(
             let input = catalog::sqlite_text(prereq.to_string());
             pg_conn
                 .conn
-                .prepare_translated_stmt_with_options(prereq, &input, &options)?
+                .prepare_translated_stmt_with_options(prereq, &input, options.clone())?
                 .run_ignore_rows()?;
         }
         pg_conn
             .conn
-            .prepare_translated_cmd_with_options(translated.cmd, sql, &options)?
+            .prepare_translated_cmd_with_options(translated.cmd, sql, options.clone())?
             .run_ignore_rows()?;
         match new_table_keys.as_deref() {
             Some(table) => check_table_keys(&pg_conn.conn, table),
@@ -3433,7 +3443,7 @@ fn handle_pg_add_constraints(
         )
     })?;
     let mut parsed =
-        turso_pg_parser::parse(pg_definition).map_err(|e| LimboError::ParseError(e.into()))?;
+        turso_pg_parser::parse(pg_definition).map_err(crate::session::pg_parse_error)?;
     // Taken before the definition is edited below (a clone made while `create` borrows it would
     // not compile).
     let mut aside_tree = parsed.protobuf.clone();
@@ -3494,10 +3504,10 @@ fn handle_pg_add_constraints(
         }
     }
     let aside_def =
-        turso_pg_parser::deparse(&aside_tree).map_err(|e| LimboError::ParseError(e.into()))?;
+        turso_pg_parser::deparse(&aside_tree).map_err(crate::session::pg_parse_error)?;
     create.table_elts.extend(add.constraints.iter().cloned());
     let rebuilt =
-        turso_pg_parser::deparse(&parsed.protobuf).map_err(|e| LimboError::ParseError(e.into()))?;
+        turso_pg_parser::deparse(&parsed.protobuf).map_err(crate::session::pg_parse_error)?;
     // Every refusal the translator makes of the rebuilt CREATE TABLE (MATCH FULL over several
     // columns among them) is answered here, before anything is copied, dropped or locked: it came
     // from the rebuild's own CREATE, after the BEGIN, the aside copy and the DROP, under the trunk's
@@ -3505,7 +3515,7 @@ fn handle_pg_add_constraints(
     // review 16 item 9). One translation of the tree already in hand, no parse.
     PostgreSQLTranslator::new()
         .translate_with_prereqs(&parsed)
-        .map_err(|e| LimboError::ParseError(e.into()))?;
+        .map_err(crate::session::pg_parse_error)?;
 
     let quoted = catalog::quote_ident(table);
     let aside = catalog::quote_ident(&aside_name);

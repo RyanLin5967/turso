@@ -1,6 +1,6 @@
 use crate::pragma::{PragmaVirtualTable, PragmaVirtualTableCursor};
 use crate::schema::Column;
-use crate::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
+use crate::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 use crate::sync::{Arc, RwLock, Weak};
 use crate::util::columns_from_create_table_body;
 use crate::{Connection, LimboError, SymbolTable, Value};
@@ -171,11 +171,11 @@ impl VirtualTable {
         }
     }
 
-    pub(crate) fn destroy(&self) -> crate::Result<()> {
-        match &self.vtab_type {
-            VirtualTableType::Pragma(_) => Ok(()),
-            VirtualTableType::External(table) => table.destroy(),
-            VirtualTableType::Internal(_) => Ok(()),
+    /// Its DROP TABLE committed: an external module's table is destroyed when the last holder of it
+    /// (any connection's schema, program or cursor) lets go (`ExtTable`'s drop).
+    pub(crate) fn destroy_when_unused(&self) {
+        if let VirtualTableType::External(table) = &self.vtab_type {
+            table.destroy_when_unused();
         }
     }
 
@@ -338,15 +338,40 @@ impl VirtualTableCursor {
 #[derive(Debug)]
 pub(crate) struct ExtVirtualTable {
     implementation: Arc<VTabModuleImpl>,
-    table_ptr: AtomicPtr<c_void>,
+    /// The module's table, shared by every clone of this table and every cursor open on it.
+    table: Arc<ExtTable>,
 }
 static VTAB_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+/// One module table instance (its pointer), destroyed by the last holder to let go once its
+/// `DROP TABLE` committed (`ExtVirtualTable::destroy_when_unused`): a connection whose schema, or a
+/// program or cursor of whose, still holds the table never sees it freed (engine-rev-qaf-fix MED-7:
+/// the dropping connection destroyed it at its commit, checking only its own schemas).
+#[derive(Debug)]
+struct ExtTable {
+    implementation: Arc<VTabModuleImpl>,
+    ptr: AtomicPtr<c_void>,
+    destroy_on_drop: AtomicBool,
+}
+
+impl Drop for ExtTable {
+    fn drop(&mut self) {
+        if !self.destroy_on_drop.load(Ordering::Acquire) {
+            return;
+        }
+        let rc = unsafe { (self.implementation.destroy)(self.ptr.load(Ordering::SeqCst) as *const c_void) };
+        if !rc.is_ok() {
+            // Its DROP committed; a destroy that fails after it cannot fail the DROP.
+            tracing::error!("destroying a dropped virtual table failed: {rc}");
+        }
+    }
+}
 
 impl Clone for ExtVirtualTable {
     fn clone(&self) -> Self {
         Self {
             implementation: self.implementation.clone(),
-            table_ptr: AtomicPtr::new(self.table_ptr.load(Ordering::SeqCst)),
+            table: self.table.clone(),
         }
     }
 }
@@ -394,7 +419,11 @@ impl ExtVirtualTable {
         let (schema, table_ptr) = module.implementation.create(args)?;
         let vtab = ExtVirtualTable {
             implementation: module.implementation.clone(),
-            table_ptr: AtomicPtr::new(table_ptr as *mut c_void),
+            table: Arc::new(ExtTable {
+                implementation: module.implementation.clone(),
+                ptr: AtomicPtr::new(table_ptr as *mut c_void),
+                destroy_on_drop: AtomicBool::new(false),
+            }),
         };
         Ok((vtab, schema))
     }
@@ -414,13 +443,13 @@ impl ExtVirtualTable {
         // store the leaked connection pointer on the table so it can be freed on drop
         let Some(cursor) = NonNull::new(unsafe {
             (self.implementation.open)(
-                self.table_ptr.load(Ordering::SeqCst) as *const c_void,
+                self.table.ptr.load(Ordering::SeqCst) as *const c_void,
                 ext_conn_ptr.as_ptr(),
             ) as *mut c_void
         }) else {
             return Err(LimboError::ExtensionError("Open returned null".to_string().into()));
         };
-        ExtVirtualTableCursor::new(cursor, ext_conn_ptr, self.implementation.clone(), id)
+        ExtVirtualTableCursor::new(cursor, ext_conn_ptr, self.implementation.clone(), self.table.clone(), id)
     }
 
     fn update(&self, args: &[Value]) -> crate::Result<Option<i64>> {
@@ -429,7 +458,7 @@ impl ExtVirtualTable {
         let newrowid = 0i64;
         let rc = unsafe {
             (self.implementation.update)(
-                self.table_ptr.load(Ordering::SeqCst) as *const c_void,
+                self.table.ptr.load(Ordering::SeqCst) as *const c_void,
                 arg_count as i32,
                 ext_args.as_ptr(),
                 &newrowid as *const _ as *mut i64,
@@ -447,18 +476,13 @@ impl ExtVirtualTable {
         }
     }
 
-    fn destroy(&self) -> crate::Result<()> {
-        let rc = unsafe {
-            (self.implementation.destroy)(self.table_ptr.load(Ordering::SeqCst) as *const c_void)
-        };
-        match rc {
-            ResultCode::OK => Ok(()),
-            _ => Err(LimboError::ExtensionError(rc.to_string().into())),
-        }
+    /// Its DROP TABLE committed: the module's table is destroyed when its last holder lets go.
+    fn destroy_when_unused(&self) {
+        self.table.destroy_on_drop.store(true, Ordering::Release);
     }
 
     fn commit(&self) -> crate::Result<()> {
-        let rc = unsafe { (self.implementation.commit)(self.table_ptr.load(Ordering::SeqCst)) };
+        let rc = unsafe { (self.implementation.commit)(self.table.ptr.load(Ordering::SeqCst)) };
         match rc {
             ResultCode::OK => Ok(()),
             _ => Err(LimboError::ExtensionError("Commit failed".to_string().into())),
@@ -466,7 +490,7 @@ impl ExtVirtualTable {
     }
 
     fn begin(&self) -> crate::Result<()> {
-        let rc = unsafe { (self.implementation.begin)(self.table_ptr.load(Ordering::SeqCst)) };
+        let rc = unsafe { (self.implementation.begin)(self.table.ptr.load(Ordering::SeqCst)) };
         match rc {
             ResultCode::OK => Ok(()),
             _ => Err(LimboError::ExtensionError("Begin failed".to_string().into())),
@@ -474,7 +498,7 @@ impl ExtVirtualTable {
     }
 
     fn rollback(&self) -> crate::Result<()> {
-        let rc = unsafe { (self.implementation.rollback)(self.table_ptr.load(Ordering::SeqCst)) };
+        let rc = unsafe { (self.implementation.rollback)(self.table.ptr.load(Ordering::SeqCst)) };
         match rc {
             ResultCode::OK => Ok(()),
             _ => Err(LimboError::ExtensionError("Rollback failed".to_string().into())),
@@ -484,7 +508,7 @@ impl ExtVirtualTable {
     fn rename(&self, new_name: &str) -> crate::Result<()> {
         let c_new_name = std::ffi::CString::new(new_name).unwrap();
         let rc = unsafe {
-            (self.implementation.rename)(self.table_ptr.load(Ordering::SeqCst), c_new_name.as_ptr())
+            (self.implementation.rename)(self.table.ptr.load(Ordering::SeqCst), c_new_name.as_ptr())
         };
         match rc {
             ResultCode::OK => Ok(()),
@@ -500,6 +524,9 @@ pub struct ExtVirtualTableCursor {
     conn_ptr: Option<NonNull<turso_ext::Conn>>,
     implementation: Arc<VTabModuleImpl>,
     vtab_id: u64,
+    /// Keeps the module's table alive while the cursor is open; dropped after the cursor's close
+    /// (fields drop after `Drop::drop`).
+    _table: Arc<ExtTable>,
 }
 
 // SAFETY: Extension provider must guarantee Send + Sync on their side
@@ -513,6 +540,7 @@ impl ExtVirtualTableCursor {
         cursor: NonNull<c_void>,
         conn_ptr: NonNull<turso_ext::Conn>,
         implementation: Arc<VTabModuleImpl>,
+        table: Arc<ExtTable>,
         id: u64,
     ) -> crate::Result<Self> {
         Ok(Self {
@@ -520,6 +548,7 @@ impl ExtVirtualTableCursor {
             conn_ptr: Some(conn_ptr),
             implementation,
             vtab_id: id,
+            _table: table,
         })
     }
 

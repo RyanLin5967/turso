@@ -515,6 +515,8 @@ impl PostgreSQLTranslator {
     }
 
     fn translate_node(&self, node: NodeRef<'_>) -> Result<ast::Stmt, ParseError> {
+        // Stack-guard class (fastest-engine): a recursive entry is a nested step (`turso_stack_guard::NestGuard`).
+        let _nest = crate::nest()?;
         Ok(match node {
             NodeRef::SelectStmt(select) => {
                 // Top-level SELECT ... INTO is PG's legacy spelling of
@@ -2293,6 +2295,8 @@ impl PostgreSQLTranslator {
         &self,
         select: &pg_query::protobuf::SelectStmt,
     ) -> Result<ast::Select, ParseError> {
+        // Stack-guard class (fastest-engine): a recursive entry is a nested step (`turso_stack_guard::NestGuard`).
+        let _nest = crate::nest()?;
         self.in_cte_scope(&select.with_clause, || {
             self.translate_select_in_scope(select)
         })
@@ -2417,6 +2421,8 @@ impl PostgreSQLTranslator {
         &self,
         select: &pg_query::protobuf::SelectStmt,
     ) -> Result<ast::Select, ParseError> {
+        // Stack-guard class (fastest-engine): a recursive entry is a nested step (`turso_stack_guard::NestGuard`).
+        let _nest = crate::nest()?;
         // The left spine of the tree flattens into a list the engine runs left to right, which is
         // PostgreSQL's order for it: pg_query represents A UNION B UNION C, and A INTERSECT B UNION
         // C, as SetOp(SetOp(A, B), C). Anything else is an arm of its own, a subquery
@@ -2474,6 +2480,8 @@ impl PostgreSQLTranslator {
         stmt: &pg_query::protobuf::SelectStmt,
         wrap: bool,
     ) -> Result<ast::OneSelect, ParseError> {
+        // Stack-guard class (fastest-engine): a recursive entry is a nested step (`turso_stack_guard::NestGuard`).
+        let _nest = crate::nest()?;
         if !wrap {
             return self.translate_one_select(stmt);
         }
@@ -2565,6 +2573,8 @@ impl PostgreSQLTranslator {
         &self,
         select: &pg_query::protobuf::SelectStmt,
     ) -> Result<ast::OneSelect, ParseError> {
+        // Stack-guard class (fastest-engine): a recursive entry is a nested step (`turso_stack_guard::NestGuard`).
+        let _nest = crate::nest()?;
         // Compound-select leaves carry their own IntoClause. PG allows INTO
         // only on the first leaf of a top-level compound; reject all of them
         // rather than implement that form.
@@ -2623,6 +2633,8 @@ impl PostgreSQLTranslator {
         &self,
         from_items: &[pg_query::protobuf::Node],
     ) -> Result<ast::FromClause, ParseError> {
+        // Stack-guard class (fastest-engine): a recursive entry is a nested step (`turso_stack_guard::NestGuard`).
+        let _nest = crate::nest()?;
         let mut from_clause = self.translate_from_clause(&from_items[0])?;
         // Additional FROM items are comma-joins (implicit cross join)
         for item in &from_items[1..] {
@@ -2661,6 +2673,8 @@ impl PostgreSQLTranslator {
         &self,
         from_item: &pg_query::protobuf::Node,
     ) -> Result<ast::FromClause, ParseError> {
+        // Stack-guard class (fastest-engine): a recursive entry is a nested step (`turso_stack_guard::NestGuard`).
+        let _nest = crate::nest()?;
         match &from_item.node {
             Some(pg_query::protobuf::node::Node::RangeVar(range_var)) => {
                 let select_table = self.translate_range_var(range_var)?;
@@ -2862,6 +2876,8 @@ impl PostgreSQLTranslator {
         &self,
         range_sub: &pg_query::protobuf::RangeSubselect,
     ) -> Result<ast::SelectTable, ParseError> {
+        // Stack-guard class (fastest-engine): a recursive entry is a nested step (`turso_stack_guard::NestGuard`).
+        let _nest = crate::nest()?;
         if range_sub.lateral {
             return Err(ParseError::ParseError(
                 "LATERAL is supported only as CROSS JOIN LATERAL of a subquery of expressions"
@@ -3190,6 +3206,8 @@ impl PostgreSQLTranslator {
         &self,
         join_expr: &pg_query::protobuf::JoinExpr,
     ) -> Result<ast::FromClause, ParseError> {
+        // Stack-guard class (fastest-engine): a recursive entry is a nested step (`turso_stack_guard::NestGuard`).
+        let _nest = crate::nest()?;
         if join_expr.is_natural || !join_expr.using_clause.is_empty() {
             if let Some(scope) = self.lateral_scopes.borrow_mut().last_mut() {
                 scope.merged = true;
@@ -3424,6 +3442,8 @@ impl PostgreSQLTranslator {
     }
 
     fn translate_expr(&self, node: &pg_query::protobuf::Node) -> Result<ast::Expr, ParseError> {
+        // Stack-guard class (fastest-engine): a recursive entry is a nested step (`turso_stack_guard::NestGuard`).
+        let _nest = crate::nest()?;
         match &node.node {
             Some(pg_query::protobuf::node::Node::ColumnRef(col_ref)) => {
                 if let Some((table, _)) = self.series_column(col_ref)? {
@@ -3716,6 +3736,38 @@ impl PostgreSQLTranslator {
                     Some(t) => pg_type_name_to_ast_type(t).or_else(|| self.engine_type(t)),
                     None => None,
                 };
+                // A cast to bytea casts as PostgreSQL 18 does (lead DECISIONS 60ddcb6f8f): an
+                // integer is its big-endian two's complement at its type's width (int2send,
+                // int4send, int8send), numeric, float and boolean have no cast (42846), and the
+                // engine's BLOB cast took a number's text as bytes. A source whose type the syntax
+                // gives (a constant, a cast) is decided here, where an int2 cast's width is still
+                // known; any other goes to the engine's bytea type, which decides by the column's
+                // declared type or the expression's affinity.
+                if type_name.as_ref().is_some_and(|t| t.name == "BLOB") {
+                    match pg_bytea_source(arg) {
+                        PgByteaSource::Integer(width) => {
+                            let send = ast::Expr::FunctionCall {
+                                name: ast::Name::from_string(format!("int{width}send")),
+                                distinctness: None,
+                                args: vec![expr],
+                                order_by: vec![],
+                                within_group: vec![],
+                                filter_over: ast::FunctionTail { filter_clause: None, over_clause: None },
+                            };
+                            return Ok(ast::Expr::Cast { expr: Box::new(send), type_name });
+                        }
+                        PgByteaSource::NoCast(source) => {
+                            return Err(ParseError::ParseError(SqlErrorMessage::classified(
+                                SqlErrorKind::CannotCoerce,
+                                format!("cannot cast type {source} to bytea"),
+                            )));
+                        }
+                        PgByteaSource::Other => {
+                            let bytea = ast::Type { name: "bytea".to_string(), size: None, array_dimensions: 0 };
+                            return Ok(ast::Expr::Cast { expr, type_name: Some(bytea) });
+                        }
+                    }
+                }
                 Ok(ast::Expr::Cast { expr, type_name })
             }
             Some(pg_query::protobuf::node::Node::SubLink(sub_link)) => {
@@ -4041,6 +4093,8 @@ impl PostgreSQLTranslator {
         &self,
         a_expr: &pg_query::protobuf::AExpr,
     ) -> Result<ast::Expr, ParseError> {
+        // Stack-guard class (fastest-engine): a recursive entry is a nested step (`turso_stack_guard::NestGuard`).
+        let _nest = crate::nest()?;
         use pg_query::protobuf::AExprKind;
 
         match &a_expr.kind() {
@@ -4629,6 +4683,8 @@ impl PostgreSQLTranslator {
         &self,
         func_call: &pg_query::protobuf::FuncCall,
     ) -> Result<ast::Expr, ParseError> {
+        // Stack-guard class (fastest-engine): a recursive entry is a nested step (`turso_stack_guard::NestGuard`).
+        let _nest = crate::nest()?;
         // Extract function name
         let func_name = func_call
             .funcname
@@ -4962,6 +5018,8 @@ impl PostgreSQLTranslator {
         &self,
         case_expr: &pg_query::protobuf::CaseExpr,
     ) -> Result<ast::Expr, ParseError> {
+        // Stack-guard class (fastest-engine): a recursive entry is a nested step (`turso_stack_guard::NestGuard`).
+        let _nest = crate::nest()?;
         // Translate optional base expression (CASE <expr> WHEN ...)
         let base = if let Some(arg) = &case_expr.arg {
             Some(Box::new(self.translate_expr(arg)?))
@@ -5042,6 +5100,8 @@ impl PostgreSQLTranslator {
         &self,
         sub_link: &pg_query::protobuf::SubLink,
     ) -> Result<ast::Expr, ParseError> {
+        // Stack-guard class (fastest-engine): a recursive entry is a nested step (`turso_stack_guard::NestGuard`).
+        let _nest = crate::nest()?;
         use pg_query::protobuf::SubLinkType;
 
         let subselect_node = sub_link.subselect.as_ref().ok_or_else(|| {
@@ -5082,6 +5142,8 @@ impl PostgreSQLTranslator {
         &self,
         with_clause: &Option<pg_query::protobuf::WithClause>,
     ) -> Result<Option<ast::With>, ParseError> {
+        // Stack-guard class (fastest-engine): a recursive entry is a nested step (`turso_stack_guard::NestGuard`).
+        let _nest = crate::nest()?;
         use pg_query::protobuf::node::Node;
 
         let with_clause = match with_clause {
@@ -5367,6 +5429,8 @@ impl PostgreSQLTranslator {
         &self,
         bool_expr: &pg_query::protobuf::BoolExpr,
     ) -> Result<ast::Expr, ParseError> {
+        // Stack-guard class (fastest-engine): a recursive entry is a nested step (`turso_stack_guard::NestGuard`).
+        let _nest = crate::nest()?;
         use pg_query::protobuf::BoolExprType;
 
         if bool_expr.args.is_empty() {
@@ -6166,6 +6230,64 @@ fn pg_type_name_to_ast_type(type_name: &pg_query::protobuf::TypeName) -> Option<
         size: None,
         array_dimensions: 0,
     })
+}
+
+/// What a cast to bytea does with its source, by the type the syntax gives it.
+enum PgByteaSource {
+    /// An integer of this many bytes (a constant: int4 if it fits, else int8; a cast to int2, int4
+    /// or int8): encoded as its big-endian two's complement.
+    Integer(u8),
+    /// A type PostgreSQL 18 has no cast to bytea from: refused 42846, named as PostgreSQL names it.
+    NoCast(&'static str),
+    /// Any other source (a string, a parameter, a column, an expression): the engine decides.
+    Other,
+}
+
+fn pg_bytea_source(node: &pg_query::protobuf::Node) -> PgByteaSource {
+    use pg_query::protobuf::{a_const::Val, node::Node};
+    let Some(node) = node.node.as_ref() else {
+        return PgByteaSource::Other;
+    };
+    match node {
+        Node::AConst(c) => match c.val.as_ref() {
+            Some(Val::Ival(_)) => PgByteaSource::Integer(4),
+            // A constant past int4 is int8 if it fits, else numeric (PostgreSQL's make_const).
+            Some(Val::Fval(f)) => {
+                let text = f.fval.replace('_', "");
+                let (neg, digits) = match text.strip_prefix('-') {
+                    Some(d) => (true, d.to_string()),
+                    None => (false, text.clone()),
+                };
+                let radix = |p: &str, r: u32| {
+                    digits.strip_prefix(p).or_else(|| digits.strip_prefix(&p.to_uppercase())).and_then(|d| i128::from_str_radix(d, r).ok())
+                };
+                let value = radix("0x", 16).or_else(|| radix("0o", 8)).or_else(|| radix("0b", 2)).or_else(|| digits.parse::<i128>().ok());
+                match value.map(|v| if neg { -v } else { v }) {
+                    Some(v) if i64::try_from(v).is_ok() => PgByteaSource::Integer(8),
+                    _ => PgByteaSource::NoCast("numeric"),
+                }
+            }
+            Some(Val::Boolval(_)) => PgByteaSource::NoCast("boolean"),
+            _ => PgByteaSource::Other,
+        },
+        Node::TypeCast(c) => {
+            let Some(name) = c.type_name.as_ref().and_then(|t| extract_type_name_from_typename(t).ok()) else {
+                return PgByteaSource::Other;
+            };
+            match name.to_ascii_lowercase().as_str() {
+                "int2" | "smallint" => PgByteaSource::Integer(2),
+                "int4" | "integer" | "int" => PgByteaSource::Integer(4),
+                "int8" | "bigint" => PgByteaSource::Integer(8),
+                "bool" | "boolean" => PgByteaSource::NoCast("boolean"),
+                "float4" | "real" => PgByteaSource::NoCast("real"),
+                "float8" | "double precision" => PgByteaSource::NoCast("double precision"),
+                "numeric" | "decimal" => PgByteaSource::NoCast("numeric"),
+                "oid" => PgByteaSource::NoCast("oid"),
+                _ => PgByteaSource::Other,
+            }
+        }
+        _ => PgByteaSource::Other,
+    }
 }
 
 /// PostgreSQL's pseudo-types, which no column may have (42P16 'column "a" has pseudo-type X').

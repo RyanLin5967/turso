@@ -39,6 +39,9 @@ impl super::Dialect for SqliteDialect {
     fn name(&self) -> &'static str {
         "sqlite"
     }
+    fn owns_stored_table_sql(&self, _sql: &str) -> bool {
+        false
+    }
 
     fn parse(&self, sql: &str) -> crate::Result<(Option<turso_parser::ast::Cmd>, usize)> {
         parse(sql)
@@ -50,6 +53,11 @@ impl super::Dialect for SqliteDialect {
 
     fn parse_table_sql_ast(&self, sql: &str) -> crate::Result<turso_parser::ast::Stmt> {
         parse_table_sql_ast(sql)
+    }
+
+    // Its replay text is SQLite (it goes through SQLite's table_sql_for_replay).
+    fn table_sql_for_replay_stored(&self, sql: &str) -> crate::Result<crate::connection::StoredSql> {
+        Ok(crate::connection::StoredSql::sqlite(self.table_sql_for_replay(sql)?))
     }
 
     fn table_sql_for_replay(&self, sql: &str) -> crate::Result<String> {
@@ -147,7 +155,7 @@ pub fn register_builtin_catalog(
     schema: &mut Schema,
     enable_custom_types: bool,
 ) -> crate::Result<()> {
-    for vtab in pragma_vtabs() {
+    for vtab in pragma_vtabs()? {
         schema.tables.insert(
             vtab.name.to_owned(),
             Arc::new(Table::Virtual(Arc::new((*vtab).clone()))),
@@ -170,21 +178,22 @@ pub fn register_builtin_catalog(
     Ok(())
 }
 
-/// Build a `VirtualTable` for each PRAGMA table-valued function.
-fn pragma_vtabs() -> Vec<Arc<VirtualTable>> {
+/// Build a `VirtualTable` for each PRAGMA table-valued function. The schemas are fixed and parse,
+/// but the parse can still be refused by the stack guard on a thread with almost no stack left
+/// (the stack-guard class: it panicked here on a 128 KiB thread), so the refusal is returned.
+fn pragma_vtabs() -> crate::Result<Vec<Arc<VirtualTable>>> {
     PragmaVirtualTable::functions()
         .into_iter()
         .map(|(tab, schema_sql)| {
-            Arc::new(VirtualTable {
+            Ok(Arc::new(VirtualTable {
                 name: format!("pragma_{}", tab.pragma_name),
-                columns: VirtualTable::resolve_columns(schema_sql)
-                    .expect("pragma table-valued function schema resolution should not fail"),
+                columns: VirtualTable::resolve_columns(schema_sql)?,
                 kind: VTabKind::TableValuedFunction,
                 vtab_type: VirtualTableType::Pragma(tab),
                 vtab_id: 0,
                 is_droppable: false,
                 innocuous: true,
-            })
+            }))
         })
         .collect()
 }
@@ -537,6 +546,7 @@ pub fn resolve_builtin_function(name: &str, arg_count: usize) -> crate::Result<O
         "int_to_boolean" => Ok(Some(Func::Scalar(ScalarFunc::IntToBoolean))),
         "validate_ipaddr" => Ok(Some(Func::Scalar(ScalarFunc::ValidateIpAddr))),
         "numeric_encode" => Ok(Some(Func::Scalar(ScalarFunc::NumericEncode))),
+        "varchar_encode" => Ok(Some(Func::Scalar(ScalarFunc::VarcharEncode))),
         "numeric_decode" => Ok(Some(Func::Scalar(ScalarFunc::NumericDecode))),
         "numeric_add" => Ok(Some(Func::Scalar(ScalarFunc::NumericAdd))),
         "numeric_sub" => Ok(Some(Func::Scalar(ScalarFunc::NumericSub))),

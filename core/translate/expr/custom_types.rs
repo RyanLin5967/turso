@@ -1188,6 +1188,97 @@ mod tests {
         );
     }
 
+    /// C32 MED (a Claude review, 2026-10-15): FLOAT4 and FLOAT8 are BASE-only custom types (no
+    /// ENCODE), and a CAST to one emitted nothing, so CAST('1.5' AS float8) stayed text. A CAST to a
+    /// BASE-only type casts by its primitive base's affinity. Expected values from sqlite3 3.51.0
+    /// (/usr/bin/sqlite3, 2025-06-12): `SELECT typeof(CAST('1.5' AS float8)), CAST('1.5' AS float8),
+    /// typeof(CAST('1.5' AS float4)), CAST('1.5' AS float4), typeof(CAST(2 AS float8)),
+    /// CAST(2 AS float8)` answered `real|1.5|real|1.5|real|2.0`.
+    #[test]
+    fn a_cast_to_a_base_only_type_casts_by_its_base() {
+        let conn = open();
+        let rows = conn
+            .prepare(
+                "SELECT typeof(CAST('1.5' AS float8)), CAST('1.5' AS float8), typeof(CAST('1.5' AS float4)), \
+                 CAST('1.5' AS float4), typeof(CAST(2 AS float8)), CAST(2 AS float8)",
+            )
+            .unwrap()
+            .run_collect_rows()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![vec![
+                Value::build_text("real"),
+                Value::from_f64(1.5),
+                Value::build_text("real"),
+                Value::from_f64(1.5),
+                Value::build_text("real"),
+                Value::from_f64(2.0),
+            ]]
+        );
+    }
+
+    /// A CAST to a BASE-only type over text (not a domain) converts to text, as PostgreSQL 18 casts
+    /// by the underlying type (review of 96b69304b, F4: the CAST was a no-op). FLAGGED: a change
+    /// the SQLite dialect sees too, for a custom type over text only (custom types are opt-in).
+    ///
+    /// Over bytea the SQLite dialect keeps SQLite's CAST unchanged (integrate-reviewer-2 L3; lead
+    /// DECISIONS 60ddcb6f8f): a number stays the number, as sqlite3 3.51.0 answers `SELECT
+    /// typeof(CAST(10 AS bytea)), CAST(10 AS bytea), typeof(CAST(1.5 AS bytea))` with
+    /// `integer|10|real` (/usr/bin/sqlite3, 2026-10-16). PostgreSQL 18's integer-to-bytea encoding
+    /// and its 42846 refusals are the PostgreSQL dialect's, asserted over the wire
+    /// (wire_sessions a_cast_to_a_type_over_text_converts_and_over_bytea_encodes_an_integer).
+    /// LEAD-RULED SPEC CHANGE, FLAGGED (DECISIONS 60ddcb6f8f): this test first asserted 42846 for
+    /// integer sources here, the reversed premise.
+    #[test]
+    fn a_cast_to_a_base_only_type_over_text_converts_and_over_blob_keeps_sqlites_cast() {
+        let conn = open();
+        conn.execute("CREATE TYPE ttext(value text) BASE text").unwrap();
+        let rows = conn
+            .prepare("SELECT typeof(CAST(10 AS ttext)), CAST(10 AS ttext)")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap();
+        assert_eq!(rows, vec![vec![Value::build_text("text"), Value::build_text("10")]]);
+        let rows = conn
+            .prepare("SELECT typeof(CAST(10 AS bytea)), CAST(10 AS bytea), typeof(CAST(1.5 AS bytea))")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![vec![Value::build_text("integer"), Value::from_i64(10), Value::build_text("real")]]
+        );
+    }
+
+    /// fastest-wire c15466936 (wirefuzz against PostgreSQL 18.6): a value too long for varchar(n) is
+    /// refused as a classified string-data-right-truncation error in PostgreSQL's words ("value too
+    /// long for type character varying(5)"; 22001 on the wire), not as a RAISE whose message the wire
+    /// would have to read; and an UPDATE assigning such a constant is refused even when no row matches,
+    /// since PostgreSQL coerces the constant to the column's type when it plans the statement. A value
+    /// that fits is the control. At the base the INSERT raises 'value too long for varchar' and the
+    /// UPDATE answers 0 rows: red by its claim.
+    #[test]
+    fn a_value_too_long_for_varchar_is_a_truncation_error_even_when_no_row_matches() {
+        let conn = open();
+        conn.execute("CREATE TABLE vc(id INTEGER PRIMARY KEY, v varchar(5)) STRICT")
+            .unwrap();
+        conn.execute("INSERT INTO vc VALUES (2, 'abcde')").unwrap();
+        let mut wrong = Vec::new();
+        for sql in ["INSERT INTO vc VALUES (1, 'abcdef')", "UPDATE vc SET v = 'abcdef' WHERE id = 1"] {
+            match conn.execute(sql) {
+                Err(e)
+                    if format!("{e:?}").starts_with("StringDataRightTruncation(")
+                        && e.to_string() == "value too long for type character varying(5)" => {}
+                other => wrong.push(format!("{sql}: {other:?}")),
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "CLAIM: each is refused as StringDataRightTruncation, in PostgreSQL's words: {wrong:#?}"
+        );
+    }
+
     /// Engine review 20 item 9: 1d8bf442e's catch region covered only types with a function '=', so
     /// a built-in with a RAISE in its ENCODE, a bare '<' and no '=' (varchar(n), smallint, the
     /// date/time types) still raised through an indexed equality: `v = 'abcdef'` on varchar(3)
@@ -2087,6 +2178,65 @@ mod tests {
             }
         }
         assert!(bad.is_empty(), "CLAIM: a numeric typmod rounded or overflowed unlike PostgreSQL: {bad:?}");
+    }
+
+    /// Review C38 MED 2 (artie frontier/fastest/reviews/REVIEW-claude-cards-C27-C39-20261015.md): the
+    /// bounded type had no INPUT EXPONENT bound. PostgreSQL refuses an exponent past INT_MAX / 2
+    /// (1073741823) with 22003 even for a zero, and an exponent no integer holds alike. PG 18.6's
+    /// answers for this exact SQL (artie raw frontier/fastest/lanes/engine/raw/pg18-numeric-exponent.txt
+    /// e4c073c95b): '0e1073741823' * x is 0.00; '0e1073741824' * x and '0e9999999999999999999' * x
+    /// overflow.
+    #[test]
+    fn a_numeric_input_exponent_is_bounded_as_postgresql_does() {
+        let setup = || {
+            vec![
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, x numeric(10, 2)) STRICT".to_string(),
+                "INSERT INTO t VALUES (1, 1)".to_string(),
+            ]
+        };
+        let overflow = "value overflows numeric format";
+        let mut bad = Vec::new();
+        for (sql, want) in [
+            ("SELECT '0e1073741823' * x FROM t", Ok("0.00")),
+            ("SELECT '0e1073741824' * x FROM t", Err(overflow)),
+            ("SELECT '0e9999999999999999999' * x FROM t", Err(overflow)),
+        ] {
+            let mut steps = setup();
+            steps.push(sql.to_string());
+            let got = run_bounded(steps);
+            let ok = match (&got, &want) {
+                (Ok(Some(v)), Ok(w)) => v == w,
+                (Err(m), Err(w)) => m.contains(w),
+                _ => false,
+            };
+            if !ok {
+                bad.push(format!("{sql} gave {got:?}, not PostgreSQL 18's {want:?}"));
+            }
+        }
+        assert!(bad.is_empty(), "CLAIM: a numeric input exponent outside PostgreSQL's bound was not refused as PostgreSQL refuses it: {bad:?}");
+    }
+
+    /// Review C38 MED 1: the class fix's ALTER TABLE ADD COLUMN check refused numeric(p, s) on a
+    /// NON-STRICT table, where the name is only a type name with SQLite's affinity and no custom type
+    /// applies, and where CREATE TABLE accepts it. The rule must be CREATE TABLE's: the typmod is
+    /// bounded only where the column uses the numeric custom type (a STRICT table). Engine
+    /// consistency (both statements are this engine's), not a PostgreSQL oracle: a non-STRICT
+    /// numeric(1001, 0) is accepted by CREATE TABLE here.
+    #[test]
+    fn alter_table_add_column_bounds_a_numeric_typmod_only_where_create_table_does() {
+        let mut bad = Vec::new();
+        for strict in [false, true] {
+            let opt = if strict { " STRICT" } else { "" };
+            let created = run_bounded(vec![format!("CREATE TABLE c(id INTEGER PRIMARY KEY, y numeric(1001, 0)){opt}")]);
+            let altered = run_bounded(vec![
+                format!("CREATE TABLE a(id INTEGER PRIMARY KEY){opt}"),
+                "ALTER TABLE a ADD COLUMN y numeric(1001, 0)".to_string(),
+            ]);
+            if created.is_ok() != altered.is_ok() {
+                bad.push(format!("strict {strict}: CREATE TABLE gave {created:?} but ALTER TABLE ADD COLUMN gave {altered:?}"));
+            }
+        }
+        assert!(bad.is_empty(), "CLAIM: ALTER TABLE ADD COLUMN and CREATE TABLE disagree on a numeric typmod: {bad:?}");
     }
 
     /// Class (a) (DECISIONS 994f7d41e0), the typmod's other DDL: ALTER TABLE ADD COLUMN declared a

@@ -8,6 +8,8 @@ pub mod phase;
 mod result_types;
 pub use result_types::{element_of, AssignSource, AssignTarget, StatementTypes};
 mod session;
+#[cfg(all(test, unix))]
+mod stack_guard_tests;
 mod sqlstate;
 pub use sqlstate::sqlstate;
 

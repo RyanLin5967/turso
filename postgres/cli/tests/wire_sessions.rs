@@ -1065,6 +1065,118 @@ fn a_domain_check_failure_is_23514_with_postgresqls_message_on_every_path() {
     fails(&mut a, "UPDATE tm SET x = -1 WHERE id = 2", "value for domain dm violates check constraint \"dm_check\"");
 }
 
+/// A CAST to a type over text converts to text, a domain's included: PostgreSQL 18 casts to a
+/// domain with its underlying type's casts (CREATE CAST: "Casting to or from a domain uses the casts
+/// associated with its underlying type"), so CAST(10 AS dt) is the text '10', which passes CHECK
+/// (VALUE >= '0') and sorts above '9'. The CAST was a no-op, so the integer 10 failed that CHECK
+/// (an integer sorts below every text) and sorted below 9 (review of 96b69304b, F4).
+///
+/// Over bytea, PostgreSQL 18 casts an integer as its big-endian two's complement at its type's
+/// width (int2 2 bytes, int4 4, int8 8; a literal is int4 if it fits, else int8): the three
+/// conversions of the PG 18 regression expected output (postgres/conformance/upstream/strings.out,
+/// "conversions between bytea and integer types"), a domain over bytea, and int2/int4/int8 columns.
+/// numeric, float and boolean sources are refused 42846, naming the source's type.
+///
+/// LEAD-RULED SPEC CHANGE, FLAGGED (DECISIONS 60ddcb6f8f, reversing cc4653c2d3's bytea half): this
+/// test first asserted 42846 for CAST(10 AS bytea) and CAST(10 AS dby), a premise PG 18 does not
+/// hold; those rows now carry strings.out's values, and the non-integer refusal rows stay.
+#[test]
+fn a_cast_to_a_type_over_text_converts_and_over_bytea_encodes_an_integer() {
+    let dir = Scratch::new("castbase");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE DOMAIN dt AS text CHECK (VALUE >= '0')").ok("CREATE DOMAIN dt");
+    assert_eq!(a.q("SELECT CAST(10 AS dt)").single("SELECT CAST(10 AS dt)"), "10");
+    a.q("CREATE DOMAIN du AS text").ok("CREATE DOMAIN du");
+    let sql = "SELECT x FROM (SELECT CAST(10 AS du) AS x UNION ALL SELECT CAST(9 AS du) AS x) s ORDER BY x";
+    let rows = a.q(sql).ok(sql).rows;
+    assert_eq!(rows, vec![vec![Some("10".to_string())], vec![Some("9".to_string())]], "{sql}");
+    // strings.out, conversions between bytea and integer types (PG 18 expected output).
+    let row = |a: &mut Wire, sql: &str| -> Vec<Option<String>> {
+        let rows = a.q(sql).ok(sql).rows;
+        assert_eq!(rows.len(), 1, "{sql}: {rows:?}");
+        rows[0].clone()
+    };
+    let s = |v: &[&str]| v.iter().map(|x| Some(x.to_string())).collect::<Vec<_>>();
+    assert_eq!(row(&mut a, "SELECT 0x1234::int2::bytea, (-0x1234)::int2::bytea"), s(&["\\x1234", "\\xedcc"]));
+    assert_eq!(row(&mut a, "SELECT 0x12345678::int4::bytea, (-0x12345678)::int4::bytea"), s(&["\\x12345678", "\\xedcba988"]));
+    assert_eq!(
+        row(&mut a, "SELECT 0x1122334455667788::int8::bytea, (-0x1122334455667788)::int8::bytea"),
+        s(&["\\x1122334455667788", "\\xeeddccbbaa998878"])
+    );
+    // A literal is int4 when it fits, int8 when only that fits.
+    assert_eq!(row(&mut a, "SELECT CAST(10 AS bytea), CAST(4294967296 AS bytea)"), s(&["\\x0000000a", "\\x0000000100000000"]));
+    a.q("CREATE DOMAIN dby AS bytea").ok("CREATE DOMAIN dby");
+    assert_eq!(row(&mut a, "SELECT CAST(10 AS dby)"), s(&["\\x0000000a"]));
+    a.q("CREATE TABLE tib(a int2, b int4, c int8)").ok("CREATE TABLE tib");
+    a.q("INSERT INTO tib VALUES (4660, -305419896, 1234605616436508552)").ok("INSERT INTO tib");
+    assert_eq!(
+        row(&mut a, "SELECT a::bytea, b::bytea, c::bytea FROM tib"),
+        s(&["\\x1234", "\\xedcba988", "\\x1122334455667788"])
+    );
+    // numeric, float and boolean have no cast to bytea in PG 18: 42846, naming the source's type.
+    for (sql, source) in [
+        ("SELECT CAST(1.5 AS bytea)", "numeric"),
+        ("SELECT CAST(1.5::float8 AS bytea)", "double precision"),
+        ("SELECT CAST(true AS bytea)", "boolean"),
+        ("SELECT CAST(1.5 AS dby)", "numeric"),
+    ] {
+        let e = a.q(sql).err(sql);
+        assert_eq!(e.code, "42846", "{sql}: {e:?}");
+        // PostgreSQL's text after the registered PGDIV-PARSE-PREFIX ("Parse error: ", postgres/COMPAT.md).
+        let text = e.message.strip_prefix("Parse error: ").unwrap_or(&e.message);
+        assert!(text.starts_with(&format!("cannot cast type {source} to ")), "{sql}: {e:?}");
+    }
+    // Control: a text source to bytea is no refusal.
+    a.q("SELECT CAST('ab' AS bytea)").ok("SELECT CAST('ab' AS bytea)");
+}
+
+/// libpg_query's refusal of a statement nested too deeply is 54001, and it is told apart from any
+/// other error by its kind, never by its words: a syntax error that quotes a literal reading "stack
+/// depth limit exceeded" or "recursion limit reached" is PostgreSQL's 42601. The classification
+/// matched the message's text with `contains`, so such a literal was reported 54001 (review of
+/// 96b69304b, F5). Control: a statement nested past prost's decode limit is still 54001.
+#[test]
+fn a_syntax_error_quoting_the_stack_message_is_42601_and_a_deep_statement_54001() {
+    let dir = Scratch::new("pgq54001");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in [
+        "SELECT 1 'stack depth limit exceeded'",
+        "SELECT 1 'recursion limit reached'",
+        "SELECT 'stack depth limit exceeded",
+    ] {
+        let e = a.q(sql).err(sql);
+        assert_eq!(e.code, "42601", "{sql}: {e:?}");
+    }
+    let mut deep = "1".to_string();
+    for _ in 0..200 {
+        deep = format!("(SELECT {deep})");
+    }
+    let sql = format!("SELECT {deep}");
+    let e = a.q(&sql).err("200 nested scalar subqueries");
+    assert_eq!(e.code, "54001", "premise: 200 nested scalar subqueries are refused 54001: {e:?}");
+}
+
+/// A numeric typmod outside PostgreSQL's range is 22023, as PostgreSQL 18 refuses it ("NUMERIC
+/// precision 1001 must be between 1 and 1000", invalid_parameter_value): the DDL's check dropped the
+/// condition and sent 42601 (review of 96b69304b, F8). numeric(p) is numeric(p, 0).
+#[test]
+fn a_numeric_typmod_out_of_range_is_22023() {
+    let dir = Scratch::new("typmod22023");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in [
+        "CREATE TABLE tp1(x numeric(1001))",
+        "CREATE TABLE tp2(x numeric(1001, 2))",
+        "CREATE TABLE tp3(x numeric(0, 0))",
+    ] {
+        let e = a.q(sql).err(sql);
+        assert_eq!(e.code, "22023", "{sql}: {e:?}");
+    }
+    a.q("CREATE TABLE tp4(x numeric(1000, 2))").ok("premise: numeric(1000, 2) is accepted");
+}
+
 /// A client that floods SSLRequests and never reads cannot hold its session, nor the server's one
 /// slot, past the authentication timeout (Codex/Claude C37 H1: the server answered every repeated
 /// SSLRequest with 'N' and blocked for good in a write with no deadline; a second client got

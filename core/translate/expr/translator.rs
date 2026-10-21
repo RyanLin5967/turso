@@ -90,6 +90,134 @@ pub fn resolve_expr(
     translate_expr(program, referenced_tables, expr, dest_reg, resolver)
 }
 
+/// A CAST to a type with no ENCODE anywhere in its chain (a domain's included) converts as its
+/// primitive base does, as PostgreSQL 18 casts to a domain by its underlying type: an integer or
+/// real base by its affinity, a text base to TEXT (review of 96b69304b, F4: CAST(10 AS dt) over text
+/// stayed the integer 10; the text is SQLite's rendering of the value, not PostgreSQL's output
+/// function's, registered PGDIV-CAST-TEXT-RENDERING). Over a blob base (bytea) the dialect decides
+/// ([`crate::dialect::Dialect::integer_to_bytea`]): the SQLite dialect keeps SQLite's CAST
+/// unchanged (integrate-reviewer-2 L3); PostgreSQL's encodes an integer as its big-endian two's
+/// complement at its type's width, refuses a numeric, float or boolean source 42846 naming its
+/// type, and casts any other source to BLOB (lead DECISIONS 60ddcb6f8f). Other bases (any) are
+/// left as they are.
+fn emit_cast_by_base_without_encode(
+    program: &mut ProgramBuilder,
+    referenced_tables: Option<&TableReferences>,
+    source: &ast::Expr,
+    ty: &str,
+    target_register: usize,
+    resolver: &Resolver,
+) -> Result<()> {
+    let Some(base) = super::arrays::base_without_encode(resolver, ty) else {
+        return Ok(());
+    };
+    match Affinity::affinity(base) {
+        affinity @ (Affinity::Integer | Affinity::Real | Affinity::Text) => {
+            program.emit_insn(Insn::Cast {
+                reg: target_register,
+                affinity,
+            });
+        }
+        Affinity::Blob if resolver.dialect.integer_to_bytea(8).is_some() => {
+            match bytea_source(source, referenced_tables, resolver) {
+                ByteaSource::Integer(width) => {
+                    let func = resolver.dialect.integer_to_bytea(width).expect("the dialect encodes 2, 4 and 8 bytes");
+                    program.emit_insn(Insn::Function {
+                        constant_mask: 0,
+                        start_reg: target_register,
+                        dest: target_register,
+                        func: FuncCtx { func, arg_count: 1 },
+                    });
+                }
+                ByteaSource::NoCast(source_type) => {
+                    crate::bail_parse_error!(SqlErrorKind::CannotCoerce; "cannot cast type {source_type} to {ty}");
+                }
+                ByteaSource::Other => {
+                    program.emit_insn(Insn::Cast {
+                        reg: target_register,
+                        affinity: Affinity::Blob,
+                    });
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// What a cast to bytea does with its source, by the source's PostgreSQL type.
+enum ByteaSource {
+    /// An integer of this many bytes: encoded.
+    Integer(u8),
+    /// A type PostgreSQL 18 has no cast to bytea from (numeric, float, boolean): refused, named.
+    NoCast(&'static str),
+    /// Anything else (text, bytea, NULL, a parameter): cast to BLOB.
+    Other,
+}
+
+/// A source's PostgreSQL type for a cast to bytea: a numeric literal is int4 if it fits, else
+/// int8, else numeric (PostgreSQL's rule for a constant); a column or a cast by its declared type
+/// name; any other expression by its affinity, an integer one taken as int8 (BLIND SPOT, stated:
+/// PostgreSQL gives an expression its own type, `int4 + int4` is int4; registered
+/// PGDIV-BYTEA-INT-EXPR-WIDTH).
+fn bytea_source(source: &ast::Expr, referenced_tables: Option<&TableReferences>, resolver: &Resolver) -> ByteaSource {
+    fn literal(text: &str) -> ByteaSource {
+        let (neg, digits) = match text.strip_prefix('-') {
+            Some(d) => (true, d),
+            None => (false, text),
+        };
+        let value = match digits.strip_prefix("0x").or_else(|| digits.strip_prefix("0X")) {
+            Some(hex) => i128::from_str_radix(hex, 16).ok(),
+            None => digits.parse::<i128>().ok(),
+        };
+        match value.map(|v| if neg { -v } else { v }) {
+            Some(v) if i32::try_from(v).is_ok() => ByteaSource::Integer(4),
+            Some(v) if i64::try_from(v).is_ok() => ByteaSource::Integer(8),
+            _ => ByteaSource::NoCast("numeric"),
+        }
+    }
+    fn by_name(name: &str) -> Option<ByteaSource> {
+        let base = name.split('(').next().unwrap_or(name).trim().to_ascii_lowercase();
+        Some(match base.as_str() {
+            "smallint" | "int2" => ByteaSource::Integer(2),
+            "integer" | "int" | "int4" => ByteaSource::Integer(4),
+            "bigint" | "int8" => ByteaSource::Integer(8),
+            "boolean" | "bool" => ByteaSource::NoCast("boolean"),
+            "real" | "float4" => ByteaSource::NoCast("real"),
+            "double precision" | "float8" | "double" | "float" => ByteaSource::NoCast("double precision"),
+            "numeric" | "decimal" => ByteaSource::NoCast("numeric"),
+            _ => return None,
+        })
+    }
+    match source {
+        ast::Expr::Literal(ast::Literal::Numeric(n)) => literal(n),
+        ast::Expr::Unary(ast::UnaryOperator::Negative, inner) => match inner.as_ref() {
+            ast::Expr::Literal(ast::Literal::Numeric(n)) => literal(&format!("-{n}")),
+            _ => bytea_source(inner, referenced_tables, resolver),
+        },
+        ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => bytea_source(&exprs[0], referenced_tables, resolver),
+        ast::Expr::Cast { type_name: Some(t), .. } => by_name(&t.name).unwrap_or(ByteaSource::Other),
+        ast::Expr::Column { table, column, .. } => {
+            let declared = referenced_tables
+                .and_then(|tables| tables.find_table_by_internal_id(*table))
+                .and_then(|(_, table_ref)| table_ref.get_column_at(*column).map(|c| c.ty_str.clone()));
+            declared
+                .as_deref()
+                .and_then(by_name)
+                .unwrap_or_else(|| by_affinity(source, referenced_tables, resolver))
+        }
+        _ => by_affinity(source, referenced_tables, resolver),
+    }
+}
+
+fn by_affinity(source: &ast::Expr, referenced_tables: Option<&TableReferences>, resolver: &Resolver) -> ByteaSource {
+    match super::affinity::get_expr_affinity(source, referenced_tables, Some(resolver)) {
+        Affinity::Integer => ByteaSource::Integer(8),
+        Affinity::Real => ByteaSource::NoCast("double precision"),
+        _ => ByteaSource::Other,
+    }
+}
+
 /// Translate an expression into bytecode.
 #[turso_macros::trace_stack]
 pub fn translate_expr(
@@ -99,6 +227,8 @@ pub fn translate_expr(
     target_register: usize,
     resolver: &Resolver,
 ) -> Result<usize> {
+    // Stack-guard class (fastest-engine): a recursive entry is a nested step (`stack::NestGuard`).
+    let _nest = crate::stack::NestGuard::enter("a recursive step")?;
     let constant_span = if expr.is_constant(resolver) {
         if !program.constant_span_is_open() {
             Some(program.constant_span_start())
@@ -577,18 +707,12 @@ pub fn translate_expr(
                             }
                         }
 
-                        // A domain over a numeric base with no ENCODE converts as that base
-                        // before its CHECKs read it: left text, CAST('0.5' AS d) passed a CHECK
-                        // (value > 1), text sorting above every number (fresh-context review of
-                        // the ultrareview fixes).
-                        if let Some(base) =
-                            super::arrays::numeric_base_without_encode(resolver, &tn.name)
-                        {
-                            program.emit_insn(Insn::Cast {
-                                reg: target_register,
-                                affinity: Affinity::affinity(base),
-                            });
-                        }
+                        // A domain over a base with no ENCODE converts as that base before its
+                        // CHECKs read it: left text, CAST('0.5' AS d) passed a CHECK (value > 1),
+                        // text sorting above every number (fresh-context review of the ultrareview
+                        // fixes); left a number, CAST(10 AS dt) over text failed CHECK (VALUE >=
+                        // '0') (review of 96b69304b, F4).
+                        emit_cast_by_base_without_encode(program, referenced_tables, expr, &tn.name, target_register, resolver)?;
 
                         // Validate domain constraints on the encoded value
                         emit_domain_cast_constraints(
@@ -632,17 +756,10 @@ pub fn translate_expr(
                             )?;
                             return Ok(target_register);
                         }
-                        // A numeric base with no ENCODE (bigint, float4, float8) converts as
-                        // its base does: left a no-op, CAST('1.5' AS float8) stayed text where
-                        // SQLite's name rule ("FLOA") makes it REAL.
-                        if let Some(base) =
-                            super::arrays::numeric_base_without_encode(resolver, &tn.name)
-                        {
-                            program.emit_insn(Insn::Cast {
-                                reg: target_register,
-                                affinity: Affinity::affinity(base),
-                            });
-                        }
+                        // A base with no ENCODE converts as that base does: left a no-op,
+                        // CAST('1.5' AS float8) stayed text where SQLite's name rule ("FLOA")
+                        // makes it REAL, and CAST(10 AS a type over text) stayed a number.
+                        emit_cast_by_base_without_encode(program, referenced_tables, expr, &tn.name, target_register, resolver)?;
                         return Ok(target_register);
                     }
                 }
@@ -1859,6 +1976,7 @@ pub fn translate_expr(
                         | ScalarFunc::IntToBoolean
                         | ScalarFunc::ValidateIpAddr
                         | ScalarFunc::NumericEncode
+                        | ScalarFunc::VarcharEncode
                         | ScalarFunc::NumericDecode
                         | ScalarFunc::NumericAdd
                         | ScalarFunc::NumericSub
@@ -2164,7 +2282,8 @@ pub fn translate_expr(
                                 .name
                                 .clone()
                                 .unwrap_or_else(|| format!("column{}", col_idx + 1));
-                            let quoted_col_name = format!("'{col_name}'");
+                            // Escaped (QUOTE-SWEEP F5: sanitize_string un-doubles it).
+                            let quoted_col_name = format!("'{}'", crate::util::escape_sql_string_literal(&col_name));
                             args.push(Box::new(ast::Expr::Literal(ast::Literal::String(
                                 quoted_col_name,
                             ))));

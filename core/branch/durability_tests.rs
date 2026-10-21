@@ -3306,3 +3306,71 @@ fn a_chain_that_writes_forks_and_releases_builds_each_view_from_its_own_pages() 
     let _ = child.reap().unwrap();
     let _ = tip.into_id();
 }
+
+/// LEAP L1, ASYNC-DESIGN T6 (ASYNC-2), G2 by the first write: with the flusher held, an async
+/// create then its branch's first write make ONE flight and one full flush of the store's class
+/// between them (the write's flight carries the create's buffered record ahead of its own). The
+/// create reads Durable once the write returns, and a crash image taken then holds the branch and
+/// the row. Catalog store, async's class. At the stub the create leads its own flight and the first
+/// write syncs the arena too, so the flights and flushes claims fail.
+#[test]
+fn an_async_create_is_durable_at_its_branchs_first_write() {
+    let class = if cfg!(target_vendor = "apple") { crate::branch::SyncClass::FullFsync } else { crate::branch::SyncClass::Fsync };
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("t6.db");
+    let id;
+    {
+        let db = open_at(&path, DatabaseOpts::new().with_branch_durability(BranchDurability::Catalog { sync: class })).unwrap();
+        let trunk = db.connect().unwrap();
+        seed(&trunk, 20);
+        trunk.create_branch_async("warm").unwrap();
+        let held = db.branch_flusher_hold(true);
+        let g0 = db.branches.group_counters();
+        let k0 = crate::branch::sync_counts();
+        let created = trunk.create_branch_async("t6").unwrap();
+        id = created.id;
+        let b = db.connect_named("t6").unwrap();
+        set(&b, 7, "t6-write");
+        let g1 = db.branches.group_counters();
+        let k1 = crate::branch::sync_counts();
+        let status = db.branch_status(id).unwrap();
+        let image = crash_image(&path, dir.path());
+        db.branch_flusher_hold(false);
+        let flushes = if cfg!(target_vendor = "apple") { k1.full_fsync - k0.full_fsync } else { k1.fsync - k0.fsync };
+        assert_eq!(g1[0] - g0[0], 1, "CLAIM: the async create and its first write made one flight");
+        assert_eq!(flushes, 1, "CLAIM: the async create and its first write made one flush of the store's class");
+        assert_eq!(status, crate::branch::async_api::BranchStatus::Durable, "CLAIM: the create is durable once the write returned");
+        assert!(held, "premise: the flusher was held");
+        let crashed = open_at(&image, DatabaseOpts::new().with_branch_durability(BranchDurability::Catalog { sync: class })).unwrap();
+        assert_eq!(crashed.branch_named("t6").unwrap(), Some(id), "CLAIM: the crash image holds the branch");
+        let c = crashed.connect_named("t6").unwrap();
+        assert_eq!(value(&c, 7).as_deref(), Some("t6-write"), "CLAIM: the crash image holds the first write");
+    }
+}
+
+/// LEAP L1, ASYNC-DESIGN T17 arm (a), G5 (an id lost in a crash is never reissued): with the
+/// flusher held, an async create k, then a crash image; the reopened store gives a new create an id
+/// above k, and `branch_status(k)` reads LostInCrash. At the stub k is durable when acknowledged,
+/// so it survives the crash and reads Durable: red by the status claim.
+#[test]
+fn an_id_lost_in_a_crash_is_never_reissued() {
+    let class = if cfg!(target_vendor = "apple") { crate::branch::SyncClass::FullFsync } else { crate::branch::SyncClass::Fsync };
+    let opts = || DatabaseOpts::new().with_branch_durability(BranchDurability::Catalog { sync: class });
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("t17.db");
+    let db = open_at(&path, opts()).unwrap();
+    let trunk = db.connect().unwrap();
+    seed(&trunk, 5);
+    trunk.create_branch_async("warm").unwrap();
+    let held = db.branch_flusher_hold(true);
+    let k = trunk.create_branch_async("lost").unwrap().id;
+    let image = crash_image(&path, dir.path());
+    db.branch_flusher_hold(false);
+    let crashed = open_at(&image, opts()).unwrap();
+    let t = crashed.connect().unwrap();
+    let next = t.create_branch_async("after").unwrap().id;
+    let status = crashed.branch_status(k).unwrap();
+    assert!(next.0 > k.0, "CLAIM: the id after the crash ({}) is above the lost one ({})", next.0, k.0);
+    assert_eq!(status, crate::branch::async_api::BranchStatus::LostInCrash, "CLAIM: the lost create reads LostInCrash");
+    assert!(held, "premise: the flusher was held");
+}

@@ -28,11 +28,13 @@ rustflags = [
 
 # To be able to run unit tests on Linux, support compilation to 'x86_64-unknown-linux-gnu'.
 # pthread_key_create() destructors and segfault after a DSO unloading https://sourceware.org/bugzilla/show_bug.cgi?id=21031
+# `-Wl,--warn-unresolved-symbols` is NOT set here (fastest-engine, engine-gettid-rev MED-1): for every
+# linux-gnu target it turned any undefined symbol into a silent GOT-0 that crashes at the first call
+# (libc::gettid on glibc 2.28: it linked, then SIGSEGV). Only the napi crates need it, for the napi_*
+# symbols node provides at load; their build.rs set it for their own targets.
 [target.'cfg(all(target_os = "linux", target_env = "gnu"))']
 rustflags = [
   "--cfg=tokio_unstable",
-  "-C",
-  "link-args=-Wl,--warn-unresolved-symbols",
   "-C",
   "link-args=-Wl,-z,nodelete",
 ]

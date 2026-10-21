@@ -1,3 +1,4 @@
+use crate::connection::{EngineSql, Origin};
 use super::compiler::{DbspCircuit, DbspCompiler, DeltaSet};
 use super::dbsp::Delta;
 use super::operator::ComputationTracker;
@@ -12,6 +13,11 @@ use crate::util::{extract_view_columns, ViewColumnSchema};
 use crate::{return_if_io, LimboError, Pager, Result, Statement};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::cell::RefCell;
+
+/// `map[key]`, or the entry whose key is `key` in another ASCII case (SQL names match in any case).
+fn get_ignore_case<'m, V>(map: &'m HashMap<String, V>, key: &str) -> Option<&'m V> {
+    map.get(key).or_else(|| map.iter().find(|(k, _)| k.eq_ignore_ascii_case(key)).map(|(_, v)| v))
+}
 use std::fmt;
 use std::rc::Rc;
 use turso_parser::ast;
@@ -247,6 +253,7 @@ impl IncrementalView {
         main_data_root: i64,
         internal_state_root: i64,
         internal_state_index_root: i64,
+        dialect: &Arc<dyn crate::Dialect>,
     ) -> Result<DbspCircuit> {
         // Build the logical plan from the SELECT statement
         let mut builder = LogicalPlanBuilder::new(schema);
@@ -259,7 +266,8 @@ impl IncrementalView {
             main_data_root,
             internal_state_root,
             internal_state_index_root,
-        );
+        )
+        .with_dialect(dialect.clone());
         let circuit = compiler.compile(&logical_plan)?;
 
         Ok(circuit)
@@ -309,6 +317,20 @@ impl IncrementalView {
         internal_state_root: i64,
         internal_state_index_root: i64,
     ) -> Result<Self> {
+        let sqlite: Arc<dyn crate::Dialect> = Arc::new(crate::dialect::SqliteDialect);
+        Self::from_sql_with_dialect(sql, schema, main_data_root, internal_state_root, internal_state_index_root, &sqlite)
+    }
+
+    /// `from_sql`, its expressions resolved through `dialect`: the database's, as a plain view's are
+    /// (dialect code review MED-3: the view's compiler resolved with SQLite whatever the database).
+    pub fn from_sql_with_dialect(
+        sql: &str,
+        schema: &Schema,
+        main_data_root: i64,
+        internal_state_root: i64,
+        internal_state_index_root: i64,
+        dialect: &Arc<dyn crate::Dialect>,
+    ) -> Result<Self> {
         let mut parser = Parser::new(sql.as_bytes());
         let cmd = parser.next_cmd()?;
         let cmd = cmd.expect("View is an empty statement");
@@ -318,13 +340,14 @@ impl IncrementalView {
                 view_name,
                 columns: _,
                 select,
-            }) => IncrementalView::from_stmt(
+            }) => IncrementalView::from_stmt_with_dialect(
                 view_name,
                 select,
                 schema,
                 main_data_root,
                 internal_state_root,
                 internal_state_index_root,
+                dialect,
             ),
             _ => Err(LimboError::ParseError(format!(
                 "View is not a CREATE MATERIALIZED VIEW statement: {sql}"
@@ -339,6 +362,20 @@ impl IncrementalView {
         main_data_root: i64,
         internal_state_root: i64,
         internal_state_index_root: i64,
+    ) -> Result<Self> {
+        let sqlite: Arc<dyn crate::Dialect> = Arc::new(crate::dialect::SqliteDialect);
+        Self::from_stmt_with_dialect(view_name, select, schema, main_data_root, internal_state_root, internal_state_index_root, &sqlite)
+    }
+
+    /// `from_stmt` with the database's dialect (`from_sql_with_dialect`).
+    pub fn from_stmt_with_dialect(
+        view_name: ast::QualifiedName,
+        select: ast::Select,
+        schema: &Schema,
+        main_data_root: i64,
+        internal_state_root: i64,
+        internal_state_index_root: i64,
+        dialect: &Arc<dyn crate::Dialect>,
     ) -> Result<Self> {
         let name = view_name.name.as_str().to_string();
 
@@ -358,7 +395,7 @@ impl IncrementalView {
             &mut table_conditions,
         )?;
 
-        Self::new(
+        Self::new_with_dialect(
             name,
             select.clone(),
             referenced_tables,
@@ -370,6 +407,7 @@ impl IncrementalView {
             main_data_root,
             internal_state_root,
             internal_state_index_root,
+            dialect,
         )
     }
 
@@ -387,6 +425,39 @@ impl IncrementalView {
         internal_state_root: i64,
         internal_state_index_root: i64,
     ) -> Result<Self> {
+        let sqlite: Arc<dyn crate::Dialect> = Arc::new(crate::dialect::SqliteDialect);
+        Self::new_with_dialect(
+            name,
+            select_stmt,
+            referenced_tables,
+            table_aliases,
+            qualified_table_names,
+            table_conditions,
+            column_schema,
+            schema,
+            main_data_root,
+            internal_state_root,
+            internal_state_index_root,
+            &sqlite,
+        )
+    }
+
+    /// `new`, its expressions resolved through `dialect` (`from_sql_with_dialect`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_dialect(
+        name: String,
+        select_stmt: ast::Select,
+        referenced_tables: Vec<Arc<BTreeTable>>,
+        table_aliases: HashMap<String, String>,
+        qualified_table_names: HashMap<String, String>,
+        table_conditions: HashMap<String, Vec<Option<ast::Expr>>>,
+        column_schema: ViewColumnSchema,
+        schema: &Schema,
+        main_data_root: i64,
+        internal_state_root: i64,
+        internal_state_index_root: i64,
+        dialect: &Arc<dyn crate::Dialect>,
+    ) -> Result<Self> {
         // Create the tracker that will be shared by all operators
         let tracker = Arc::new(Mutex::new(ComputationTracker::new()));
 
@@ -397,6 +468,7 @@ impl IncrementalView {
             main_data_root,
             internal_state_root,
             internal_state_index_root,
+            dialect,
         )?;
 
         Ok(Self {
@@ -463,10 +535,16 @@ impl IncrementalView {
         let table_name = name.name.as_str();
 
         // Build the fully qualified name
+        // Quoted (wire: ONE QUOTING FUNCTION class): this name is interpolated into the view's
+        // own SELECT text (`SELECT .. FROM {qualified}`).
         let qualified_name = if let Some(ref db) = name.db_name {
-            format!("{db}.{table_name}")
+            format!(
+                "{}.{}",
+                crate::util::quote_identifier(db.as_str()),
+                crate::util::quote_identifier(table_name)
+            )
         } else {
-            table_name.to_string()
+            crate::util::quote_identifier(table_name)
         };
 
         // Skip CTEs - they're not real tables
@@ -715,11 +793,21 @@ impl IncrementalView {
             let select_clause = if has_rowid_alias {
                 "*".to_string()
             } else {
-                "*, rowid".to_string()
+                // The rowid by a name no column shadows (QUOTE-SWEEP F3: `*, rowid` read a column
+                // named rowid as the row's key).
+                let rowid = table.rowid_name().ok_or_else(|| {
+                    LimboError::ParseError(format!(
+                        "materialized view: every rowid name of {} is a column's",
+                        table.name
+                    ).into())
+                })?;
+                format!("*, {rowid}")
             };
 
             // Get accumulated WHERE conditions for this table
-            let where_clause = if let Some(conditions) = table_conditions.get(&table.name) {
+            // Both maps are keyed by the name AS WRITTEN in the view, so a stored spelling in another
+            // case missed them (QUOTE-SWEEP F10: the db qualifier and the populate WHERE were dropped).
+            let where_clause = if let Some(conditions) = get_ignore_case(table_conditions, &table.name) {
                 // Combine multiple conditions with OR if there are multiple occurrences
                 Self::combine_conditions(
                     select_stmt,
@@ -733,10 +821,12 @@ impl IncrementalView {
             };
 
             // Use the qualified table name if available, otherwise just the table name
-            let table_name = qualified_table_names
-                .get(&table.name)
+            // The fallback quoted as the qualified names are (engine-rev-quote42 LOW). It IS reached
+            // (QUOTE-SWEEP F10 corrects d14d50a7f's "unreachable"): the map is keyed by the name as
+            // the view wrote it; the case-blind lookup above now finds it in another case.
+            let table_name = get_ignore_case(qualified_table_names, &table.name)
                 .cloned()
-                .unwrap_or_else(|| table.name.clone());
+                .unwrap_or_else(|| crate::util::quote_identifier(&table.name));
 
             // Construct the query for this table
             let query = if where_clause.is_empty() {
@@ -1212,7 +1302,9 @@ impl IncrementalView {
                     // the new connection's schema cookie check would fail (database file has old version).
 
                     // Prepare the statement using the parent connection
-                    let stmt = conn.prepare(&query)?;
+                    // The fill's printed SQLite text: SQLite whatever the dialect (the wire's NO
+                    // SILENT DIALECT SWITCH class).
+                    let stmt = conn.prepare_engine(EngineSql::new(&query), Origin::Root)?;
 
                     self.populate_state = PopulateState::ProcessingOneTable {
                         queries,

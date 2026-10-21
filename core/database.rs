@@ -863,6 +863,11 @@ pub struct Database<A: alloc::ConcurrentAllocator = alloc::DynAllocator> {
     /// address, this can never repeat within a process, so detach/reattach
     /// and close/reopen produce distinguishable values.
     pub(crate) incarnation: u64,
+    /// A prepare generation shared by every connection of this database (review C42 MED-7): a
+    /// change that alters what translation compiles in for all of them (a journal-mode switch, which
+    /// installs or removes the MV store) bumps it, and each connection's prepare key adds it to its
+    /// own (`Connection::prepare_context_generation`).
+    pub(crate) prepare_context_generation: AtomicU64,
 
     /// In Memory Page 1 for Empty Dbs
     init_page_1: Arc<ArcSwapOption<Page>>,
@@ -938,6 +943,13 @@ impl fmt::Debug for Database {
 }
 
 impl Database {
+    /// Bump the database-wide prepare generation (`prepare_context_generation`): every
+    /// connection's cached programs re-prepare (review C42 MED-7).
+    pub(crate) fn bump_prepare_context_generation(&self) {
+        self.prepare_context_generation
+            .fetch_add(1, Ordering::Release);
+    }
+
     /// Returns true if this database is backed by MemoryIO.
     pub fn is_in_memory_db(&self) -> bool {
         is_memory_like(&self.path)
@@ -1000,6 +1012,7 @@ impl Database {
         let enable_custom_types = opts.enable_custom_types || dialect.requires_custom_types();
 
         let db = Database {
+            prepare_context_generation: AtomicU64::new(0),
             mv_store,
             mv_store_allocator,
             path,
@@ -2022,7 +2035,7 @@ impl Database {
                         None,
                         pager,
                         &syms,
-                        dialect.as_ref(),
+                        &dialect,
                     );
 
                     match result {
@@ -2679,6 +2692,8 @@ impl Database {
                             self.experimental_mvcc_passive_checkpoint_enabled(),
                         )?;
                         self.mv_store.store(Some(mv_store));
+                        // The MV store is compiled into every connection's programs (review c42b MED-3, LOW-2).
+                        self.bump_prepare_context_generation();
                     }
 
                     return Ok(IOResult::Done(Arc::new(*pager)));
@@ -2780,6 +2795,8 @@ impl Database {
                 self.experimental_mvcc_passive_checkpoint_enabled(),
             )?;
             self.mv_store.store(Some(mv_store.clone()));
+            // The MV store is compiled into every connection's programs (review c42b MED-3, LOW-2).
+            self.bump_prepare_context_generation();
             let mvcc_bootstrap_conn = self._connect(true, None, None, None)?;
             match mv_store.bootstrap(mvcc_bootstrap_conn.clone()) {
                 Ok(()) => {}
@@ -2791,6 +2808,8 @@ impl Database {
             }
         } else {
             self.mv_store.store(None);
+            // The MV store is compiled into every connection's programs (review c42b MED-3, LOW-2).
+            self.bump_prepare_context_generation();
         }
         Ok(())
     }
@@ -2882,6 +2901,8 @@ impl Database {
             pager: ArcSwap::new(pager),
             schema: RwLock::new(schema.unwrap_or_else(|| self.schema.lock().clone())),
             database_schemas: RwLock::new(HashMap::default()),
+            attached_schemas_seen: AtomicU64::new(u64::MAX),
+            frontend_context: std::sync::OnceLock::new(),
             auto_commit: AtomicBool::new(true),
             transaction_state: AtomicTransactionState::new(TransactionState::None),
             poisoned_tx: AtomicBool::new(false),
@@ -2898,6 +2919,8 @@ impl Database {
             #[cfg(feature = "conn_raw_api")]
             mvcc_log_metadata: RwLock::new(HashMap::default()),
             capture_data_changes: RwLock::new(None),
+            capture_data_changes_at_begin: RwLock::new(None),
+            pending_vtab_destroys: RwLock::new(Vec::new()),
             cdc_transaction_id: AtomicI64::new(-1),
             closed: AtomicBool::new(false),
             temp: crate::connection::TempDbContext::new(),
@@ -3759,7 +3782,11 @@ impl Database {
 
 // Optimized for fast get() operations and supports unlimited attached databases.
 pub(crate) struct DatabaseCatalog {
-    pub(crate) name_to_index: HashMap<String, usize>,
+    /// Keyed by the name case-folded (`normalize_ident`): names match in any case, as SQLite's do.
+    name_to_index: HashMap<String, usize>,
+    /// Each database's name as written at ATTACH (fastest-wire: `"MixedCase"` listed as mixedcase),
+    /// for every list and every message.
+    display_names: HashMap<usize, String>,
     allocated: Vec<u64>,
     pub(crate) index_to_data: HashMap<usize, (Arc<Database>, Arc<Pager>)>,
 }
@@ -3769,6 +3796,7 @@ impl DatabaseCatalog {
     pub(crate) fn new() -> Self {
         Self {
             name_to_index: HashMap::default(),
+            display_names: HashMap::default(),
             index_to_data: HashMap::default(),
             allocated: vec![3], // 0 | 1, as those are reserved for main and temp
         }
@@ -3781,14 +3809,21 @@ impl DatabaseCatalog {
     }
 
     pub(crate) fn get_name_by_index(&self, index: usize) -> Option<String> {
-        self.name_to_index
-            .iter()
-            .find(|(_, &idx)| idx == index)
-            .map(|(name, _)| name.clone())
+        self.display_names.get(&index).cloned()
+    }
+
+    /// The index of the database named `s`, in any case.
+    pub(crate) fn index_of(&self, s: &str) -> Option<usize> {
+        self.name_to_index.get(&crate::util::normalize_ident(s)).copied()
+    }
+
+    /// Every attached database's name as written, with its index.
+    pub(crate) fn names(&self) -> impl Iterator<Item = (&str, usize)> + '_ {
+        self.display_names.iter().map(|(&idx, name)| (name.as_str(), idx))
     }
 
     pub(crate) fn get_database_by_name(&self, s: &str) -> Option<(usize, Arc<Database>)> {
-        match self.name_to_index.get(s) {
+        match self.name_to_index.get(&crate::util::normalize_ident(s)) {
             None => None,
             Some(idx) => self
                 .index_to_data
@@ -3806,14 +3841,16 @@ impl DatabaseCatalog {
     }
 
     fn add(&mut self, s: &str) -> usize {
+        let key = crate::util::normalize_ident(s);
         turso_assert!(
-            !self.name_to_index.contains_key(s),
+            !self.name_to_index.contains_key(&key),
             "lib: database name already exists in catalog",
             { "name": s }
         );
 
         let index = self.allocate_index();
-        self.name_to_index.insert(s.to_string(), index);
+        self.name_to_index.insert(key, index);
+        self.display_names.insert(index, s.to_string());
         index
     }
 
@@ -3824,10 +3861,11 @@ impl DatabaseCatalog {
     }
 
     pub(crate) fn remove(&mut self, s: &str) -> Option<usize> {
-        if let Some(index) = self.name_to_index.remove(s) {
+        if let Some(index) = self.name_to_index.remove(&crate::util::normalize_ident(s)) {
             // Should be impossible to remove main or temp.
             turso_assert_greater_than_or_equal!(index, 2);
             self.deallocate_index(index);
+            self.display_names.remove(&index);
             self.index_to_data.remove(&index);
             Some(index)
         } else {

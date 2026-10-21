@@ -1,3 +1,4 @@
+use crate::connection::{EngineSql, Origin};
 use std::{
     collections::{BTreeSet, HashSet, VecDeque},
     sync::atomic::Ordering,
@@ -326,11 +327,13 @@ impl IndexMethod for VectorSparseInvertedIndexMethod {
     ) -> Result<Arc<dyn IndexMethodAttachment>> {
         let query_pattern1 = format!(
             "SELECT vector_distance_jaccard({}, ?) as distance FROM {} ORDER BY distance LIMIT ?",
-            configuration.columns[0].name, configuration.table_name
+            crate::util::quote_identifier(&configuration.columns[0].name),
+            crate::util::quote_identifier(&configuration.table_name)
         );
         let query_pattern2 = format!(
             "SELECT vector_distance_jaccard(?, {}) as distance FROM {} ORDER BY distance LIMIT ?",
-            configuration.columns[0].name, configuration.table_name
+            crate::util::quote_identifier(&configuration.columns[0].name),
+            crate::util::quote_identifier(&configuration.table_name)
         );
         Ok(Arc::new(VectorSparseInvertedIndexMethodAttachment {
             configuration: configuration.clone(),
@@ -434,7 +437,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
             quote_identifier(&self.stats_btree),
         );
         for sql in [inverted_index_create, stats_index_create] {
-            let mut stmt = connection.prepare(&sql)?;
+            let mut stmt = connection.prepare_engine(EngineSql::new(&sql), Origin::Root)?;
             // by default we set needs_stmt_subtransactions = true to all write transaction
             // this will lead to Busy error here - because Transaction opcode will be unable to acquire ownership to the subjournal as it already owned by parent statement which is still active
             //
@@ -470,7 +473,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
             quote_identifier(&self.stats_btree)
         );
         for sql in [inverted_index_drop, stats_index_drop] {
-            let mut stmt = connection.prepare(&sql)?;
+            let mut stmt = connection.prepare_engine(EngineSql::new(&sql), Origin::Root)?;
             connection.start_nested();
             let result = stmt.run_ignore_rows();
             connection.end_nested();

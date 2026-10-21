@@ -954,7 +954,9 @@ pub fn translate_insert(
         key_reg: insertion.key_register(),
         record_reg: insertion.record_register(),
         flag: insert_flags,
-        table_name: table_name.to_string(),
+        // The table's name, never the Name's display (`"s p"` quoted): a materialized view's
+        // delta and a capture row are filed by name, as UPDATE's and DELETE's are.
+        table_name: table_name.as_str().to_string(),
     });
 
     // Fire AFTER INSERT triggers

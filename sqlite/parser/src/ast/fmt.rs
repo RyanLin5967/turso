@@ -2443,7 +2443,19 @@ impl ToTokens for Type {
         s: &mut S,
         context: &C,
     ) -> Result<(), S::Error> {
-        s.append(TK_ID, Some(&self.name))?;
+        // The name prints so that it reads back as itself (engine-rev-qaf-fix HIGH-4): bare when every
+        // word is a plain type word, else bracket-quoted as written (`[x,y]`, `[not null]`), which the
+        // parser reads back as the bracket's bytes; a name holding `]` is double-quoted (UNCHECKED:
+        // whether that form reads back without its quotes).
+        let plain = !self.name.is_empty()
+            && self.name.split(' ').all(|w| crate::lexer::is_plain_type_word(w.as_bytes()));
+        if plain {
+            s.append(TK_ID, Some(&self.name))?;
+        } else if !self.name.contains(']') {
+            s.append(TK_ID, Some(&format!("[{}]", self.name)))?;
+        } else {
+            s.append(TK_ID, Some(&format!("\"{}\"", self.name.replace('"', "\"\""))))?;
+        }
         if let Some(ref size) = self.size {
             s.append(TK_LP, None)?;
             size.to_tokens(s, context)?;

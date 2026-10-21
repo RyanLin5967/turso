@@ -88,6 +88,18 @@ impl Dialect for PostgresDialect {
     fn name(&self) -> &'static str {
         "postgres"
     }
+    // This frontend's own rows are its two marked forms (dialect design REVISION 2 item 8).
+    fn owns_stored_table_sql(&self, sql: &str) -> bool {
+        sql.starts_with(STORED_PG_SCHEMA_PREFIX) || sql.starts_with(STORED_PG_ALTERED_PREFIX)
+    }
+
+    // Its raw rows replay as their own PostgreSQL DDL, so that text is the client's syntax; its ALTERed
+    // and schema-qualified rows replay as canonical SQLite (REVISION 2 item 4).
+    fn table_sql_for_replay_stored(&self, sql: &str) -> Result<turso_core::StoredSql> {
+        let text = self.table_sql_for_replay(sql)?;
+        let raw = !sql.starts_with(STORED_PG_ALTERED_PREFIX) && decode_stored_pg_schema_sql(sql) == Some(text.as_str());
+        Ok(if raw { turso_core::StoredSql::client(text) } else { turso_core::StoredSql::sqlite(text) })
+    }
 
     fn parse(&self, sql: &str) -> Result<(Option<turso_parser::ast::Cmd>, usize)> {
         // This frontend's own SQLite, marked where it is built: read as SQLite.
@@ -168,11 +180,11 @@ impl Dialect for PostgresDialect {
         };
 
         let parse_result =
-            turso_pg_parser::parse(raw_sql).map_err(|e| LimboError::ParseError(e.into()))?;
+            turso_pg_parser::parse(raw_sql).map_err(crate::session::pg_parse_error)?;
         let translator = turso_pg_parser::translator::PostgreSQLTranslator::new();
         let stmt = translator
             .translate(&parse_result)
-            .map_err(|e| LimboError::ParseError(e.into()))?;
+            .map_err(crate::session::pg_parse_error)?;
         match stmt {
             turso_parser::ast::Stmt::CreateTable { tbl_name, body, .. } => {
                 let mut table = BTreeTable::from_create_table_ast(&tbl_name, &body, root_page)?;
@@ -200,11 +212,11 @@ impl Dialect for PostgresDialect {
         };
 
         let parse_result =
-            turso_pg_parser::parse(raw_sql).map_err(|e| LimboError::ParseError(e.into()))?;
+            turso_pg_parser::parse(raw_sql).map_err(crate::session::pg_parse_error)?;
         let translator = turso_pg_parser::translator::PostgreSQLTranslator::new();
         let stmt = translator
             .translate(&parse_result)
-            .map_err(|e| LimboError::ParseError(e.into()))?;
+            .map_err(crate::session::pg_parse_error)?;
         match stmt {
             stmt @ turso_parser::ast::Stmt::CreateTable { .. } => Ok(stmt),
             _ => Err(LimboError::ParseError(
@@ -320,6 +332,12 @@ impl Dialect for PostgresDialect {
 
     fn requires_custom_types(&self) -> bool {
         true
+    }
+
+    /// PostgreSQL 18 casts an integer to bytea as its big-endian two's complement at its type's
+    /// width: int2send, int4send, int8send (lead DECISIONS 60ddcb6f8f; PG 18 strings.out).
+    fn integer_to_bytea(&self, width: u8) -> Option<Func> {
+        matches!(width, 2 | 4 | 8).then(|| Func::Dialect(format!("int{width}send")))
     }
 
     /// PostgreSQL's float input reads 'Infinity', '-Infinity', 'inf' and '-inf' in any case, with

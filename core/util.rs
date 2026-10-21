@@ -187,16 +187,25 @@ pub fn table_name_for_error(name: &turso_parser::ast::QualifiedName) -> String {
 /// Quote a SQL identifier with double quotes when necessary.
 /// Always safe to call — returns the bare name when no quoting is needed.
 pub fn quote_identifier(name: &str) -> String {
-    let needs_quoting = name.is_empty()
-        || name.as_bytes()[0].is_ascii_digit()
-        || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
-        || turso_parser::lexer::is_quotable_keyword(name.as_bytes());
-    if needs_quoting {
-        let escaped = name.replace('"', "\"\"");
-        format!("\"{escaped}\"")
+    // The parser's one rule (QUOTE-SWEEP-4a97c9c36: `true`/`false` and digit-leading names were bare
+    // in one of the two printers or the other).
+    if turso_parser::lexer::identifier_needs_quotes(name.as_bytes()) {
+        double_quote_identifier(name)
     } else {
         name.to_string()
     }
+}
+
+/// Quote a SQL identifier with double quotes always (each `"` in it doubled), for SQL text whose
+/// spelling is kept quoted whatever the name: stored backing-table SQL, a pragma's argument.
+pub fn double_quote_identifier(name: &str) -> String {
+    format!("\"{}\"", escape_identifier(name))
+}
+
+/// The inside of a double-quoted identifier: each `"` doubled. For text that adds its own quotes
+/// around it (VACUUM's `"{schema}"."{table}"`); everything else uses `double_quote_identifier`.
+pub fn escape_identifier(name: &str) -> String {
+    name.replace('"', "\"\"")
 }
 
 pub const PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX: &str = "sqlite_autoindex_";
@@ -257,7 +266,7 @@ pub fn parse_schema_rows(
     schema: &mut Schema,
     syms: &SymbolTable,
     resolve_attached_db: &dyn Fn(&str) -> Option<usize>,
-    dialect: &dyn crate::dialect::Dialect,
+    dialect: &crate::sync::Arc<dyn crate::dialect::Dialect>,
 ) -> Result<IOResult<()>> {
     {
         let inner = state
@@ -293,7 +302,7 @@ pub fn parse_schema_rows(
                 dbsp_state_index_roots,
                 materialized_view_info,
                 resolve_attached_db,
-                dialect,
+                dialect.as_ref(),
             )
         }));
     }
@@ -314,6 +323,7 @@ pub fn parse_schema_rows(
         inner.materialized_view_info,
         inner.dbsp_state_roots,
         inner.dbsp_state_index_roots,
+        dialect,
     )?;
 
     Ok(IOResult::Done(()))

@@ -2293,6 +2293,15 @@ impl Pager {
 
     /// Rollback to the newest savepoint. This basically just means reading the subjournal from the start offset
     /// of the savepoint to the end of the subjournal and restoring the page images to the page cache.
+    /// Test builds only (queue a-f review L6's red): the next statement-savepoint rollback that has
+    /// a savepoint to roll back fails before restoring a page, as an I/O error reading the
+    /// subjournal would.
+    #[cfg(test)]
+    pub(crate) fn fail_next_statement_rollback() -> &'static std::sync::atomic::AtomicBool {
+        static FAIL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        &FAIL
+    }
+
     pub fn rollback_to_newest_savepoint(&self) -> Result<bool> {
         let mut savepoints = self.savepoints.write();
         if !matches!(
@@ -2305,6 +2314,12 @@ impl Pager {
         let journal_end_offset = savepoint.write_offset();
         let savepoint = savepoint.snapshot();
 
+        #[cfg(test)]
+        if Self::fail_next_statement_rollback().swap(false, std::sync::atomic::Ordering::SeqCst) {
+            return Err(LimboError::InternalError(
+                "test failpoint: the statement rollback failed".to_string(),
+            ));
+        }
         self.rollback_to_snapshot(&savepoint, journal_end_offset)?;
 
         if let Some(parent) = savepoints.last() {

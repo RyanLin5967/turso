@@ -556,7 +556,12 @@ fn update_pragma(
                     "invalid auto vacuum mode".to_string().into(),
                 ));
             };
+            // PRAGMA auto_vacuum compiles the mode in: a change re-prepares (review C42 LOW-4).
+            let changed = pager.get_auto_vacuum_mode() != auto_vacuum_mode;
             pager.persist_auto_vacuum_mode(auto_vacuum_mode)?;
+            if changed {
+                connection.bump_prepare_context_generation();
+            }
             let largest_root_page_number_reg = program.alloc_register();
             program.emit_insn(Insn::ReadCookie {
                 db: database_id,
@@ -1745,8 +1750,8 @@ fn query_pragma(
                             .operators()
                             .iter()
                             .map(|op| match &op.func_name {
-                                Some(f) => format!("'{}' {}", op.op, f),
-                                None => format!("'{}'", op.op),
+                                Some(f) => format!("'{}' {}", crate::util::escape_sql_string_literal(&op.op), f),
+                                None => format!("'{}'", crate::util::escape_sql_string_literal(&op.op)),
                             })
                             .collect();
                         program.emit_string8(ops.join(", "), base_reg + 5);

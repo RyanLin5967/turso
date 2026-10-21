@@ -26,7 +26,13 @@ pub enum LimboError {
     ParseError(SqlErrorMessage),
     #[error(transparent)]
     #[diagnostic(transparent)]
-    LexerError(#[from] turso_parser::error::Error),
+    LexerError(turso_parser::error::Error),
+    /// A recursive entry of the parser or the engine found its thread's stack nearly spent
+    /// (`turso_stack_guard::NestGuard`, the stack-guard class): the statement nests too deeply for the
+    /// thread running it, and is refused rather than overflowing the thread, which would abort the
+    /// process. PostgreSQL's 54001 stack_depth_limit_exceeded, in its words.
+    #[error("stack depth limit exceeded")]
+    StackDepthLimitExceeded,
     #[error("Conversion error: {0}")]
     ConversionError(String),
     #[error("Env variable error: {0}")]
@@ -85,6 +91,11 @@ pub enum LimboError {
     Raise(turso_parser::ast::ResolveType, SqlErrorMessage),
     #[error("RaiseIgnore")]
     RaiseIgnore,
+    /// A value too long for its type's declared length (varchar(n)), in PostgreSQL's words: its
+    /// string_data_right_truncation, typed so a server answers it by kind, never by message
+    /// (fastest-wire c15466936, 22001).
+    #[error("{0}")]
+    StringDataRightTruncation(String),
     #[error("Extension error: {0}")]
     ExtensionError(SqlErrorMessage),
     #[error("integer overflow")]
@@ -197,6 +208,10 @@ impl LimboError {
             Self::ReadOnly => ReadOnlyTransaction,
             Self::DatabaseFull(_) => DiskFull,
             Self::Interrupt => QueryCanceled,
+            // The stack-guard class (fastest-engine): PostgreSQL's 54001, as check_stack_depth().
+            Self::StackDepthLimitExceeded => StatementTooComplex,
+            // The engine's typed varchar(n) refusal (fastest-wire c15466936): 22001 by kind.
+            Self::StringDataRightTruncation(_) => StringDataRightTruncation,
             _ => InternalError,
         }
     }
@@ -205,7 +220,8 @@ impl LimboError {
     /// shell appends after a runtime error message ("... (19)").
     pub fn sqlite_result_code(&self) -> i32 {
         match self {
-            Self::Constraint(_) | Self::ForeignKeyConstraint(_) | Self::Raise(..) => 19,
+            // StringDataRightTruncation: 19, as the RAISE(ABORT) varchar's ENCODE used before it.
+            Self::Constraint(_) | Self::ForeignKeyConstraint(_) | Self::Raise(..) | Self::StringDataRightTruncation(_) => 19,
             Self::Busy | Self::BusySnapshot | Self::StatementsInProgress(_) => 5,
             Self::TableLocked => 6,
             Self::ReadOnly => 8,
@@ -239,6 +255,7 @@ impl LimboError {
                 | Self::InvalidFormatter(_)
                 | Self::IntegerOverflow
                 | Self::TooBig
+                | Self::StringDataRightTruncation(_)
         )
     }
 }
@@ -439,3 +456,15 @@ pub const SQLITE_CONSTRAINT_UNIQUE: usize = 2067;
 // op_sequence_commit_inner_tx.
 #[allow(dead_code)]
 pub const SQLITE_BUSY: usize = 5;
+
+/// The parser's errors, with its stack-guard refusal made the engine's own
+/// (`LimboError::StackDepthLimitExceeded`), so a caller sees one error for one condition whichever
+/// layer met it.
+impl From<turso_parser::error::Error> for LimboError {
+    fn from(e: turso_parser::error::Error) -> Self {
+        match e {
+            turso_parser::error::Error::StackDepthLimitExceeded => LimboError::StackDepthLimitExceeded,
+            e => LimboError::LexerError(e),
+        }
+    }
+}

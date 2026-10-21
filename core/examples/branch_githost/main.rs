@@ -2591,9 +2591,17 @@ fn victims_line(s0: u64, made: u64, n: u64, label: &str) {
 // ---------------------------------------------------------------------------------------------
 // r13-compose R1: crash images and the restart (PREREG §3.3, A2.F7's A12, A2.F10, A4.C3).
 
+/// Off macOS there is no proc_pid_rusage, so D_c is not measured there and the example refuses
+/// (the Linux workspace build broke on this function: artie raw uw-elfgate3-gate-d416dbda6.txt).
+#[cfg(not(target_os = "macos"))]
+fn diskio_line(_cmd: &str) -> String {
+    not_a_result("device bytes are read with proc_pid_rusage, which only macOS has")
+}
+
 /// r13-compose A5.8: this process's device bytes written and read (proc_pid_rusage RUSAGE_INFO_V4,
 /// as r12-catload's branch_restart reads them): D_c's instrument, an upper bound on a clone's
 /// copy-on-write divergence (a rewrite counts again).
+#[cfg(target_os = "macos")]
 fn diskio_line(cmd: &str) -> String {
     // SAFETY: a zeroed plain-integer struct, filled by the call.
     let mut info: libc::rusage_info_v4 = unsafe { std::mem::zeroed() };

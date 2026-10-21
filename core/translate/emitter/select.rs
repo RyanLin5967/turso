@@ -38,6 +38,8 @@ pub fn emit_program_for_select(
     resolver: &Resolver,
     plan: SelectPlan,
 ) -> Result<()> {
+    // Stack-guard class (fastest-engine): a recursive entry is a nested step (`stack::NestGuard`).
+    let _nest = crate::stack::NestGuard::enter("a recursive step")?;
     emit_program_for_select_with_resolver(program, resolver.fork(), plan)
 }
 

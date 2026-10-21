@@ -34,13 +34,15 @@ pub fn sequence_backing_table_name(seq_name: &str) -> String {
 }
 
 pub fn sequence_backing_table_sql(seq_name: &str) -> String {
-    let table_name = sequence_backing_table_name(seq_name);
+    // Quoted with its own `"` doubled (engine-rev-quote42 H2: a CDC table `my"cdc` made the
+    // AUTOINCREMENT backing table's SQL a lexer error).
+    let table_name = crate::util::double_quote_identifier(&sequence_backing_table_name(seq_name));
     // INTEGER PRIMARY KEY makes `value` the rowid alias: nextval inserts are
     // keyed by the sequence value itself (no synthetic rowid) and the inline
     // compaction emitted by `emit_backing_table_compaction` collapses each
     // backing table down to a single watermark row via DELETE-all + INSERT.
     format!(
-        "CREATE TABLE \"{table_name}\"(\
+        "CREATE TABLE {table_name}(\
          value INTEGER PRIMARY KEY,\
          is_called INTEGER,\
          start INTEGER,\

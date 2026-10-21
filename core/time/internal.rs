@@ -251,18 +251,24 @@ impl Time {
         }
     }
 
-    pub fn time_add_date(self, years: i32, months: i32, days: i64) -> Result<Self> {
+    /// `years`, `months` and `days` after this time. Every step is checked (the C32 HIGH: the u32
+    /// month span and the day sum panicked inside an extern "C" scalar): a year or month count
+    /// outside i32, a span past u32 months, or a result past chrono's range is `CreationError`.
+    pub fn time_add_date(self, years: i64, months: i64, days: i64) -> Result<Self> {
         let mut dt: NaiveDateTime = self.into();
+        let years = i32::try_from(years).map_err(|_| TimeError::CreationError)?;
+        let months = i32::try_from(months).map_err(|_| TimeError::CreationError)?;
+        let year_months = years.unsigned_abs().checked_mul(12).ok_or(TimeError::CreationError)?;
 
         match years.cmp(&0) {
             std::cmp::Ordering::Greater => {
                 dt = dt
-                    .checked_add_months(chrono::Months::new(years.unsigned_abs() * 12))
+                    .checked_add_months(chrono::Months::new(year_months))
                     .ok_or(TimeError::CreationError)?;
             }
             std::cmp::Ordering::Less => {
                 dt = dt
-                    .checked_sub_months(chrono::Months::new(years.unsigned_abs() * 12))
+                    .checked_sub_months(chrono::Months::new(year_months))
                     .ok_or(TimeError::CreationError)?;
             }
             std::cmp::Ordering::Equal => (),
@@ -282,7 +288,8 @@ impl Time {
             std::cmp::Ordering::Equal => (),
         };
 
-        dt += chrono::Duration::try_days(days).ok_or(TimeError::CreationError)?;
+        let span = chrono::Duration::try_days(days).ok_or(TimeError::CreationError)?;
+        dt = dt.checked_add_signed(span).ok_or(TimeError::CreationError)?;
 
         Ok(dt.into())
     }
@@ -311,16 +318,18 @@ impl Time {
         self.inner.timestamp_nanos_opt()
     }
 
-    pub fn add_duration(&self, d: Duration) -> Self {
-        Self {
-            inner: self.inner + d.inner,
-        }
+    /// This time plus `d`, or `CreationError` past chrono's range (the C32 HIGH: `+` panicked).
+    pub fn add_duration(&self, d: Duration) -> Result<Self> {
+        Ok(Self {
+            inner: self.inner.checked_add_signed(d.inner).ok_or(TimeError::CreationError)?,
+        })
     }
 
-    pub fn sub_duration(&self, d: Duration) -> Self {
-        Self {
-            inner: self.inner - d.inner,
-        }
+    /// This time minus `d`, or `CreationError` past chrono's range.
+    pub fn sub_duration(&self, d: Duration) -> Result<Self> {
+        Ok(Self {
+            inner: self.inner.checked_sub_signed(d.inner).ok_or(TimeError::CreationError)?,
+        })
     }
 
     pub fn trunc_duration(&self, d: Duration) -> Result<Self> {
@@ -526,7 +535,10 @@ impl TryFrom<Vec<u8>> for Time {
             | (value[9] as u32) << 24;
 
         Ok(Self {
-            inner: DateTime::from_timestamp(seconds - (3600 * 24 * DAYS_BEFORE_EPOCH), nanoseconds)
+            // Checked: a caller's blob can carry any seconds (the C32 HIGH, i64::MIN).
+            inner: seconds
+                .checked_sub(3600 * 24 * DAYS_BEFORE_EPOCH)
+                .and_then(|s| DateTime::from_timestamp(s, nanoseconds))
                 .ok_or(TimeError::InvalidFormat)?
                 .to_utc(),
         })

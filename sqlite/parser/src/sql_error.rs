@@ -30,6 +30,7 @@ pub enum SqlErrorKind {
     AmbiguousParameter,
     DuplicateAlias,
     StatementTooComplex,
+    CannotCoerce,
     InternalError,
     SerializationFailure,
     LockNotAvailable,

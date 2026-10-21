@@ -851,7 +851,7 @@ fn validate(
                                     Some(ast::TypeSize::MaxSize(e)) => vec![e.clone()],
                                     None => vec![],
                                 };
-                                check_numeric_typmod(type_name, &params)?;
+                                check_numeric_typmod(type_name, &params, is_strict)?;
                             }
                             Some(_) => {}
                         }
@@ -1110,11 +1110,11 @@ fn emit_ctas_insert(
 /// declares a column type with parameters (a domain's base type takes none). Parameters that are
 /// not integer literals are left to numeric's ENCODE, which builds the same typmod at every write
 /// and CAST.
-pub(crate) fn check_numeric_typmod(
-    type_name: &str,
-    params: &[Box<ast::Expr>],
-) -> crate::Result<()> {
-    if !normalize_ident(type_name).eq_ignore_ascii_case("numeric") {
+pub(crate) fn check_numeric_typmod(type_name: &str, params: &[Box<ast::Expr>], is_strict: bool) -> crate::Result<()> {
+    // Only a STRICT table's column uses the numeric custom type; on any other table numeric(p, s)
+    // is a type name with SQLite's affinity, which CREATE TABLE accepts as written (review C38 MED
+    // 1: ALTER TABLE ADD COLUMN refused it there). One predicate for both statements.
+    if !is_strict || !normalize_ident(type_name).eq_ignore_ascii_case("numeric") {
         return Ok(());
     }
     fn literal(e: &ast::Expr) -> Option<i64> {
@@ -1126,7 +1126,12 @@ pub(crate) fn check_numeric_typmod(
     }
     if let [p, s] = params {
         if let (Some(p), Some(s)) = (literal(p), literal(s)) {
-            crate::numeric::decimal::NumericTypmod::new(p, s).map_err(|e| crate::LimboError::ParseError(e.to_string().into()))?;
+            // The typmod's own condition is kept (22023 for a range PostgreSQL refuses; review of
+            // 96b69304b, F8: it was dropped, so 42601 was sent).
+            crate::numeric::decimal::NumericTypmod::new(p, s).map_err(|e| match e {
+                crate::LimboError::Constraint(m) => crate::LimboError::ParseError(m),
+                e => e,
+            })?;
         }
     }
     Ok(())
@@ -1345,12 +1350,25 @@ pub fn translate_create_table(
     // the schema dialect format the SQL to store (the SQLite dialect renders
     // canonical text from the AST, a frontend dialect preserves its own
     // input text).
-    let sql = if let Some(ref info) = ctas_info {
-        info.schema_sql.clone()
-    } else {
-        connection
-            .dialect()
-            .format_table_sql(input, &tbl_name, &body)?
+    // The table's own row, by the statement's SOURCE (dialect design REVISION 2 item 2): engine text is
+    // stored as canonical SQLite (never the frontend's formatter); a client's text through the
+    // dialect's formatter; a replay keeps its source row's bytes (its own row only); a frontend's
+    // canonical text never creates a table (R11). CTAS stores its plan's text (outside item 2).
+    let sql = match (&resolver.sql_source, &ctas_info) {
+        (crate::connection::SqlSource::Frontend, _) => {
+            bail_parse_error!(
+                "a frontend's canonical SQLite text may not create a table ({}): a frontend creates its tables through its own parser",
+                tbl_name.name.as_str()
+            );
+        }
+        (crate::connection::SqlSource::Replay { .. }, _) => {
+            crate::translate::replayed_own_row(resolver, tbl_name.name.as_str())?.expect("a replay source")
+        }
+        (_, Some(info)) => info.schema_sql.clone(),
+        (crate::connection::SqlSource::Engine, None) => {
+            crate::dialect::Dialect::format_table_sql(&crate::dialect::SqliteDialect, input, &tbl_name, &body)?
+        }
+        (crate::connection::SqlSource::Client, None) => resolver.dialect.format_table_sql(input, &tbl_name, &body)?,
     };
 
     let parse_schema_label = program.allocate_label();
@@ -2686,10 +2704,14 @@ pub fn translate_create_type(
     let normalized_name = normalize_ident(type_name);
 
     // Reject names that shadow SQLite base types
-    let is_base_type = turso_macros::match_ignore_ascii_case!(match normalized_name.as_bytes() {
-        b"INT" | b"INTEGER" | b"REAL" | b"TEXT" | b"BLOB" | b"ANY" => true,
-        _ => false,
-    });
+    // The registry key, quotes undone (adversary of d806241ea, HIGH 1: `"integer"` passed a test
+    // of the token and then took over every STRICT INTEGER column); an empty name is refused too.
+    let key = crate::schema::type_key(&normalized_name);
+    let is_base_type = key.is_empty()
+        || turso_macros::match_ignore_ascii_case!(match key.as_bytes() {
+            b"INT" | b"INTEGER" | b"REAL" | b"TEXT" | b"BLOB" | b"ANY" => true,
+            _ => false,
+        });
     if is_base_type {
         bail_parse_error!("cannot create type \"{normalized_name}\": name is a built-in type");
     }
@@ -2724,15 +2746,28 @@ pub fn translate_create_type(
     // Build canonical SQL (without IF NOT EXISTS) for persistence
     let sql = build_create_type_sql(&normalized_name, body);
 
-    persist_type_definition(normalized_name, sql, resolver, program)
+    // Stored under the registry key, so DROP finds the row however the name was quoted
+    // (adversary of d806241ea, MED 2).
+    persist_type_definition(crate::schema::type_key(&normalized_name), sql, resolver, program)
 }
 
 /// Build canonical CREATE TYPE SQL from a normalized name and parsed body.
+///
+/// The type, base, parameter and field-type names are the parser's TOKENS (`"m'x"` with its
+/// quotes) and are written as given; quoting them again made the reparse register a type named
+/// with its quotes (`CREATE TYPE """m'x"""`). Field names are `Name`s and are quoted.
 fn build_create_type_sql(name: &str, body: &ast::CreateTypeBody) -> String {
     use crate::util::quote_identifier as quote_ident;
-    fn quote_string_literal(s: &str) -> String {
-        s.replace('\'', "''")
-    }
+    // A parser token (`"m'x"`) as given, any other text (a bracket-stripped `a,b`) quoted
+    // (adversary of d806241ea, MED 3 and the OPERATOR LOW).
+    let token = |s: &str| -> String {
+        if crate::schema::is_one_quoted_token(s) {
+            s.to_string()
+        } else {
+            quote_ident(s)
+        }
+    };
+    use crate::util::escape_sql_string_literal as quote_string_literal;
 
     match body {
         ast::CreateTypeBody::CustomType {
@@ -2746,22 +2781,22 @@ fn build_create_type_sql(name: &str, body: &ast::CreateTypeBody) -> String {
             let mut sql = if params.is_empty() {
                 format!(
                     "CREATE TYPE {} BASE {}",
-                    quote_ident(name),
-                    quote_ident(base)
+                    token(name),
+                    token(base)
                 )
             } else {
                 let param_strs: Vec<String> = params
                     .iter()
                     .map(|p| match &p.ty {
-                        Some(ty) => format!("{} {}", quote_ident(&p.name), ty),
-                        None => quote_ident(&p.name),
+                        Some(ty) => format!("{} {}", token(&p.name), ty),
+                        None => token(&p.name),
                     })
                     .collect();
                 format!(
                     "CREATE TYPE {}({}) BASE {}",
-                    quote_ident(name),
+                    token(name),
                     param_strs.join(", "),
-                    quote_ident(base)
+                    token(base)
                 )
             };
             if let Some(ref encode) = encode {
@@ -2778,7 +2813,7 @@ fn build_create_type_sql(name: &str, body: &ast::CreateTypeBody) -> String {
                     Some(func_name) => sql.push_str(&format!(
                         " OPERATOR '{}' {}",
                         quote_string_literal(&op.op),
-                        quote_ident(func_name)
+                        token(func_name)
                     )),
                     None => sql.push_str(&format!(" OPERATOR '{}'", quote_string_literal(&op.op))),
                 }
@@ -2792,13 +2827,13 @@ fn build_create_type_sql(name: &str, body: &ast::CreateTypeBody) -> String {
                     format!(
                         "{} {}",
                         quote_ident(f.name.as_str()),
-                        quote_ident(&f.field_type.name)
+                        token(&f.field_type.name)
                     )
                 })
                 .collect();
             format!(
                 "CREATE TYPE {} AS STRUCT({})",
-                quote_ident(name),
+                token(name),
                 field_strs.join(", ")
             )
         }
@@ -2809,13 +2844,13 @@ fn build_create_type_sql(name: &str, body: &ast::CreateTypeBody) -> String {
                     format!(
                         "{} {}",
                         quote_ident(f.name.as_str()),
-                        quote_ident(&f.field_type.name)
+                        token(&f.field_type.name)
                     )
                 })
                 .collect();
             format!(
                 "CREATE TYPE {} AS UNION({})",
-                quote_ident(name),
+                token(name),
                 variant_strs.join(", ")
             )
         }
@@ -2836,10 +2871,14 @@ pub fn translate_create_domain(
     let normalized_name = normalize_ident(domain_name);
 
     // Reject names that shadow SQLite base types
-    let is_base_type = turso_macros::match_ignore_ascii_case!(match normalized_name.as_bytes() {
-        b"INT" | b"INTEGER" | b"REAL" | b"TEXT" | b"BLOB" | b"ANY" => true,
-        _ => false,
-    });
+    // The registry key, quotes undone (adversary of d806241ea, HIGH 1: `"integer"` passed a test
+    // of the token and then took over every STRICT INTEGER column); an empty name is refused too.
+    let key = crate::schema::type_key(&normalized_name);
+    let is_base_type = key.is_empty()
+        || turso_macros::match_ignore_ascii_case!(match key.as_bytes() {
+            b"INT" | b"INTEGER" | b"REAL" | b"TEXT" | b"BLOB" | b"ANY" => true,
+            _ => false,
+        });
     if is_base_type {
         bail_parse_error!("cannot create domain \"{normalized_name}\": name is a built-in type");
     }
@@ -2904,7 +2943,9 @@ pub fn translate_create_domain(
         s
     };
 
-    persist_type_definition(normalized_name, sql, resolver, program)
+    // Stored under the registry key, so DROP finds the row however the name was quoted
+    // (adversary of d806241ea, MED 2).
+    persist_type_definition(crate::schema::type_key(&normalized_name), sql, resolver, program)
 }
 
 pub fn translate_drop_type(
@@ -2945,7 +2986,7 @@ pub fn translate_drop_type(
     // Check if any table uses this type
     for (_, table) in resolver.schema().tables.iter() {
         for col in table.columns() {
-            if normalize_ident(&col.ty_str) == normalized_name {
+            if crate::schema::type_key(&col.ty_str) == crate::schema::type_key(&normalized_name) {
                 bail_parse_error!(
                     "cannot drop type {normalized_name}: used by column {} in table {}",
                     col.name.as_deref().unwrap_or("?"),
@@ -2957,7 +2998,7 @@ pub fn translate_drop_type(
 
     // Check if any other type/domain depends on this type
     for (name, td) in resolver.schema().type_registry.iter() {
-        if normalize_ident(td.base()) == normalized_name {
+        if crate::schema::type_key(td.base()) == crate::schema::type_key(&normalized_name) {
             bail_parse_error!(
                 "cannot drop type {}: type {} depends on it",
                 normalized_name,
@@ -2980,10 +3021,16 @@ pub fn translate_drop_type(
         db: MAIN_DB_ID,
     });
 
-    // Search for matching row: name=type_name (col 0)
+    // Search for matching rows: name = the registry key (how rows are stored), or = the name's
+    // token (how rows were stored before; adversary of d806241ea, MED 2).
     let name_reg = program.alloc_register();
     program.emit_insn(Insn::String8 {
         dest: name_reg,
+        value: crate::schema::type_key(&normalized_name),
+    });
+    let token_reg = program.alloc_register();
+    program.emit_insn(Insn::String8 {
+        dest: token_reg,
         value: normalized_name.clone(),
     });
 
@@ -3001,15 +3048,24 @@ pub fn translate_drop_type(
     program.emit_column_or_rowid(types_cursor_id, 0, col0_reg);
 
     let skip_delete_label = program.allocate_label();
+    let delete_label = program.allocate_label();
 
-    // Check name=type_name
-    program.emit_insn(Insn::Ne {
+    // Check name = key, or name = token
+    program.emit_insn(Insn::Eq {
         lhs: col0_reg,
         rhs: name_reg,
+        target_pc: delete_label,
+        flags: CmpInsFlags::default(),
+        collation: program.curr_collation(),
+    });
+    program.emit_insn(Insn::Ne {
+        lhs: col0_reg,
+        rhs: token_reg,
         target_pc: skip_delete_label,
         flags: CmpInsFlags::default(),
         collation: program.curr_collation(),
     });
+    program.preassign_label_to_next_insn(delete_label);
 
     // Delete matching row
     program.emit_insn(Insn::Delete {
