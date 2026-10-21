@@ -204,7 +204,7 @@ def sample(path, cell, interval, stop_file, max_s):
                 return 0
 
 
-def busy_evidence(path, exclude=(), interval_default=1.0):
+def busy_evidence(path, exclude=(), interval_default=1.0, keep=None):
     """linux-rev-uw1 MED 3: the processes that make a window's record show a BUSY HOST, from the window's own samples:
     each FOREIGN process (the sampler's own classification, so kernel threads and the system under test never count)
     whose pid is not in EXCLUDE (the self-test's own tree) and that the record shows above 50% for 5 s or more (rule
@@ -247,6 +247,9 @@ def busy_evidence(path, exclude=(), interval_default=1.0):
         if ticks and over / len(ticks) > 0.05:
             top = sorted(per.items(), key=lambda kv: -sum(p for _t, p in kv[1]))[:4]
             out = [f"{comm} pid {pid}" for (pid, comm), _r in top]
+    # KEEP (late_busy): a filter on each named process's #owner row (None when unrecorded)
+    if keep is not None:
+        out = [e for e in out if keep(owners.get(int(e.rsplit(" pid ", 1)[1])))]
     # who: each named process's owner from the sampler's #owner rows (the lead's 2026-10-18 order), never guessed
     def who(e):
         pid = int(e.rsplit(" pid ", 1)[1])
@@ -259,6 +262,28 @@ def busy_evidence(path, exclude=(), interval_default=1.0):
             return f"{e} (user {user}, run unknown: it exited before the stop)"
         return f"{e} (user {user}, our run {run})" if run != "-" else f"{e} (user {user})"
     return [who(e) for e in out]
+
+
+def late_busy(path, exclude=(), own_run="-"):
+    """busy-host evidence for LATE load: a VALID-wanting live case VOIDed after its quiet baseline passed (eceubuntu4,
+    2026-10-21). Only a process that cannot be this self-test's own counts: another uid, or a process of ours whose
+    uwrun run is known and is not OWN_RUN. Ours in OWN_RUN, ours with run unknown ("?") or none ("-"), and a process
+    with no #owner row are no evidence, so the child case's own child misclassified as foreign still fails. Blind spot,
+    stated: off uwrun (own run "-") no process of our uid is evidence, so a T3 box's own other jobs read FAIL."""
+    me = os.getuid()
+    return busy_evidence(path, exclude, keep=lambda o: o is not None and (
+        o[0] != me or (o[2] not in ("?", "-") and o[2] != own_run)))
+
+
+def live_outcome(out, want, burners, rec, mine, own_run="-"):
+    """one live case's outcome, "PASS", "FAIL" or "N/A": PASS when its window gave WANT and its burners were seen to run
+    (burners_ran); N/A when a VALID-wanting case with burners VOIDed and late_busy names load that is not ours; FAIL
+    otherwise"""
+    if out == want and burners_ran(decide(rec), burners, mine, rec=rec):
+        return "PASS"
+    if burners and want == "VALID" and out == "VOID" and late_busy(rec, exclude=mine, own_run=own_run):
+        return "N/A"
+    return "FAIL"
 
 
 def burners_ran(v, burners, mine, rec=None):
@@ -413,6 +438,8 @@ def self_test():
     # case still runs, as a busy host cannot excuse a missed burner. On the T3 box (quiet by its own preflight) all run.
     busy = None
     n_pass = n_na = 0
+    # this self-test's own uwrun run, for late_busy: a process of ours in it may be the test's own
+    own_run = (owner_of(os.getpid()) or (0, "-", "-"))[2]
     # the lead's F6 order (2): a CALIBRATION of the sampler itself, run on every host whatever its load. One SUT burner
     # of one core burns for 6 s; no per-sample reading of it may exceed 120% of a core. A sampler that over-counts
     # (mutant F6, 10x) fails this live, on a quiet or a busy host alike: load can starve a burner, never inflate its
@@ -447,7 +474,13 @@ def self_test():
                 continue
         # linux-rev-uw3 MED 1: the verdict counts only when the case's own burners were seen to run in its record
         seen = burners_ran(decide(rec), burners, mine, rec=rec)
-        ok = out == want and seen
+        verdict = live_outcome(out, want, burners, rec, mine, own_run=own_run)
+        if verdict == "N/A":
+            n_na += 1
+            print(f"N/A-on-busy-host: self-test {label}: the quiet baseline passed, then load arrived: the window gave "
+                  f"{out}; its own samples show: {', '.join(late_busy(rec, exclude=mine, own_run=own_run)[:4])}", flush=True)
+            continue
+        ok = verdict == "PASS"
         bad += not ok
         n_pass += ok
         print(f"self-test {'PASS' if ok else 'FAIL'}: {label}: want {want}, got {out}"
