@@ -1841,6 +1841,9 @@ fn linux_task_path(tid: u64, leaf: &[u8], out: &mut [u8; 64]) -> usize {
 /// for want of a descriptor. Descriptor churn could not force it (bimodal on iccad9: 5000 or 0 of 5000 reads
 /// refused in 5 of 6 runs).
 pub(crate) static PROBE_EMFILE_TID: AtomicU64 = AtomicU64::new(0);
+/// The errno the injected open failure sets (REVIEW-budgets-port-fix5 LOW-1: ENOENT pins the other direction of
+/// the classification); EMFILE unless a test sets it.
+pub(crate) static PROBE_INJECT_ERRNO: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(libc::EMFILE);
 
 /// Whether task `tid` still exists: `Some(true)` if its /proc directory opens, `Some(false)` only if the
 /// open fails because the task is gone (ENOENT, ESRCH), `None` on any other failure (EMFILE, ENFILE,
@@ -1853,7 +1856,7 @@ fn linux_task_alive(tid: u64) -> Option<bool> {
     // failing with errno EMFILE, so the errno classification below is what the test exercises.
     let fd = if tid != 0 && PROBE_EMFILE_TID.load(Relaxed) == tid {
         // SAFETY: this thread's errno, set as a failed open sets it.
-        unsafe { *libc::__errno_location() = libc::EMFILE };
+        unsafe { *libc::__errno_location() = PROBE_INJECT_ERRNO.load(Relaxed) };
         -1
     } else {
         // SAFETY: a NUL-terminated path; the descriptor is closed below.
