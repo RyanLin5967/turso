@@ -2323,8 +2323,9 @@ impl Infer<'_> {
                 }
                 // An untyped string literal takes the other operand's type, as PostgreSQL resolves
                 // an unknown ('5' + i is int4; wire-rev-2a68496d0 M1: it was text).
+                // NULL is an unknown too (wire-rev-7128c6f73 L10: 1::int2 + NULL is int2).
                 let untyped = |x: Option<&PgNode>| {
-                    matches!(x.and_then(|x| x.node.as_ref()), Some(Node::AConst(c)) if matches!(c.val, Some(Val::Sval(_))))
+                    matches!(x.and_then(|x| x.node.as_ref()), Some(Node::AConst(c)) if c.isnull || matches!(c.val, Some(Val::Sval(_))))
                 };
                 let l = e.lexpr.as_deref().and_then(|l| self.type_of(l, scope));
                 let r = e.rexpr.as_deref().and_then(|r| self.type_of(r, scope));
@@ -2343,8 +2344,8 @@ impl Infer<'_> {
                     return None;
                 }
                 let (l, r) = match (l, r) {
-                    (Some(_), Some(b)) if untyped(e.lexpr.as_deref()) && !untyped(e.rexpr.as_deref()) => (Some(b), Some(b)),
-                    (Some(a), Some(_)) if untyped(e.rexpr.as_deref()) && !untyped(e.lexpr.as_deref()) => (Some(a), Some(a)),
+                    (_, Some(b)) if untyped(e.lexpr.as_deref()) && !untyped(e.rexpr.as_deref()) => (Some(b), Some(b)),
+                    (Some(a), _) if untyped(e.rexpr.as_deref()) && !untyped(e.lexpr.as_deref()) => (Some(a), Some(a)),
                     other => other,
                 };
                 // A side with no type types the expression only when it is a parameter, which
