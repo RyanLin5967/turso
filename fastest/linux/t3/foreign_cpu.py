@@ -16,8 +16,10 @@ where class is
 Each foreign pid recorded gets an `#owner` row AFTER the `#stop` row (inside the window only its uid is read, one
 stat; the owner is resolved at stop): pid, uid, login and the uwrun run it belongs to ("?" once it has exited).
 The login and run are written for this account's processes only (the run is the first component of its cwd under
-uwrun's run roots, see run_roots); any other uid gets "-" for both, so another user's login is never recorded. Owners only
-name busy-host evidence; they never change a verdict, and our own other runs are foreign like anyone's.
+uwrun's run roots, see run_roots); any other uid gets "-" for both, so another user's login is never recorded. Owners
+never change decide()'s verdict, and our own other runs are foreign like anyone's. In the SELF-TEST they decide whether
+a live case is FAIL or N/A-on-busy-host (late_busy, since 957573fc1), so owners_at_stop's pid-reuse blind spot reaches
+a self-test outcome too.
 Each tick also writes a `#tick` row (t, foreign_sum, kernel_sum, sut_sum), so a tick in which nothing
 foreign ran is on the record as a zero, not as a missing row.
 
@@ -267,11 +269,41 @@ def busy_evidence(path, exclude=(), interval_default=1.0, keep=None):
 def late_busy(path, exclude=(), own_run="-"):
     """busy-host evidence for LATE load: a VALID-wanting live case VOIDed after its quiet baseline passed (eceubuntu4,
     2026-10-21). Only a process that cannot be this self-test's own counts: another uid, or a process of ours whose
-    uwrun run is known and is not OWN_RUN. Ours in OWN_RUN, ours with run unknown ("?") or none ("-"), and a process
-    with no #owner row are no evidence, so the child case's own child misclassified as foreign still fails. Blind spot,
-    stated: off uwrun (own run "-") no process of our uid is evidence, so a T3 box's own other jobs read FAIL."""
+    uwrun run is known and is not OWN_RUN. Ours in OWN_RUN, ours with run unknown ("?") or none ("-"), a process with
+    no #owner row, and EXCLUDE are no evidence, so the child case's own child misclassified as foreign still fails.
+    linux-rev-957573fc1 MED 1: the evidence must explain the VOID by itself. decide() is re-run on a copy of the record
+    holding only the KEPT foreign processes (each #tick's foreign sum recomputed from their rows), so another uid's 5%
+    beside our own run's 98% is no evidence.
+    Blind spots, stated: off uwrun (own run "-") no process of our uid is evidence, so a T3 box's own other jobs read
+    FAIL; and "our run" is keyed by cwd, not ancestry (linux-rev-957573fc1 LOW 1), so a process of the self-test's own
+    tree whose cwd is in another run's dir reads as that run's load (no self-test case changes directory)."""
     me = os.getuid()
-    return busy_evidence(path, exclude, keep=lambda o: o is not None and (
+    owners = {}
+    lines = open(path).read().splitlines()
+    for line in lines:
+        q = line.split("\t")
+        if q[0] == "#owner" and len(q) == 5:
+            owners[int(q[1])] = (int(q[2]), q[3], q[4])
+
+    def kept(pid):
+        o = owners.get(pid)
+        return pid not in exclude and o is not None and (o[0] != me or (o[2] not in ("?", "-") and o[2] != own_run))
+    sums, out = {}, []
+    for line in lines:
+        q = line.split("\t")
+        if not q[0].startswith("#") and len(q) == 5:
+            if q[4] == "foreign":
+                if not kept(int(q[1])):
+                    continue
+                sums[q[0]] = sums.get(q[0], 0.0) + float(q[3])
+        elif q[0] == "#tick" and len(q) >= 3:
+            q[2] = f"{sums.get(q[1], 0.0):.1f}"
+            line = "\t".join(q)
+        out.append(line)
+    late = path + ".late"
+    with open(late, "w") as f:
+        f.write("\n".join(out) + "\n")
+    return busy_evidence(late, exclude, keep=lambda o: o is not None and (
         o[0] != me or (o[2] not in ("?", "-") and o[2] != own_run)))
 
 
