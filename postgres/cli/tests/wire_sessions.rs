@@ -17432,10 +17432,65 @@ fn a_bound_varchar_array_is_read_as_array_in_reads_it() {
     .enumerate()
     {
         let id = (k + 1).to_string();
-        let r = a.x_undeclared(sql, &[value, &id]);
+        // Parse, Bind and Sync with no Execute: the Bind's own answer, whatever the engine then
+        // stores (its cut of an excess of blanks is the known red a_value_whose_excess_is_spaces_is_cut_per_column).
+        let mut parse = vec![0u8];
+        parse.extend_from_slice(sql.as_bytes());
+        parse.extend_from_slice(&[0, 0, 0]);
+        a.send(b'P', &parse);
+        let mut bind = vec![0u8, 0u8, 0, 0];
+        bind.extend_from_slice(&2i16.to_be_bytes());
+        for v in [value, id.as_str()] {
+            bind.extend_from_slice(&(v.len() as i32).to_be_bytes());
+            bind.extend_from_slice(v.as_bytes());
+        }
+        bind.extend_from_slice(&0i16.to_be_bytes());
+        a.send(b'B', &bind);
+        a.send(b'S', &[]);
+        let r = a.read_reply();
         let too_long = r.error.as_ref().is_some_and(|e| e.code == "22001" && e.message == long);
         if too_long != refused {
             wrong.push(format!("{sql} with {value}: PG {}; got {:?} {:?}", if refused { "22001 at Bind" } else { "bound" }, r.tags, r.error));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// wire-rev-4a1934c89-beb4 LOW-3 (its PG 18.6 probe #27-#32, #66): a parameter of a string type, declared or typed by
+/// its first assignment, assigned to a column of another category has no assignment cast: 42804 'column "x" is of type
+/// numeric but expression is of type text' at the first such column. A declared text went into numeric and into
+/// varchar(3)[] (22001), and crossed VALUES rows were 42P08.
+#[test]
+fn a_string_parameter_assigned_to_another_category_is_42804() {
+    let dir = Scratch::new("assign-42804");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in [
+        "CREATE TABLE mix(id int PRIMARY KEY, x numeric(6,2), v varchar(3))",
+        "CREATE TABLE two(id int PRIMARY KEY, a varchar(3), b varchar(10))",
+        "CREATE TABLE va(id int PRIMARY KEY, a varchar(3)[])",
+    ] {
+        a.q(sql).ok(sql);
+    }
+    let mut wrong = Vec::new();
+    for (sql, params, want) in [
+        ("INSERT INTO mix VALUES (9, $1, $1)", vec![(25u32, 0i16, &b"9"[..])], Err("column \"x\" is of type numeric but expression is of type text")),
+        ("INSERT INTO mix VALUES (10, $1, $1)", vec![(1700, 0, &b"9"[..])], Ok("INSERT 0 1")),
+        ("INSERT INTO two VALUES (11, $1, $1)", vec![(0, 0, &b"ab"[..])], Ok("INSERT 0 1")),
+        (
+            "INSERT INTO mix VALUES (13, $1, $2), (14, $2, $1)",
+            vec![(0, 0, &b"1"[..]), (0, 0, &b"2"[..])],
+            Err("column \"x\" is of type numeric but expression is of type character varying"),
+        ),
+        ("INSERT INTO va VALUES (52, $1)", vec![(25, 0, &b"{abcd}"[..])], Err("column \"a\" is of type character varying[] but expression is of type text")),
+    ] {
+        let r = a.xt(sql, &params);
+        let agrees = match want {
+            Ok(tag) => r.error.is_none() && r.tags.last().map(String::as_str) == Some(tag),
+            Err(message) => r.error.as_ref().is_some_and(|e| e.code == "42804" && e.message == message),
+        };
+        if !agrees {
+            wrong.push(format!("{sql}: PG {want:?}; got {:?} {:?}", r.tags, r.error));
         }
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
