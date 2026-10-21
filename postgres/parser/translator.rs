@@ -407,10 +407,13 @@ impl PostgreSQLTranslator {
             name
         };
         let mut qn = match schema_qualifier(&range_var.schemaname) {
-            // pg_catalog's relations stay unqualified, as the engine finds its catalog tables.
-            SchemaQualifier::Unqualified
-            | SchemaQualifier::PgCatalog
-            | SchemaQualifier::InformationSchema => ast::QualifiedName::single(name),
+            SchemaQualifier::Unqualified => ast::QualifiedName::single(name),
+            // pg_catalog's and information_schema's relations are the main database's virtual
+            // tables, named there whatever the search path: unqualified, a path naming no existing
+            // schema hid them (wire-rev-4a1934c89-beb4 MED-3).
+            SchemaQualifier::PgCatalog | SchemaQualifier::InformationSchema => {
+                ast::QualifiedName::fullname(pg_name("main"), name)
+            }
             // An explicit public is the main database's relation whatever the search path: read
             // as unqualified, `INSERT INTO public.t` under `search_path TO s, public` wrote into
             // s.t (wire review 17 item 1).

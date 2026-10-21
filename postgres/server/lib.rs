@@ -6235,7 +6235,7 @@ fn pg_bytes_to_value(bytes: &[u8], pg_type: &Type) -> PgWireResult<Value> {
             if *pg_type == Type::NUMERIC && turso_pg_parser::translator::decimal_past_float8(trimmed) {
                 return Err(PgWireError::UserError(error(
                     SqlErrorKind::FeatureNotSupported,
-                    format!("numeric value {trimmed} is not supported: more than 15 significant digits would be rounded"),
+                    format!("numeric value {trimmed} is not supported: the engine's float8 would not hold it exactly"),
                 )));
             }
             // An integer-shaped numeric is the integer, never an f64: '9007199254740993' was
@@ -9161,10 +9161,12 @@ mod tests {
             (b"-0", &Type::FLOAT4),
             (b"4.9e-324", &Type::FLOAT8),
             (b"1.4e-45", &Type::FLOAT4),
-            (b"1e-400", &Type::NUMERIC),
         ] {
             assert_eq!(code(zero, t), None, "{:?} as {t}", std::str::from_utf8(zero));
         }
+        // A numeric outside a double's range is refused, never bound as 0 (the lead's ruling
+        // d2bf57effb; wire-rev-1de981755-numeric HIGH-6: it bound 0).
+        assert_eq!(code(b"1e-400", &Type::NUMERIC).as_deref(), Some("0A000"));
         let based = pg_bytes_to_value(b"0b_10_0101", &Type::INT4).unwrap();
         assert_eq!(based, Value::from_i64(37));
         let based = pg_bytes_to_value(b"0x_1EEE_FFFF", &Type::INT4).unwrap();

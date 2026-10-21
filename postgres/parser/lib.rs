@@ -487,11 +487,13 @@ pub enum SchemaQualifier<'a> {
 pub fn schema_qualifier(schema: &str) -> SchemaQualifier<'_> {
     if schema.is_empty() {
         SchemaQualifier::Unqualified
-    } else if schema.eq_ignore_ascii_case("public") || schema.eq_ignore_ascii_case("main") {
+    // As written: libpg_query folds an unquoted qualifier, so a quoted "Public" is another schema,
+    // as in PostgreSQL (wire-rev-4a1934c89-beb4 MED-4).
+    } else if schema == "public" || schema == "main" {
         SchemaQualifier::Main
-    } else if schema.eq_ignore_ascii_case("pg_catalog") {
+    } else if schema == "pg_catalog" {
         SchemaQualifier::PgCatalog
-    } else if schema.eq_ignore_ascii_case("information_schema") {
+    } else if schema == "information_schema" {
         SchemaQualifier::InformationSchema
     } else {
         SchemaQualifier::Attached(schema)

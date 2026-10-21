@@ -12592,7 +12592,7 @@ replays_postgresql!(
     "pg18-audit1-lib-parameters_decode_at_postgresqls_edges.out",
     [
         (1, "PGDIV-PUBLIC-SCHEMA-NOOP cluster-state [cluster]: DROP SCHEMA IF EXISTS public CASCADE answers DROP SCHEMA without dropping, so CREATE SCHEMA public fails 42601 'schema \"public\" already exists'"),
-        (12, "PGDIV-NUMERIC-AS-FLOAT value [engine]: SILENT: numeric param 1e-400 answers '0' where PG answers the exact 0.(399 zeros)1; the numeric decode underflows"),
+        (12, "PGDIV-NUMERIC-LITERAL-WIDE refused [wire]: a numeric parameter 1e-400, outside a double's range, is refused 0A000 at Bind where PG answers its exact value (it answered 0; wire-rev-1de981755-numeric HIGH-6)"),
     ]
 );
 replays_postgresql!(
@@ -13230,8 +13230,8 @@ replays_postgresql!(
     pg18_c33_replays_as_postgresql_answered,
     "pg18-c33.out",
     [
-        (13, "PGDIV-NUMERIC-AS-FLOAT value [engine]: SILENT: 0x_7FFF_FFFF_FFFF_FFFF_F answers '1.4757395258967641e+20' typed 701; PG exact 147573952589676412927 typed 1700"),
-        (17, "PGDIV-NUMERIC-AS-FLOAT value [engine]: SILENT: SELECT 9223372036854775808 answers '9.223372036854776e+18' typed 701; PG exact numeric 9223372036854775808"),
+        (13, "PGDIV-NUMERIC-LITERAL-WIDE refused [wire]: 0x_7FFF_FFFF_FFFF_FFFF_F, past int8, is refused 0A000 where PG answers 147573952589676412927 (it answered 1.4757395258967641e+20; wire-rev-1de981755-numeric HIGH-4)"),
+        (17, "PGDIV-NUMERIC-LITERAL-WIDE refused [wire]: SELECT 9223372036854775808, past int8, is refused 0A000 where PG answers the exact numeric"),
         (19, "PGDIV-NEG-ZERO value [engine]: SILENT: SELECT -0.0 answers '-0' typed 701; PG numeric '0.0'"),
         (20, "PGDIV-NEG-ZERO value [engine]: SILENT: SELECT -0.0::float8 answers '0'; PG '-0' (cast binds before unary minus)"),
         (22, "PGDIV-NEG-ZERO value [engine]: SILENT: '-0'::numeric answers '-0' typed 701; PG '0' typed 1700"),
@@ -13370,7 +13370,7 @@ replays_postgresql!(
     pg18_num_replays_as_postgresql_answered,
     "pg18-num.out",
     [
-        (4, "PGDIV-NUMERIC-AS-FLOAT value [engine]: SILENT: SELECT 0x_7FFF_FFFF_FFFF_FFFF_F answers float '1.4757395258967641e+20' typed 701; PG exact 147573952589676412927 numeric"),
+        (4, "PGDIV-NUMERIC-LITERAL-WIDE refused [wire]: SELECT 0x_7FFF_FFFF_FFFF_FFFF_F, past int8, is refused 0A000 where PG answers 147573952589676412927"),
     ]
 );
 replays_postgresql!(

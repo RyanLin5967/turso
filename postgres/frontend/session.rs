@@ -464,6 +464,95 @@ fn refuse_cross_database(
     Ok(())
 }
 
+/// The session's search path as every lookup reads it, entries as written: a case variant of
+/// public ("Public") names no schema, public being lower case, so it is passed over, never
+/// handed to the engine or the lookups here, which fold it to main (wire-rev-4a1934c89-beb4
+/// MED-4: under "Public", s1 the INSERT landed in public.v). A path whose every entry is passed
+/// over stays a path (it names nothing): the empty Vec is returned with `set` true.
+pub(crate) fn written_search_path(pg_conn: &PgConnectionInner) -> Vec<String> {
+    let mut path = pg_conn.session_state.lock().search_path.clone();
+    path.retain(|e| e == "public" || !e.eq_ignore_ascii_case("public"));
+    path
+}
+
+/// Under a search path that names no schema (every entry passed over or missing), an unqualified
+/// relation other than a catalog table (the main database's virtual tables) or a CTE resolves to
+/// nothing: 42P01, as PostgreSQL answers (wire-rev-4a1934c89-beb4 MED-4: "Public" alone read
+/// public.v). The catalog's relations are found, pg_catalog being always searched.
+fn refuse_unresolvable_under_an_empty_path(
+    pg_conn: &PgConnectionInner,
+    parse: &turso_pg_parser::pg_query::ParseResult,
+) -> Result<()> {
+    use turso_pg_parser::pg_query::NodeRef;
+    if pg_conn.session_state.lock().search_path.is_empty() {
+        return Ok(());
+    }
+    let names = pg_conn.conn.attached_database_names();
+    let path = written_search_path(pg_conn);
+    if path.iter().any(|e| e == "public" || e == "main" || names.iter().any(|n| n == e)) {
+        return Ok(());
+    }
+    let ctes: Vec<String> = parse
+        .protobuf
+        .nodes()
+        .iter()
+        .filter_map(|(n, ..)| match n {
+            NodeRef::CommonTableExpr(c) => Some(c.ctename.clone()),
+            _ => None,
+        })
+        .collect();
+    let schema = pg_conn.conn.current_schema();
+    for (qualifier, name) in turso_pg_parser::translator::named_relations(parse) {
+        if qualifier.is_some() || ctes.contains(&name) {
+            continue;
+        }
+        let virtual_table = schema.get_table(&name).is_some_and(|t| matches!(t.as_ref(), turso_core::schema::Table::Virtual(_)));
+        if !virtual_table {
+            return Err(LimboError::InvalidArgument(SqlErrorMessage::classified(
+                SqlErrorKind::UndefinedTable,
+                format!("relation \"{name}\" does not exist"),
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// An unqualified CREATE TABLE (or CREATE TABLE AS) is made in the first schema of the search path
+/// that exists, as PostgreSQL's creation namespace is: public is main, an attached schema is named
+/// as written, '$user' and a missing name are passed over; under a path naming none it is 3F000
+/// 'no schema has been selected to create in'. It was always made in public
+/// (wire-rev-4a1934c89-beb4 MED-5). The relation's schema is set in the parse, so every later
+/// reader of it agrees. No path set: main, as before.
+fn create_in_the_path(pg_conn: &PgConnectionInner, parse: &mut turso_pg_parser::pg_query::ParseResult) -> Result<()> {
+    use turso_pg_parser::pg_query::protobuf::node::Node;
+    let [raw] = parse.protobuf.stmts.as_mut_slice() else { return Ok(()) };
+    let rel = match raw.stmt.as_deref_mut().and_then(|s| s.node.as_mut()) {
+        Some(Node::CreateStmt(c)) => c.relation.as_mut(),
+        Some(Node::CreateTableAsStmt(c)) => c.into.as_deref_mut().and_then(|i| i.rel.as_mut()),
+        _ => None,
+    };
+    let Some(rel) = rel.filter(|r| r.schemaname.is_empty() && r.catalogname.is_empty() && r.relpersistence != "t") else {
+        return Ok(());
+    };
+    if pg_conn.session_state.lock().search_path.is_empty() {
+        return Ok(());
+    }
+    let names = pg_conn.conn.attached_database_names();
+    for entry in written_search_path(pg_conn) {
+        if entry == "public" || entry == "main" {
+            return Ok(());
+        }
+        if names.iter().any(|n| *n == entry) {
+            rel.schemaname = entry;
+            return Ok(());
+        }
+    }
+    Err(LimboError::InvalidArgument(SqlErrorMessage::classified(
+        SqlErrorKind::InvalidSchemaName,
+        "no schema has been selected to create in",
+    )))
+}
+
 /// A numeric literal of more than 15 significant digits is refused 0A000 before anything runs,
 /// wherever it stands (a VALUES item, an UPDATE or ON CONFLICT source, a DEFAULT, a comparison, an
 /// expression): the engine reads it as a REAL, which rounds it, and the rounded value would be
@@ -485,7 +574,7 @@ fn refuse_long_decimals(
     match turso_pg_parser::long_decimal_literal(sql, &exempt) {
         Some(literal) => Err(LimboError::ParseError(SqlErrorMessage::classified(
             SqlErrorKind::FeatureNotSupported,
-            format!("numeric literal {literal} is not supported: more than 15 significant digits would be rounded"),
+            format!("numeric literal {literal} is not supported: the engine's float8 would not hold it exactly"),
         ))),
         None => Ok(()),
     }
@@ -900,11 +989,12 @@ impl PgConnection {
     /// holds the name or a read fails.
     fn stored_relation(&self, schema: Option<&str>, name: &str) -> Option<StoredRelation> {
         let databases: Vec<String> = match schema {
-            Some(s) if s.eq_ignore_ascii_case("public") || s == "main" => vec!["main".to_string()],
+            Some(s) if s == "public" || s == "main" => vec!["main".to_string()],
             Some(s) => vec![s.to_string()],
             None => {
-                let path = self.search_path();
-                if path.is_empty() {
+                let set = !self.inner.session_state.lock().search_path.is_empty();
+                let path = written_search_path(&self.inner);
+                if !set {
                     let mut all = vec!["main".to_string()];
                     let mut attached = self.inner.conn.attached_database_names();
                     attached.sort();
@@ -1794,10 +1884,11 @@ fn prepare_statement_parsed(
 
     // One parse serves both the special forms and the translation (it was two), and a Parse
     // message's serves its classification too (C53).
-    let parse_result = match parsed {
+    let mut parse_result = match parsed {
         Some(parsed) => parsed,
         None => turso_pg_parser::parse(sql).map_err(|e| LimboError::ParseError(e.into()))?,
     };
+    create_in_the_path(pg_conn, &mut parse_result)?;
     // One statement per prepare, as PostgreSQL's Parse takes one (42601): the translator reads the
     // first, so `COMMIT; INSERT ...` in one Parse committed and skipped the INSERT, answering
     // success (wire review 14 item 5). The simple protocol splits a query before it prepares.
@@ -1834,6 +1925,7 @@ fn prepare_statement_parsed(
     refuse_alter_column_type_across_families(pg_conn, &parse_result)?;
     refuse_cross_database(pg_conn, sql, &parse_result)?;
     refuse_long_decimals(pg_conn, sql, &parse_result)?;
+    refuse_unresolvable_under_an_empty_path(pg_conn, &parse_result)?;
     if !pg_conn.conn.get_auto_commit() {
         let relations = turso_pg_parser::translator::named_relations(&parse_result);
         if !relations.is_empty() {
@@ -1918,7 +2010,7 @@ fn prepare_statement_parsed(
             // A parameter compared with something no context types is refused (42P18) by the
             // server, which alone reads the types the client declared (wire review 8 item 7,
             // review 11 item 1).
-            let search_path = pg_conn.session_state.lock().search_path.clone();
+            let search_path = written_search_path(pg_conn);
             // Which attached schema holds a name, probed only when the walk resolves an
             // unqualified name through one, once per (schema, name) per statement (wire review 17
             // item 3).
@@ -2009,10 +2101,18 @@ fn prepare_statement_parsed(
     }
 
     let options = {
-        let state = pg_conn.session_state.lock();
-        let path = state.search_path.clone();
+        // A path whose every entry names no schema stays a path, never None, which searches
+        // every schema.
+        // A path naming no schema still finds pg_catalog's and information_schema's relations,
+        // the main database's virtual tables (wire-rev-4a1934c89-beb4 MED-3); a user relation it
+        // would find there was refused 42P01 before (refuse_unresolvable_under_an_empty_path).
+        let set = !pg_conn.session_state.lock().search_path.is_empty();
+        let mut path = written_search_path(pg_conn);
+        if set && path.is_empty() {
+            path.push("main".to_string());
+        }
         PrepareOptions {
-            unqualified_database_search_path: if path.is_empty() { None } else { Some(path) },
+            unqualified_database_search_path: if set { Some(path) } else { None },
         }
     };
     if !performs {
@@ -4598,11 +4698,10 @@ fn same_relation_name(
 /// first entry holding the table wins, and none holding it is 42P01. None with no path set, where
 /// the engine's default order (main, then the attached schemas) applies.
 fn schema_on_search_path(pg_conn: &Arc<PgConnectionInner>, table: &str) -> Result<Option<String>> {
-    let path = pg_conn.session_state.lock().search_path.clone();
-    if path.is_empty() {
+    if pg_conn.session_state.lock().search_path.is_empty() {
         return Ok(None);
     }
-    for entry in &path {
+    for entry in &written_search_path(pg_conn) {
         let database = if entry.eq_ignore_ascii_case("public") {
             "main"
         } else {
@@ -4976,7 +5075,7 @@ fn resident_relation_columns(
     match turso_pg_parser::schema_qualifier(schema) {
         SchemaQualifier::Main => columns_in("main"),
         SchemaQualifier::Unqualified => {
-            let path = pg_conn.session_state.lock().search_path.clone();
+            let path = written_search_path(pg_conn);
             pg_conn
                 .conn
                 .resident_unqualified_table_columns(table, &path)
