@@ -1914,6 +1914,15 @@ pub fn emit_non_from_clause_subquery(
             }
         }
     }
+    if let (SubqueryType::In { cursor_id, .. }, Plan::Select(select)) = (query_type, &plan) {
+        if let [column] = select.result_columns.as_slice() {
+            if let Some((type_def, _)) =
+                super::order_by::expr_value_type(&column.expr, &select.table_references, resolver.schema())
+            {
+                program.in_subquery_types.insert(*cursor_id, type_def.name.clone());
+            }
+        }
+    }
     program.nested(|program| {
         let subquery_id = program.next_subquery_eqp_id();
         match query_type {

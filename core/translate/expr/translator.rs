@@ -269,7 +269,77 @@ pub fn translate_expr(
                         label_skip_row
                     };
 
-                    if *not_in {
+                    // A typed IN compares each element through the type's '=' instead of
+                    // probing the ephemeral index, which compares plainly
+                    // (`in_subquery_type_eq`; engine-rev-types-08caaec44 HIGH 2). An element
+                    // the '=' answers NULL makes the result NULL when nothing matches, as a
+                    // NULL element does.
+                    let typed_eq = if lhs_column_count == 1 {
+                        in_subquery_type_eq(lhs_columns[0], *cursor_id, referenced_tables, resolver, program)
+                    } else {
+                        None
+                    };
+                    if let Some(resolved) = typed_eq {
+                        let null_seen = program.alloc_register();
+                        program.emit_insn(Insn::Integer {
+                            value: 0,
+                            dest: null_seen,
+                        });
+                        let loop_start = program.allocate_label();
+                        let loop_next = program.allocate_label();
+                        let loop_done = program.allocate_label();
+                        let label_found = if *not_in { label_skip_row } else { label_include_row };
+                        program.emit_insn(Insn::Rewind {
+                            cursor_id: *cursor_id,
+                            pc_if_empty: label_on_no_null,
+                        });
+                        program.preassign_label_to_next_insn(loop_start);
+                        let element = program.alloc_register();
+                        program.emit_insn(Insn::Column {
+                            cursor_id: *cursor_id,
+                            column: 0,
+                            dest: element,
+                            default: None,
+                        });
+                        let equal = emit_custom_type_operator_on_regs(
+                            program,
+                            lhs_column_regs_start,
+                            element,
+                            &resolved,
+                            resolver,
+                        )?;
+                        let not_null = program.allocate_label();
+                        program.emit_insn(Insn::NotNull {
+                            reg: equal,
+                            target_pc: not_null,
+                        });
+                        program.emit_insn(Insn::Integer {
+                            value: 1,
+                            dest: null_seen,
+                        });
+                        program.emit_insn(Insn::Goto { target_pc: loop_next });
+                        program.preassign_label_to_next_insn(not_null);
+                        program.emit_insn(Insn::If {
+                            reg: equal,
+                            target_pc: label_found,
+                            jump_if_null: false,
+                        });
+                        program.preassign_label_to_next_insn(loop_next);
+                        program.emit_insn(Insn::Next {
+                            cursor_id: *cursor_id,
+                            pc_if_next: loop_start,
+                            fullscan: false,
+                        });
+                        program.preassign_label_to_next_insn(loop_done);
+                        program.emit_insn(Insn::If {
+                            reg: null_seen,
+                            target_pc: label_null_result,
+                            jump_if_null: false,
+                        });
+                        program.emit_insn(Insn::Goto {
+                            target_pc: label_on_no_null,
+                        });
+                    } else if *not_in {
                         // NOT IN: skip row if value is found
                         program.emit_insn(Insn::Found {
                             cursor_id: *cursor_id,
@@ -410,7 +480,7 @@ pub fn translate_expr(
 
             // Check if either operand has a custom type with a matching operator
             if let Some(resolved) =
-                find_custom_type_operator(e1, e2, op, referenced_tables, resolver, program.id_value_type.as_ref())
+                find_custom_type_operator(e1, e2, op, referenced_tables, resolver, program)
             {
                 let result_reg = emit_custom_type_operator(
                     program,

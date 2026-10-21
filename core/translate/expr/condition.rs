@@ -97,7 +97,7 @@ pub(super) fn translate_in_list(
                 &ast::Operator::Equals,
                 referenced_tables,
                 resolver,
-                program.id_value_type.as_ref(),
+                program,
             )
         };
         if let Some(resolved) = type_eq {
@@ -445,7 +445,7 @@ pub fn translate_condition_expr(
         ast::Expr::Binary(e1, op, e2) => {
             // Check if either operand has a custom type with a matching operator
             if let Some(resolved) =
-                find_custom_type_operator(e1, e2, op, Some(referenced_tables), resolver, program.id_value_type.as_ref())
+                find_custom_type_operator(e1, e2, op, Some(referenced_tables), resolver, program)
             {
                 let result_reg = emit_custom_type_operator(
                     program,

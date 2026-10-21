@@ -351,6 +351,10 @@ pub struct ProgramBuilder {
     /// (`emit_non_from_clause_subquery`), for `Statement::get_column_type_info` (fastest-wire
     /// 76b5a2550: `(SELECT max(b) FROM n)` over numeric is numeric, as PostgreSQL types it).
     pub scalar_subquery_types: std::collections::HashMap<usize, String>,
+    /// The custom type of an IN subquery's one column, by its ephemeral cursor (as
+    /// `scalar_subquery_types` by its result register), so the IN compares through the type's '='
+    /// (engine-rev-types-08caaec44 HIGH 2).
+    pub in_subquery_types: std::collections::HashMap<usize, String>,
     /// Current parsing nesting level
     nested_level: usize,
     init_label: BranchOffset,
@@ -762,6 +766,7 @@ impl ProgramBuilder {
             result_columns: Vec::new(),
             table_references: TableReferences::new(vec![], vec![]),
             scalar_subquery_types: std::collections::HashMap::new(),
+            in_subquery_types: std::collections::HashMap::new(),
             collation: None,
             nested_level: 0,
             // These labels will be filled when `prologue()` is called

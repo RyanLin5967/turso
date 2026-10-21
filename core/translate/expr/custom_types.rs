@@ -228,9 +228,32 @@ fn derived_operand_info(
     expr: &ast::Expr,
     referenced_tables: Option<&TableReferences>,
     resolver: &Resolver,
+    scalars: Option<&std::collections::HashMap<usize, String>>,
 ) -> Option<ExprCustomTypeInfo> {
     if crate::branch::store::fe_mutant("derived_value_compares_plainly") {
         return None;
+    }
+    // A one-column scalar subquery is of the type its column carries
+    // (`ProgramBuilder::scalar_subquery_types`; engine-rev-types-08caaec44 HIGH 2:
+    // `b = (SELECT max(c) FROM m)` compared plainly). Mutant `subquery_compares_plainly` (test
+    // builds only): untyped, as before.
+    if let (
+        Some(scalars),
+        ast::Expr::SubqueryResult {
+            query_type: SubqueryType::RowValue { result_reg_start, num_regs: 1 },
+            ..
+        },
+    ) = (scalars, expr)
+    {
+        if crate::branch::store::fe_mutant("subquery_compares_plainly") {
+            return None;
+        }
+        let type_def = resolver.schema().get_type_def_unchecked(scalars.get(result_reg_start)?)?.clone();
+        return Some(ExprCustomTypeInfo {
+            type_name: type_def.name.to_lowercase(),
+            column: None,
+            type_def,
+        });
     }
     // By the values it yields (`expr_value_type`): a CAST that yields its type's ENCODE (numeric's
     // blob) is not an operand of the type's operators, which refuse a blob (review of this lane's
@@ -336,9 +359,11 @@ pub(super) fn find_custom_type_operator(
     op: &ast::Operator,
     referenced_tables: Option<&TableReferences>,
     resolver: &Resolver,
-    value_type: Option<&Arc<TypeDef>>,
+    program: &ProgramBuilder,
 ) -> Option<ResolvedOperator> {
     let op_str = operator_to_str(op)?;
+    let value_type = program.id_value_type.as_ref();
+    let scalars = Some(&program.scalar_subquery_types);
     // `value` in a domain CHECK translated outside any table (CAST to the domain) is a value of
     // that domain (`ProgramBuilder::id_value_type`).
     let value_info = |e: &ast::Expr| {
@@ -440,8 +465,8 @@ pub(super) fn find_custom_type_operator(
         // answers 14.00). Mutant `derived_value_computes_plainly` (test builds only): SQLite's
         // arithmetic, as before.
         if lhs_info.is_none() && rhs_info.is_none() && !crate::branch::store::fe_mutant("derived_value_computes_plainly") {
-            let lhs_derived = derived_operand_info(e1, referenced_tables, resolver).map(with_operators);
-            let rhs_derived = derived_operand_info(e2, referenced_tables, resolver).map(with_operators);
+            let lhs_derived = derived_operand_info(e1, referenced_tables, resolver, scalars).map(with_operators);
+            let rhs_derived = derived_operand_info(e2, referenced_tables, resolver, scalars).map(with_operators);
             if let Some(f) = defines(&lhs_derived).or_else(|| defines(&rhs_derived)) {
                 return Some(resolved(f));
             }
@@ -462,8 +487,8 @@ pub(super) fn find_custom_type_operator(
     );
     let (lhs_info, rhs_info) = if comparison && lhs_info.is_none() && rhs_info.is_none() {
         (
-            derived_operand_info(e1, referenced_tables, resolver).map(with_operators),
-            derived_operand_info(e2, referenced_tables, resolver).map(with_operators),
+            derived_operand_info(e1, referenced_tables, resolver, scalars).map(with_operators),
+            derived_operand_info(e2, referenced_tables, resolver, scalars).map(with_operators),
         )
     } else {
         (lhs_info, rhs_info)
@@ -493,7 +518,7 @@ pub(super) fn find_custom_type_operator(
     let same_type_value = |e: &ast::Expr, info: &ExprCustomTypeInfo| {
         comparison
             && !crate::branch::store::fe_mutant("column_against_value_plain")
-            && derived_operand_info(e, referenced_tables, resolver)
+            && derived_operand_info(e, referenced_tables, resolver, scalars)
                 .map(with_operators)
                 .is_some_and(|d| d.type_name == info.type_name)
     };
@@ -527,6 +552,46 @@ pub(super) fn find_custom_type_operator(
     }
 
     None
+}
+
+/// The '=' an IN subquery's probe compares `lhs` with its elements through: the '=' function of
+/// the type `lhs` carries (a column of a custom type, or a value of one, `derived_operand_info`),
+/// or of the type the subquery's column carries (`ProgramBuilder::in_subquery_types`), the two
+/// agreeing when both are typed; None when neither is, or the type's '=' is naked. The ephemeral
+/// index's probe compares a key plainly, so `c IN (SELECT b FROM n)` over numeric(8, 3) against
+/// numeric(8, 2) found nothing (engine-rev-types-08caaec44 HIGH 2). Mutant
+/// `subquery_compares_plainly` (test builds only): None, as before.
+pub(super) fn in_subquery_type_eq(
+    lhs: &ast::Expr,
+    cursor_id: usize,
+    referenced_tables: Option<&TableReferences>,
+    resolver: &Resolver,
+    program: &ProgramBuilder,
+) -> Option<ResolvedOperator> {
+    if crate::branch::store::fe_mutant("subquery_compares_plainly") {
+        return None;
+    }
+    let schema = resolver.schema();
+    let lhs_type = expr_custom_type_info(lhs, referenced_tables, resolver)
+        .or_else(|| derived_operand_info(lhs, referenced_tables, resolver, Some(&program.scalar_subquery_types)))
+        .map(|info| schema.operator_type_of(&info.type_def));
+    let sub_type = program
+        .in_subquery_types
+        .get(&cursor_id)
+        .and_then(|name| schema.get_type_def_unchecked(name))
+        .map(|td| schema.operator_type_of(td));
+    let type_def = match (lhs_type, sub_type) {
+        (Some(a), Some(b)) if a.name.eq_ignore_ascii_case(&b.name) => a,
+        (Some(a), None) | (None, Some(a)) => a,
+        _ => return None,
+    };
+    let func_name = type_eq_function(&type_def)?.to_string();
+    Some(ResolvedOperator {
+        func_name,
+        swap_args: false,
+        negate: false,
+        encode_info: None,
+    })
 }
 
 /// The function a custom type's '=' calls: `find_custom_type_operator`'s direct match, the type's
@@ -592,7 +657,7 @@ pub(crate) fn key_takes_type_operator(
         None => {
             operand_compatible(key, type_def.value_input_type(), resolver)
                 || (!crate::branch::store::fe_mutant("column_against_value_plain")
-                    && derived_operand_info(key, referenced_tables, resolver)
+                    && derived_operand_info(key, referenced_tables, resolver, None)
                         .is_some_and(|d| seek_type_of(resolver.schema(), &d.type_def).name.eq_ignore_ascii_case(&type_def.name)))
         }
     }
