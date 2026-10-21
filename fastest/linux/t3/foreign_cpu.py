@@ -442,7 +442,7 @@ def self_test():
         w0 = time.monotonic()
         while time.monotonic() - w0 < 30 and s.poll() is None and not (os.path.exists(out) and os.path.getsize(out) > 0):
             time.sleep(0.02)
-        procs, stopped = [], []
+        procs, stopped, to_stop = [], [], []
         t0 = time.monotonic()
         pending = sorted(burners, key=lambda b: b[1])
         while time.monotonic() - t0 < secs:
@@ -482,9 +482,12 @@ def self_test():
                             f"sys.exit(subprocess.call([sys.executable, '-c', {code!r}], env={{'PATH': '/usr/bin:/bin'}}))\n")
                 procs.append(subprocess.Popen([sys.executable, "-c", code], env=env))
                 launched.setdefault(label, []).append((b, procs[-1].pid))
-                if len(b) > 4 and b[4] == "stopped":  # a burner the host "starves": SIGSTOPped for its whole burn
-                    os.kill(procs[-1].pid, signal.SIGSTOP)
-                    stopped.append(procs[-1].pid)
+                if len(b) > 4 and b[4] == "stopped":  # a burner the host "starves": SIGSTOPped 0.5 s into its
+                    to_stop.append((procs[-1].pid, el + 0.5))  # burn (it reads its clock once started), then held
+            for pid_, at_ in [x for x in to_stop if x[1] <= el]:
+                os.kill(pid_, signal.SIGSTOP)
+                to_stop.remove((pid_, at_))
+                stopped.append(pid_)
             time.sleep(0.05)
         for pid_ in stopped:
             os.kill(pid_, signal.SIGCONT)
