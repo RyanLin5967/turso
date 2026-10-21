@@ -16817,3 +16817,69 @@ fn a_failed_shutdown_wal_sync_fail_stops_a_store_with_an_undrained_release() {
         );
     }
 }
+
+/// fe-mutkill (survivor of the f4683e89d lib sweep): a trunk commit's WAL sync that fails after the
+/// commit yielded on it aborts the statement without coming back to the commit, so the commit
+/// gate's close is where the noted failure is acted on (engine review 9 #10, pager.rs
+/// `close_trunk_gate`). Its test, `every_trunk_wal_sync_failure_site_fail_stops_on_its_own`, runs
+/// on Apple only: off Apple the commit's barrier drains every branch record before the WAL sync,
+/// so nothing is at risk when it fails. Here a branch record is written while the sync is in the
+/// air: a D0 store (records written, never drained), the commit's WAL sync returned unfinished and
+/// failed at the IO's next step (FailWalSyncIo mode 3); while the commit waits on it another
+/// connection forks (premise: undrained); the IO steps, the statement fails, and a fork from a fresh
+/// connection is refused. Both stores. Mutant `wal_fail_stop_not_at_close`.
+#[test]
+fn a_yielded_commit_sync_failure_fail_stops_at_the_gates_close() {
+    use std::sync::atomic::Ordering as O;
+    let _s = serial();
+    for catalog in [false, true] {
+        let what = format!("catalog={catalog}");
+        let dir = tempfile::TempDir::new().unwrap();
+        let (db, armed) = open_failing_wal(&dir.path().join("gate-close.db"), opts(catalog, SyncClass::Off));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        trunk.execute("PRAGMA synchronous = FULL").unwrap();
+        trunk.execute("PRAGMA fullfsync = ON").unwrap();
+        trunk.execute("PRAGMA data_sync_retry = 1").unwrap();
+        let _b = trunk.fork_branch().unwrap().into_id();
+        armed.store(3, O::Release);
+        let mut stmt = trunk.prepare("UPDATE t SET v = 'yielded' WHERE id = 7").unwrap();
+        loop {
+            match stmt.step() {
+                Ok(crate::StepResult::IO) if armed.load(O::Acquire) == 0 => break,
+                Ok(crate::StepResult::IO | crate::StepResult::Yield) => db.io.step().unwrap(),
+                other => panic!("{what}: premise: the commit waits on its WAL sync, not {other:?}"),
+            }
+        }
+        // A branch record written while the commit's sync is in the air, on another thread so a
+        // wait on the commit cannot hang the test.
+        let forked = {
+            let db = db.clone();
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(db.connect().and_then(|c| c.fork_branch().map(|x| x.into_id())));
+            });
+            rx.recv_timeout(std::time::Duration::from_secs(10))
+        };
+        assert!(
+            matches!(forked, Ok(Ok(_))),
+            "{what}: premise: another connection forked while the commit's sync was in the air: {forked:?}"
+        );
+        assert!(
+            drained(&db) < db.branches.durable_for_test(SyncClass::Off),
+            "{what}: premise: that fork is written and not drained"
+        );
+        let ended = loop {
+            match stmt.step() {
+                Ok(crate::StepResult::IO | crate::StepResult::Yield) => db.io.step().unwrap(),
+                other => break other,
+            }
+        };
+        assert!(ended.is_err(), "{what}: premise: the failed WAL sync failed the commit: {ended:?}");
+        drop(stmt);
+        assert_fail_stopped(
+            db.connect().unwrap().fork_branch().map(|x| x.into_id()),
+            &format!("{what}: the next fork after a commit's WAL sync failed after it yielded"),
+        );
+    }
+}
