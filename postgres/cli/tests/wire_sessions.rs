@@ -13315,7 +13315,6 @@ replays_postgresql!(
     "pg18-infcast.out",
     [
         (2, "PGDIV-NAN ours-only [ours-only]: 'NaN'::float8 refused 0A000 (engine holds no NaN); PG answers t, t"),
-        (3, "PGDIV-PARSE-PREFIX error-text [wire]: 22P02 both; ours prefixes 'Parse error: '"),
     ]
 );
 replays_postgresql!(
