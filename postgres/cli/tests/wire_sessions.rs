@@ -16436,6 +16436,66 @@ fn a_decimal_past_15_digits_is_refused_on_every_path() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// wire-rev-7128c6f73 L1 and L9 (its PG 18.6 probe4 #93-#100): numeric_in refuses an exponent at or past INT_MAX/2,
+/// 22003 'value overflows numeric format', and reads underscores between digits and a 0x/0o/0b integer (PG 16+); a bound
+/// '1e-2147483648' was stored 0.00, and '1_000' and '0x10' were 22P02.
+#[test]
+fn a_bound_numeric_is_read_as_numeric_in_reads_it() {
+    let dir = Scratch::new("bind-numeric-input");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE nb(id int, n numeric(6,2))").ok("create");
+    let mut wrong = Vec::new();
+    for value in ["1e-2147483648", "1e2147483647"] {
+        let (types, error) = a.bind_round("INSERT INTO nb (id, n) VALUES (1, $1)", &[], &[Some(value.as_bytes())], &[]);
+        if !error.as_ref().is_some_and(|e| e.code == "22003" && e.message == "value overflows numeric format") {
+            wrong.push(format!("'{value}': messages {:?} error {error:?}, PostgreSQL 22003 value overflows numeric format", String::from_utf8_lossy(&types)));
+        }
+    }
+    for (id, value) in [(2, "1_000"), (3, "0x10")] {
+        let sql = format!("INSERT INTO nb (id, n) VALUES ({id}, $1)");
+        let (types, error) = a.bind_round(&sql, &[], &[Some(value.as_bytes())], &[]);
+        if error.is_some() {
+            wrong.push(format!("'{value}': messages {:?} error {error:?}, PostgreSQL INSERT 0 1", String::from_utf8_lossy(&types)));
+        }
+    }
+    let r = a.q("SELECT id, n FROM nb ORDER BY id");
+    let want = vec![vec![Some("2".to_string()), Some("1000.00".to_string())], vec![Some("3".to_string()), Some("16.00".to_string())]];
+    if r.rows != want {
+        wrong.push(format!("nb holds {:?}, PostgreSQL {want:?}", r.rows));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// wire-rev-7128c6f73 L2 and L10 (its PG 18.6 probe4 #130-#134; probe7 #28): an operator between two unknowns (string
+/// literals or NULL) is 42725 wherever it stands, in WHERE, inside a function and in VALUES as in the target list; and a
+/// NULL beside an int2 takes int2, so 1::int2 + NULL is typed 21 (ours 701).
+#[test]
+fn an_operator_between_unknowns_is_42725_wherever_it_stands() {
+    let dir = Scratch::new("unknown-operators");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let mut wrong = Vec::new();
+    for (sql, op) in [
+        ("SELECT '1' + NULL", "+"),
+        ("SELECT NULL + NULL", "+"),
+        ("SELECT 1 WHERE '1' + '2' = 3", "+"),
+        ("SELECT abs('1' - '2')", "-"),
+        ("VALUES ('1' + '2')", "+"),
+    ] {
+        let r = a.q(sql);
+        let message = format!("operator is not unique: unknown {op} unknown");
+        if !r.error.as_ref().is_some_and(|e| e.code == "42725" && e.message.ends_with(&message)) {
+            wrong.push(format!("{sql}: rows {:?} error {:?}, PostgreSQL 42725 {message}", r.rows, r.error));
+        }
+    }
+    let r = a.q("SELECT 1::int2 + NULL");
+    if r.error.is_some() || r.oids != Some(vec![21]) {
+        wrong.push(format!("1::int2 + NULL: oids {:?} error {:?}, PostgreSQL [21]", r.oids, r.error));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// wire-rev-351702a43 LOW-8 and wire-rev-7128c6f73 L5 (probe3 #44, #48; probe4 #167, #168): a quoted "MAX" is not max
 /// (PG's names are case-sensitive once quoted) and public.max is no function, so PG refuses both 42883 and names them as
 /// written; the walk folded "MAX" to max, and public.max answered a row (null, typed 25).
