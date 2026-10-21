@@ -48,6 +48,14 @@ def registered_runs(source):
     return int(found[0])
 
 
+def parse_reading(line):
+    """One stdout line's AD-T5 READING fields, or None."""
+    m = READING.match(line)
+    if not m:
+        return None
+    return dict(p.split("=", 1) for p in m.group(1).split() if "=" in p)
+
+
 def self_test():
     """The parse fired both ways: a planted RUNS = 7 reads 7; no declaration, or two, is refused."""
     import tempfile
@@ -66,6 +74,14 @@ def self_test():
                 got = "refused"
             if got != want:
                 sys.exit(f"SELF-TEST FAILED: {text!r} read {got!r}, want {want!r}")
+    # A test's first reading shares its line with the harness's "test NAME ... " under
+    # --nocapture (rev2bd-l24fix-ic10's raw: "test ad_t5_epsilon_arm ... AD-T5 READING arm=eps
+    # run=0 ..."); it is read like any other.
+    for line in ("AD-T5 READING arm=live run=3 allocs=0",
+                 "test ad_t5_live_arm_and_control ... AD-T5 READING arm=live run=3 allocs=0"):
+        kv = parse_reading(line)
+        if not kv or kv.get("arm") != "live" or kv.get("run") != "3":
+            sys.exit(f"SELF-TEST FAILED: {line!r} read {kv!r}")
     print(f"self-test ok; {SOURCE} declares RUNS = {registered_runs(SOURCE)}")
 
 
@@ -174,10 +190,9 @@ def run(binary, mutant, outdir, label):
         f.write(proc.stderr)
     readings = {}
     for line in proc.stdout.splitlines():
-        m = READING.match(line)
-        if not m:
+        kv = parse_reading(line)
+        if kv is None:
             continue
-        kv = dict(p.split("=", 1) for p in m.group(1).split() if "=" in p)
         if "arm" in kv and "run" in kv:
             readings[(kv["arm"], int(kv["run"]))] = kv
     counts = {}
