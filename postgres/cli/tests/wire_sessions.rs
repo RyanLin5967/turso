@@ -17210,6 +17210,42 @@ fn an_integer_expression_cast_to_oid_is_unsigned() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// numfuzz (its first shard at 1f632d0b7, seed 17; recorded on iccad2 PG 18.6, numeric_text_past_float8_is_judged_as_a_
+/// literal_is.out): a numeric written as text and cast or typed numeric ('...'::numeric, NUMERIC '...', CAST('...' AS
+/// numeric), '...'::decimal(p,s)) of more than 15 significant digits is judged as the same digits written as a
+/// literal: the engine's float8 would round it, so it is refused 0A000 or answered exactly, never rounded.
+/// '6234213084550261446.181833849240796'::numeric + 0 answered 6.234213084550262e+18.
+#[test]
+fn numeric_text_past_float8_is_judged_as_a_literal_is() {
+    let dir = Scratch::new("numeric-text");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let mut wrong = Vec::new();
+    for (sql, value) in [
+        ("SELECT '6234213084550261446.181833849240796'::numeric + 0 AS v", "6234213084550261446.181833849240796"),
+        ("SELECT NUMERIC '3.14159265358979323846' AS v", "3.14159265358979323846"),
+        ("SELECT CAST('12345678901234567890.123456789' AS numeric) AS v", "12345678901234567890.123456789"),
+        ("SELECT '12345678901234567890.123456789'::decimal(40,9) AS v", "12345678901234567890.123456789"),
+        ("SELECT '1.5'::numeric + 0 AS v", "1.5"),
+    ] {
+        let r = a.q(sql);
+        let exact = r.error.is_none() && r.rows == vec![vec![Some(value.to_string())]];
+        let refused = r.error.as_ref().is_some_and(|e| e.code == "0A000");
+        if !(exact || refused) {
+            wrong.push(format!("{sql}: PG {value}; got {:?} {:?} {:?}", r.oids, r.rows, r.error));
+        }
+    }
+    for value in ["6234213084550261446.181833849240796", "1.5"] {
+        let r = a.x_undeclared("SELECT $1::numeric + 0 AS v", &[value]);
+        let exact = r.error.is_none() && r.rows == vec![vec![Some(value.to_string())]];
+        let refused = r.error.as_ref().is_some_and(|e| e.code == "0A000");
+        if !(exact || refused) {
+            wrong.push(format!("$1::numeric + 0 with {value}: PG {value}; got {:?} {:?} {:?}", r.oids, r.rows, r.error));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// wire-rev-351702a43 LOW-6 (its PG 18.6 probe3 #161): a CASE is typed by its results (an int4 constant and an int4
 /// function: 23); the walk never typed a CASE column, and the engine announced it text (25).
 #[test]
