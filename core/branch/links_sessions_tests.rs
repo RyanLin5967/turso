@@ -1583,6 +1583,12 @@ fn ls_fill_live_child() {
     let empty = super::store::LINKS_FILL_EMPTY_SPAWNS.load(Ordering::Acquire) - e0;
     let batches = super::store::LINKS_FILL_HELD_BATCHES.load(Ordering::Acquire) - b0;
     let per_create = grown / grown_creates.max(1);
+    println!(
+        "LS-LIVE-DEFER by_batches={} by_log={} b_sum={}",
+        super::store::DEFER_RELEASES[0].load(Ordering::Acquire),
+        super::store::DEFER_RELEASES[1].load(Ordering::Acquire),
+        super::store::DEFER_B_SUM.load(Ordering::Acquire)
+    );
     println!("LS-LIVE creates={creates} cuts={cuts} starts={starts} empty={empty} batches={batches} prefilled={} per_create={per_create}", u64::from(prefilled));
 }
 
@@ -1606,6 +1612,9 @@ fn under_sustained_creates_the_fill_completes() {
         assert_eq!(r.len(), 1, "premise: the child reported:\n{text}");
         let (creates, cuts, starts, empty, batches, prefilled, per_create) = (r[0][0], r[0][1], r[0][2], r[0][3], r[0][4], r[0][5], r[0][6]);
         let k = (2 * (4u64 << 10)) / per_create.max(1);
+        for l in text.lines().filter(|l| l.contains("LS-LIVE-DEFER ")) {
+            println!("{l}");
+        }
         println!("LS live: {rows} rows: creates {creates} cuts {cuts} starts {starts} empty spawns {empty} batches {batches} prefilled {prefilled}; {per_create} B per create, K = {k}");
         assert!(cuts >= 2, "{rows} rows: premise: the log was cut {cuts} time(s) under {creates} creates");
         assert!(starts >= 2, "{rows} rows: premise: the fill was started {starts} time(s)");

@@ -4125,6 +4125,12 @@ pub(crate) static LINKS_FILL_PAUSE_MS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static LINKS_FILL_COLUMN_TXNS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 #[cfg(test)]
 pub(crate) static LINKS_FILL_COLUMN_ERROR: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+/// Test builds (the bounded deferral, observing): deferrals ended by B batches (0) and by one threshold of log
+/// (1), and the sum of their B.
+#[cfg(test)]
+pub(crate) static DEFER_RELEASES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+#[cfg(test)]
+pub(crate) static DEFER_B_SUM: AtomicU64 = AtomicU64::new(0);
 /// Test builds (the lead's fill-LIVENESS ruling): fill spawns that ended stopped or superseded having committed
 /// no batch.
 #[cfg(test)]
@@ -6551,6 +6557,12 @@ impl BranchStore {
                 let (from, at_log, b) = *cat.links_defer.get_or_insert((done, log_len, forks.div_ceil(64) + 1));
                 if done.saturating_sub(from) < b && log_len < at_log + threshold {
                     return true;
+                }
+                // Test builds (observing): which bound ended the deferral (0: B batches, 1: the log), and the B.
+                #[cfg(test)]
+                {
+                    DEFER_RELEASES[usize::from(done.saturating_sub(from) < b)].fetch_add(1, Ordering::AcqRel);
+                    DEFER_B_SUM.fetch_add(b, Ordering::AcqRel);
                 }
             }
             cat.links_defer = None;
