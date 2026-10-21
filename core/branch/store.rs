@@ -1596,6 +1596,15 @@ impl AsyncCtl {
 // that sets the link args sets tokio_unstable too, so its absence beside the flag refuses the build.
 // Pass the flag through `cargo --config 'target.<host>.rustflags=["--cfg=fe_ad_t5_firecheck"]'`.
 // BLIND SPOT: a RUSTFLAGS that repeats `--cfg=tokio_unstable` but drops the link args passes.
+// The flag lifts HIGH F's refusal only beside the `fe-mutants` feature (engine-rev-async-20200c00a
+// L2: on the flag alone a build accepted async creates whatever its features, so the lift was not
+// bound to the one binary amendment 2 lets carry it). Alone, it refuses the build.
+#[cfg(all(fe_ad_t5_firecheck, not(feature = "fe-mutants")))]
+compile_error!(
+    "fe_ad_t5_firecheck is set without the fe-mutants feature: it lifts HIGH F's refusal of async \
+     creates only in AD-T5's fire-check binary, which carries both"
+);
+
 #[cfg(all(fe_ad_t5_firecheck, not(tokio_unstable)))]
 compile_error!(
     "fe_ad_t5_firecheck is set but tokio_unstable is not: the flag replaced .cargo/config.toml's \
@@ -7964,12 +7973,15 @@ impl StoreCore {
         // mechanism; no build a user links can. AD-T5's fire-check binary (PREREG-v1 amendment 2:
         // the one binary that may carry `fe-mutants`, whose readings fill no slot) runs it too
         // (engine-2bdcd32c6 MED 4: refused, every async_s0 arm was VOID at its warm-up). It is
-        // lifted by the compiler flag `--cfg fe_ad_t5_firecheck` (RUSTFLAGS), which only that
-        // binary's build sets (async_s0_firecheck.py), never by a cargo feature: a feature is
+        // lifted by the compiler flag `--cfg fe_ad_t5_firecheck` together with `fe-mutants` (the
+        // flag alone does not compile, engine-rev-async-20200c00a L2), which only that binary's build
+        // sets (async_s0_firecheck.py, through `cargo --config`), never by a cargo feature alone: a feature is
         // turned on by `--all-features`, a build every reader runs (lead ruling, artie DECISIONS
         // 66b4671687). Mutant `fire_check_build_refuses_async` (test and fe-mutants builds):
         // refused there too, as at da850ed1c.
-        if cfg!(not(test)) && (cfg!(not(fe_ad_t5_firecheck)) || fe_mutant("fire_check_build_refuses_async")) {
+        if cfg!(not(test))
+            && (cfg!(not(all(fe_ad_t5_firecheck, feature = "fe-mutants"))) || fe_mutant("fire_check_build_refuses_async"))
+        {
             return Some("async creates are refused until the id floor lands (ASYNC-DESIGN §9): a lost id could be issued again");
         }
         let device_drained = match self.class {
@@ -11659,23 +11671,38 @@ impl StoreCore {
                 }
             }
         }
-        let mut inner = self.inner.lock();
-        let now = inner.lease.now_ms();
-        // With no lease outstanding the clock's value constrains nothing, so a close writes nothing.
-        // Compared with what is DURABLE: a stamp only queued dies here with the journal (N3).
-        if inner.leases_exist() && now > inner.lease.durable_ms {
-            inner.lease.queued(now);
-            if let Err(e) = self.log(&mut inner, Record::Clock { now_ms: now }) {
-                tracing::debug!("branch lease clock not stamped at close: {e}");
+        // The rest of the close's I/O, the lease clock's stamp (a flight of its own) and the
+        // confirm word, under catch_unwind as the async flight above is (engine-rev-async-20200c00a
+        // L3: a close runs while its caller's thread may be unwinding, where a second panic
+        // aborts). A panic fail-stops the store. Mutant `close_tail_unguarded` (test builds only):
+        // not caught, as at 57f616b6a.
+        let tail = || {
+            let mut inner = self.inner.lock();
+            let now = inner.lease.now_ms();
+            // With no lease outstanding the clock's value constrains nothing, so a close writes
+            // nothing. Compared with what is DURABLE: a stamp only queued dies here with the
+            // journal (N3).
+            if inner.leases_exist() && now > inner.lease.durable_ms {
+                inner.lease.queued(now);
+                if let Err(e) = self.log(&mut inner, Record::Clock { now_ms: now }) {
+                    tracing::debug!("branch lease clock not stamped at close: {e}");
+                }
             }
+            // After the stamp, which is a flight of its own.
+            drop(inner);
+            #[cfg(test)]
+            if CLOSE_TAIL_PANICS.swap(false, Ordering::AcqRel) {
+                panic!("failpoint: the close's tail panicked");
+            }
+            self.close_confirms();
+        };
+        if fe_mutant("close_tail_unguarded") {
+            tail();
+        } else if std::panic::catch_unwind(std::panic::AssertUnwindSafe(tail)).is_err() {
+            tracing::warn!("branch store close: its lease stamp or confirm word panicked; the store fail-stops");
+            let mut g = self.group.lock();
+            self.group.fail(&mut g);
         }
-        // After the stamp, which is a flight of its own.
-        drop(inner);
-        #[cfg(test)]
-        if CLOSE_TAIL_PANICS.swap(false, Ordering::AcqRel) {
-            panic!("failpoint: the close's tail panicked");
-        }
-        self.close_confirms();
     }
 }
 
