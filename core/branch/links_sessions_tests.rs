@@ -212,21 +212,28 @@ fn ls_hard_whole_child() {
         k += 1;
     }
     let past = db.branches.past_hard_limit_for_test();
-    // Operations past the hard limit, then the checkpoints they started are waited for.
+    // Operations past the hard limit (each a create; the waits on an install they made, this thread's
+    // back-pressure waits), then the checkpoints they started are waited for.
+    let waits0 = super::store::thread_waits();
+    let peak = log_bytes(&path);
     for _ in 0..200 {
         let _ = trunk.fork_branch().unwrap().into_id();
     }
+    let waits = super::store::thread_waits() - waits0;
     db.branch_checkpoint_wait();
     let whole = super::catalog::WHOLE_UPGRADE_BATCHES.load(Ordering::Acquire) - w0;
     super::store::LINKS_FILL_PAUSE_MS.store(0, Ordering::Release);
-    println!("LS-WHOLE rows={n} past={} creates={k} whole_batches={whole} log={}", u64::from(past), log_bytes(&path));
+    println!("LS-WHOLE rows={n} past={} creates={k} whole_batches={whole} waits={waits} meta={} peak={peak} log={}", u64::from(past), meta_version(&path), log_bytes(&path));
 }
 
 /// h1gap-rev-c HIGH-2: past the hard log limit, with a slow fill, no checkpoint links the whole catalog
 /// inside its capture (an O(N) stall of every create: under the store mutex in the sharp mode, and
 /// behind the install every operation waits for in the fuzzy one; the reviewer measured 1.2-4.7 s at
-/// N=1000-4000). Counted, not timed: the batches a whole-catalog upgrade ran (`WHOLE_UPGRADE_BATCHES`)
-/// are at most one, at 1,000 and at 4,000 rows. Premise: the log passed the hard limit.
+/// N=1000-4000). Counted, not timed, at 1,000 and at 4,000 rows (FLAGGED stricter, lead ruling 62c11ec63d,
+/// before its fix): the batches a whole-catalog upgrade ran (`WHOLE_UPGRADE_BATCHES`) are 0, and the 200
+/// creates past the hard limit waited on no install (`thread_waits`). And the log was cut while the fill
+/// was incomplete: the store stays at its version (19) and the log ends under its peak (the non-flip cut).
+/// Premise: the log passed the hard limit.
 #[test]
 fn past_the_hard_log_limit_no_checkpoint_links_the_whole_catalog() {
     if in_child() {
@@ -236,9 +243,12 @@ fn past_the_hard_log_limit_no_checkpoint_links_the_whole_catalog() {
         let text = child("ls_hard_whole_child", &[("FE_LS_ROWS", rows)]);
         let r = readings(&text, "LS-WHOLE ");
         assert_eq!(r.len(), 1, "premise: the child reported:\n{text}");
-        let (n, past, whole) = (r[0][0], r[0][1], r[0][3]);
+        let (n, past, whole, waits, meta, peak, log) = (r[0][0], r[0][1], r[0][3], r[0][4], r[0][5], r[0][6], r[0][7]);
         assert_eq!(past, 1, "{n} rows: premise: the log never passed the hard limit");
-        assert!(whole <= 1, "{n} rows: past the hard limit a checkpoint linked the whole catalog ({whole} batches of {})", super::catalog::UPGRADE_BATCH);
+        assert_eq!(whole, 0, "{n} rows: past the hard limit a checkpoint linked the whole catalog ({whole} batches of {})", super::catalog::UPGRADE_BATCH);
+        assert_eq!(waits, 0, "{n} rows: creates past the hard limit waited on an install {waits} times");
+        assert_eq!(meta, 19, "{n} rows: the store flipped before its fill was complete (meta {meta})");
+        assert!(log < peak, "{n} rows: the log was not cut past the hard limit ({log} B at the end, {peak} B at the limit)");
     }
 }
 
