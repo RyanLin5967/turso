@@ -4209,6 +4209,12 @@ impl PostgreSQLTranslator {
             })
             .ok_or_else(|| ParseError::ParseError("Missing operator name".to_string().into()))?;
 
+        if matches!(op_name, "+" | "-" | "*" | "/" | "%")
+            && [a_expr.lexpr.as_deref(), a_expr.rexpr.as_deref()].into_iter().flatten().any(is_numeric_typmod_cast)
+        {
+            return Err(refuse_numeric_cast_arithmetic(op_name));
+        }
+
         // Handle unary operators (no left expression)
         if a_expr.lexpr.is_none() {
             let rhs = a_expr
@@ -4651,6 +4657,12 @@ impl PostgreSQLTranslator {
             })
             .next_back()
             .ok_or_else(|| ParseError::ParseError("Missing function name".to_string().into()))?;
+
+        if matches!(func_name.to_ascii_lowercase().as_str(), "sum" | "avg")
+            && func_call.args.iter().any(is_numeric_typmod_cast)
+        {
+            return Err(refuse_numeric_cast_arithmetic(&func_name));
+        }
 
         // Translate FILTER clause
         let filter_clause = if let Some(ref filter) = func_call.agg_filter {
@@ -6076,19 +6088,24 @@ fn float_literal(text: &str, type_name: &str) -> Result<ast::Expr, ParseError> {
 /// is one when it does not fit int8. Text that is no number is not one (its reader refuses it).
 pub fn decimal_past_float8(text: &str) -> bool {
     let t = text.trim();
+    let negative = t.starts_with('-');
     let t = t.strip_prefix(['-', '+']).unwrap_or(t);
     let lower = t.to_ascii_lowercase();
     let body: String = lower.chars().filter(|c| *c != '_').collect();
+    // An integer is exact when its value, sign included, fits int8 (-0x8000000000000000 does).
+    let fits_int8 = |magnitude: Option<u128>| {
+        magnitude.is_some_and(|m| if negative { m <= 1u128 << 63 } else { m < 1u128 << 63 })
+    };
     if let Some(digits) = body.strip_prefix("0x").or_else(|| body.strip_prefix("0o")).or_else(|| body.strip_prefix("0b")) {
         let radix = match &body[..2] {
             "0x" => 16,
             "0o" => 8,
             _ => 2,
         };
-        return i64::from_str_radix(digits, radix).is_err();
+        return !fits_int8(u128::from_str_radix(digits, radix).ok());
     }
     if !body.is_empty() && body.bytes().all(|b| b.is_ascii_digit()) {
-        return body.parse::<i64>().is_err();
+        return !fits_int8(body.parse::<u128>().ok());
     }
     let mantissa = body.split(['e']).next().unwrap_or("");
     if mantissa.is_empty() || !mantissa.bytes().all(|b| b.is_ascii_digit() || b == b'.') {
@@ -6348,6 +6365,24 @@ pub fn numeric_cast_typmods(type_name: &pg_query::protobuf::TypeName) -> Result<
         [p] => Some((*p, 0)),
         _ => None,
     })
+}
+
+/// Whether `node` is a cast to NUMERIC(p, s) or NUMERIC(p): the engine's REAL, exact for its own
+/// value (p <= 15) but not under arithmetic.
+fn is_numeric_typmod_cast(node: &pg_query::protobuf::Node) -> bool {
+    matches!(node.node.as_ref(), Some(pg_query::protobuf::node::Node::TypeCast(c))
+        if c.type_name.as_ref().is_some_and(|t| numeric_cast_size(t).is_some()))
+}
+
+/// Arithmetic or sum/avg over a CAST to NUMERIC(p, s) is refused 0A000: the cast is the engine's
+/// REAL, so 0.10 + 0.20 answered 0.30000000000000004 and = 0.3 answered f, where PG computes in
+/// numeric (wire-rev-351702a43 MED-2). BLIND SPOT: a cast reached through a CTE's, a view's or a
+/// derived table's column is not seen here (PGDIV-NUMERIC-CAST-FLOAT8).
+fn refuse_numeric_cast_arithmetic(what: &str) -> ParseError {
+    ParseError::ParseError(SqlErrorMessage::classified(
+        SqlErrorKind::FeatureNotSupported,
+        format!("{what} over a cast to numeric(p,s) is not supported: it would be computed inexactly as a float"),
+    ))
 }
 
 /// [`numeric_cast_typmods`] for a reader that only types (the walk): an unreadable modifier is no

@@ -429,17 +429,90 @@ fn refuse_cross_database(
 /// ([`turso_pg_parser::long_decimal_literal`], the lexer's tokens). The text bounds the scan, never
 /// decides it: such a literal is written with 16 or more digits, so a statement with fewer is not
 /// scanned (L5's write budget).
-fn refuse_long_decimals(sql: &str) -> Result<()> {
+fn refuse_long_decimals(
+    pg_conn: &PgConnectionInner,
+    sql: &str,
+    parse: &turso_pg_parser::pg_query::ParseResult,
+) -> Result<()> {
     if sql.bytes().filter(u8::is_ascii_digit).nth(15).is_none() {
         return Ok(());
     }
-    match turso_pg_parser::long_decimal_literal(sql) {
+    let exempt = float_target_literals(pg_conn, parse);
+    match turso_pg_parser::long_decimal_literal(sql, &exempt) {
         Some(literal) => Err(LimboError::ParseError(SqlErrorMessage::classified(
             SqlErrorKind::FeatureNotSupported,
             format!("numeric literal {literal} is not supported: more than 15 significant digits would be rounded"),
         ))),
         None => Ok(()),
     }
+}
+
+/// The byte offsets of the numeric literals an INSERT VALUES item or an UPDATE SET source assigns
+/// to a float4 or float8 column of a main table: PostgreSQL reads them as that float (float8in's
+/// nearest double), which the engine's REAL is, so a long one is not refused there (floats are
+/// dumped with 17 digits). Any other target, or a table this cannot read, exempts nothing.
+fn float_target_literals(pg_conn: &PgConnectionInner, parse: &turso_pg_parser::pg_query::ParseResult) -> Vec<usize> {
+    use turso_pg_parser::pg_query::protobuf::{a_const::Val, node::Node, Node as PgNode};
+    let mut out = Vec::new();
+    let [raw] = parse.protobuf.stmts.as_slice() else { return out };
+    let schema = pg_conn.conn.current_schema();
+    let float_column = |relname: &str, column: &str| {
+        schema.get_btree_table(relname).is_some_and(|t| {
+            t.get_column(column)
+                .is_some_and(|(_, c)| matches!(crate::catalog::sqlite_type_to_pg_oid(&c.ty_str), 700 | 701))
+        })
+    };
+    let literal = |node: &PgNode| match node.node.as_ref() {
+        Some(Node::AConst(c)) if matches!(c.val, Some(Val::Fval(_))) => usize::try_from(c.location).ok(),
+        _ => None,
+    };
+    match raw.stmt.as_ref().and_then(|s| s.node.as_ref()) {
+        Some(Node::InsertStmt(insert)) => {
+            let Some(rv) = insert.relation.as_ref().filter(|rv| rv.schemaname.is_empty() || rv.schemaname == "public") else {
+                return out;
+            };
+            let names: Vec<String> = if insert.cols.is_empty() {
+                match schema.get_btree_table(&rv.relname) {
+                    Some(t) => t.columns().iter().filter_map(|c| c.name.clone()).collect(),
+                    None => return out,
+                }
+            } else {
+                insert
+                    .cols
+                    .iter()
+                    .filter_map(|c| match c.node.as_ref() {
+                        Some(Node::ResTarget(r)) => Some(r.name.clone()),
+                        _ => None,
+                    })
+                    .collect()
+            };
+            if let Some(Node::SelectStmt(s)) = insert.select_stmt.as_deref().and_then(|s| s.node.as_ref()) {
+                for row in &s.values_lists {
+                    if let Some(Node::List(l)) = row.node.as_ref() {
+                        for (item, name) in l.items.iter().zip(&names) {
+                            if let Some(at) = literal(item).filter(|_| float_column(&rv.relname, name)) {
+                                out.push(at);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Some(Node::UpdateStmt(update)) => {
+            let Some(rv) = update.relation.as_ref().filter(|rv| rv.schemaname.is_empty() || rv.schemaname == "public") else {
+                return out;
+            };
+            for target in &update.target_list {
+                if let Some(Node::ResTarget(r)) = target.node.as_ref() {
+                    if let Some(at) = r.val.as_deref().and_then(literal).filter(|_| float_column(&rv.relname, &r.name)) {
+                        out.push(at);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    out
 }
 
 /// An ALTER COLUMN TYPE the engine cannot do as PostgreSQL does is refused 0A000 before anything
@@ -1636,7 +1709,7 @@ fn prepare_statement_parsed(
     refuse_dropped_schemas(pg_conn, &parse_result)?;
     refuse_alter_column_type_across_families(pg_conn, &parse_result)?;
     refuse_cross_database(pg_conn, sql, &parse_result)?;
-    refuse_long_decimals(sql)?;
+    refuse_long_decimals(pg_conn, sql, &parse_result)?;
     if !pg_conn.conn.get_auto_commit() {
         let relations = turso_pg_parser::translator::named_relations(&parse_result);
         if !relations.is_empty() {
