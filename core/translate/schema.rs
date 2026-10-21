@@ -837,7 +837,9 @@ fn validate(
                                     None => 0,
                                 };
                                 let expected = td.user_params().count();
-                                if provided != expected {
+                                if provided != expected
+                                    && !(provided == 0 && crate::translate::expr::type_takes_no_typmod(td))
+                                {
                                     bail_parse_error!(
                                         "type \"{}\" requires {} parameter(s), got {}",
                                         type_name,
@@ -966,6 +968,7 @@ fn derive_ctas_schema(
             // `ctas_keeps_unparameterized_type` (test builds only): kept, as before.
             if params.is_empty()
                 && type_def.user_params().next().is_some()
+                && !crate::translate::expr::type_takes_no_typmod(&type_def)
                 && !crate::branch::store::fe_mutant("ctas_keeps_unparameterized_type")
             {
                 return None;

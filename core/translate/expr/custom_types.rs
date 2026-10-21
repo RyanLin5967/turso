@@ -839,6 +839,37 @@ pub(crate) fn emit_dml_expr_index_value(
     Ok(())
 }
 
+/// Whether a column or a copy may name `type_def` with none of its parameters: the built-in
+/// numeric, PostgreSQL's unconstrained `numeric` (engine-rev-types-08caaec44 MED 5: a CREATE TABLE
+/// AS copy of numeric arithmetic, typmod -1 in PostgreSQL, was stored as ANY and compared as text).
+/// Mutant `numeric_requires_typmod` (test builds only): no type, as before.
+pub(crate) fn type_takes_no_typmod(type_def: &TypeDef) -> bool {
+    type_def.is_builtin && type_def.name.eq_ignore_ascii_case("numeric") && !crate::branch::store::fe_mutant("numeric_requires_typmod")
+}
+
+/// Whether `column`'s stored values are canonical encodings, one per value, so equality of the
+/// encodings is the type's equality: false for an unconstrained numeric column (and a domain over
+/// one), whose values keep their own scale (2.00 and 2.000 encode apart), so no index seek may key
+/// it (`optimizer::constraints`).
+pub(crate) fn column_encoding_is_canonical(schema: &crate::schema::Schema, column: &Column, type_def: &TypeDef) -> bool {
+    if !type_takes_no_typmod(type_def) || !column.ty_params.is_empty() {
+        return true;
+    }
+    // A domain over numeric gives the type its parameters (`domain_base_params`).
+    let mut current = schema.get_type_def_unchecked(&column.ty_str);
+    for _ in 0..64 {
+        let Some(td) = current else { break };
+        if !td.is_domain {
+            break;
+        }
+        if !td.domain_base_params.is_empty() {
+            return true;
+        }
+        current = schema.get_type_def_unchecked(td.base());
+    }
+    false
+}
+
 /// The type chain whose ENCODEs make the stored form of `column`'s DEFAULT, for a raw (stored-form)
 /// read of the column: Some when the column has a DEFAULT and its STRICT type chain ENCODEs. A row
 /// from before ALTER TABLE ADD COLUMN has no field for the column, and the Column instruction's
@@ -1119,6 +1150,11 @@ pub(crate) fn emit_type_expr(
             if let Some(param_expr) = params.get(i) {
                 let reg = program.alloc_register();
                 translate_expr(program, None, param_expr, reg, resolver)?;
+                program.id_register_overrides.insert(&param.name, reg);
+            } else if params.is_empty() && type_takes_no_typmod(type_def) {
+                // An unconstrained numeric binds its parameters to NULL (`numeric_encode`).
+                let reg = program.alloc_register();
+                program.emit_insn(Insn::Null { dest: reg, dest_end: None });
                 program.id_register_overrides.insert(&param.name, reg);
             }
         }

@@ -92,7 +92,8 @@ pub use condition::translate_condition_expr;
 pub(crate) use custom_types::{
     emit_dml_expr_index_value, emit_trigger_decode_registers, emit_type_expr,
     emit_short_record_stored_default, emit_user_facing_column_value, eq_agrees_with_encoding,
-    key_takes_type_operator, seek_type_of, stored_default_chain,
+    column_encoding_is_canonical, key_takes_type_operator, seek_type_of, stored_default_chain,
+    type_takes_no_typmod,
     seek_key_eq_function, type_eq_function,
 };
 pub use emission::{

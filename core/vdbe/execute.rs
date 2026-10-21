@@ -10835,7 +10835,13 @@ pub fn op_function(
                     other => {
                         use crate::numeric::decimal::{NumericTypmod, PgNumeric};
 
+                        // An unconstrained numeric (no typmod, PostgreSQL's plain `numeric`):
+                        // NULL precision and scale, the value kept at its own scale
+                        // (engine-rev-types-08caaec44 MED 5).
+                        let unconstrained = matches!(precision_reg.get_value(), Value::Null)
+                            && matches!(scale_reg.get_value(), Value::Null);
                         let precision = match precision_reg.get_value() {
+                            _ if unconstrained => 0,
                             Value::Numeric(Numeric::Integer(i)) => *i,
                             _ => {
                                 return Err(LimboError::Constraint(
@@ -10844,6 +10850,7 @@ pub fn op_function(
                             }
                         };
                         let scale = match scale_reg.get_value() {
+                            _ if unconstrained => 0,
                             Value::Numeric(Numeric::Integer(i)) => *i,
                             _ => {
                                 return Err(LimboError::Constraint(
@@ -10853,7 +10860,7 @@ pub fn op_function(
                         };
                         // The typmod first, before any value is parsed or rescaled: a CAST or a
                         // column whose typmod CREATE TABLE never saw is bounded here too.
-                        let typmod = NumericTypmod::new(precision, scale)?;
+                        let typmod = if unconstrained { None } else { Some(NumericTypmod::new(precision, scale)?) };
                         let value = match other {
                             Value::Numeric(Numeric::Integer(i)) => PgNumeric::from_i64(*i),
                             Value::Numeric(Numeric::Float(f)) => PgNumeric::parse(&f.to_string())
@@ -10874,7 +10881,10 @@ pub fn op_function(
                                 )));
                             }
                         };
-                        Value::from_blob(value.with_typmod(typmod)?.to_blob())
+                        match typmod {
+                            Some(typmod) => Value::from_blob(value.with_typmod(typmod)?.to_blob()),
+                            None => Value::from_blob(value.to_blob()),
+                        }
                     }
                 };
                 state.registers[*dest].set_value(result);

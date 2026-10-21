@@ -1138,6 +1138,7 @@ pub fn constraints_from_where_clause(
                         {
                             if constraint.operator != ast::Operator::Equals.into()
                                 || !crate::translate::expr::eq_agrees_with_encoding(&type_def)
+                                || !crate::translate::expr::column_encoding_is_canonical(schema, constrained_column, &type_def)
                             {
                                 continue;
                             }
