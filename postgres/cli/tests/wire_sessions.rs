@@ -17160,6 +17160,26 @@ fn a_function_name_is_matched_as_written() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// wire-rev-1de981755-rest LOW-4 (its PG 18.6 probe #5, #6): a varchar cast's length is bounded as varchartypmodin
+/// bounds it, 22023: 'abc'::varchar(0) answered '' and varchar(10485761) answered.
+#[test]
+fn a_varchar_cast_length_is_bounded() {
+    let dir = Scratch::new("vc-bounds");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let mut wrong = Vec::new();
+    for (sql, message) in [
+        ("SELECT 'abc'::varchar(0) AS a", "length for type varchar must be at least 1"),
+        ("SELECT 'abc'::varchar(10485761) AS a", "length for type varchar cannot exceed 10485760"),
+    ] {
+        let r = a.q(sql);
+        if !r.error.as_ref().is_some_and(|e| e.code == "22023" && e.message == message) {
+            wrong.push(format!("{sql}: PG 22023 {message}; got {:?} {:?}", r.rows, r.error));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// wire-rev-351702a43 LOW-6 (its PG 18.6 probe3 #161): a CASE is typed by its results (an int4 constant and an int4
 /// function: 23); the walk never typed a CASE column, and the engine announced it text (25).
 #[test]
