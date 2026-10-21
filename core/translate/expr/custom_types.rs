@@ -5038,4 +5038,25 @@ mod tests {
         }
         assert!(bad.is_empty(), "CLAIM: a plan shape answered a DML, CAST, join or compound comparison unlike PostgreSQL: {} divergences: {bad:#?}", bad.len());
     }
+
+    #[test]
+    fn probe_manual_cast_examples() {
+        let conn = open();
+        for sql in [
+            "SELECT CAST(1.5 AS numeric(8, 2))",
+            "CREATE TYPE reversed BASE text ENCODE string_reverse(value) DECODE string_reverse(value)",
+            "SELECT CAST('hello' AS reversed)",
+            "CREATE TABLE rv(id INTEGER PRIMARY KEY, r reversed) STRICT",
+            "INSERT INTO rv VALUES (1, 'hello')",
+            "SELECT r FROM rv",
+            "CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100",
+            "SELECT CAST(42 AS cents)",
+            "CREATE TABLE t1(amount cents CHECK(amount < CAST(50 AS cents))) STRICT",
+            "INSERT INTO t1 VALUES (40)",
+            "INSERT INTO t1 VALUES (60)",
+            "SELECT amount FROM t1",
+        ] {
+            println!("PROBE {sql} => {:?}", table_of(&conn, sql));
+        }
+    }
 }
