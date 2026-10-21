@@ -48,6 +48,31 @@ fn infer_type_from_expr(expr: &ast::Expr, tables: Option<&TableReferences>) -> A
     get_expr_affinity(expr, tables, None)
 }
 
+/// A derived relation's column affinity: `infer_type_from_expr`'s, except for a CAST that
+/// applies a custom type (`order_by::cast_applies_type`), whose values are its base primitive's
+/// (a domain over text yields text), so its affinity is that primitive's, not the one SQLite's
+/// name rules give the type's NAME (core-integrator, artie 26f59de787: `du`, a domain over text,
+/// read as NUMERIC, so a derived column of CAST(10 AS du) and CAST(9 AS du) ordered 9 before 10).
+/// With custom types off no name is registered and nothing changes. Mutant
+/// `cast_affinity_by_type_name` (test builds only): the name's, as before.
+fn derived_column_affinity(
+    expr: &ast::Expr,
+    tables: Option<&TableReferences>,
+    schema: &crate::schema::Schema,
+) -> Affinity {
+    if let ast::Expr::Cast { type_name: Some(ty), .. } = expr {
+        if ty.array_dimensions == 0
+            && !crate::branch::store::fe_mutant("cast_affinity_by_type_name")
+            && super::order_by::cast_applies_type(schema, ty)
+        {
+            if let Ok(Some(resolved)) = schema.resolve_type_unchecked(&ty.name) {
+                return Affinity::affinity(&resolved.primitive);
+            }
+        }
+    }
+    infer_type_from_expr(expr, tables)
+}
+
 /// Computes the affinity of column `i` of a compound (UNION/INTERSECT/EXCEPT)
 /// subquery, matching SQLite's `sqlite3SubqueryColumnTypes` (select.c).
 ///
@@ -58,14 +83,14 @@ fn infer_type_from_expr(expr: &ast::Expr, tables: Option<&TableReferences>) -> A
 /// (TEXT affinity + a numeric arm, or numeric affinity + a text arm), in which
 /// case it is downgraded to BLOB (none) so the column is compared by storage
 /// class.
-fn compound_column_affinity(arms: &[&SelectPlan], i: usize) -> Affinity {
+fn compound_column_affinity(arms: &[&SelectPlan], i: usize, schema: &crate::schema::Schema) -> Affinity {
     if arms.is_empty() {
         return Affinity::None;
     }
     let col_affinities = |arm: &SelectPlan| {
         arm.result_columns
             .get(i)
-            .map(|rc| get_expr_affinity(&rc.expr, Some(&arm.table_references), None))
+            .map(|rc| derived_column_affinity(&rc.expr, Some(&arm.table_references), schema))
             .unwrap_or(Affinity::None)
     };
     let col_data_type = |arm: &SelectPlan| {
@@ -2509,9 +2534,9 @@ fn query_output_columns(
                 .or_else(|| result_column.name(table_references).map(String::from));
             let affinity = compound_arms
                 .as_ref()
-                .map(|arms| compound_column_affinity(arms, column_index))
+                .map(|arms| compound_column_affinity(arms, column_index, schema))
                 .unwrap_or_else(|| {
-                    infer_type_from_expr(&result_column.expr, Some(table_references))
+                    derived_column_affinity(&result_column.expr, Some(table_references), schema)
                 });
             let column_type = affinity.to_type();
             let mut column = Column::new(
@@ -2597,7 +2622,7 @@ impl JoinedTable {
             .result_columns
             .iter()
             .map(|rc| {
-                let affinity = infer_type_from_expr(&rc.expr, Some(&plan.table_references));
+                let affinity = derived_column_affinity(&rc.expr, Some(&plan.table_references), schema);
                 let col_type = affinity.to_type();
                 let mut column = Column::new(
                     rc.name(&plan.table_references).map(String::from),

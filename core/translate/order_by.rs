@@ -131,7 +131,7 @@ pub(crate) fn cast_encoding_primitive(expr: &ast::Expr, schema: &Schema) -> Opti
 /// Whether `translate_expr` applies the custom type a CAST names (its `ast::Expr::Cast` arm): a
 /// domain always; a type when the CAST gives all the parameters it takes, or it takes none.
 /// Otherwise (CAST(x AS NUMERIC)) the CAST is SQLite's, by the name's affinity.
-fn cast_applies_type(schema: &Schema, ty: &ast::Type) -> bool {
+pub(crate) fn cast_applies_type(schema: &Schema, ty: &ast::Type) -> bool {
     let given = match &ty.size {
         None => 0,
         Some(ast::TypeSize::MaxSize(_)) => 1,
