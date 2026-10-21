@@ -964,8 +964,10 @@ fn func_name(call: &turso_pg_parser::pg_query::protobuf::FuncCall) -> Option<Str
             _ => None,
         })
         .collect();
+    // As written: libpg_query folds an unquoted name already, and a quoted one is case-sensitive
+    // in PostgreSQL ("MAX" is no function; wire-rev-351702a43 LOW-8).
     match names.as_slice() {
-        [name] | ["pg_catalog", name] => Some(name.to_ascii_lowercase()),
+        [name] | ["pg_catalog", name] => Some(name.to_string()),
         _ => None,
     }
 }
@@ -2211,6 +2213,35 @@ impl Infer<'_> {
                 found.flatten()
             }
             Node::FuncCall(call) => {
+                // min or max that names no function: quoted in another case ("MAX") or qualified
+                // by a schema other than pg_catalog (public.max), 42883 as PostgreSQL refuses it,
+                // named as written (wire-rev-351702a43 LOW-8, wire-rev-7128c6f73 L5).
+                let parts: Vec<&str> = call
+                    .funcname
+                    .iter()
+                    .filter_map(|n| match &n.node {
+                        Some(Node::String(s)) => Some(s.sval.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                let unknown_min_max = match parts.as_slice() {
+                    [name] | ["pg_catalog", name] => {
+                        (name.eq_ignore_ascii_case("min") || name.eq_ignore_ascii_case("max")) && !matches!(*name, "min" | "max")
+                    }
+                    [_, name] => matches!(*name, "min" | "max"),
+                    _ => false,
+                };
+                if unknown_min_max {
+                    if let Some(t) = call.args.first().and_then(|a| self.type_of(a, scope)).filter(|t| type_name(*t) != "unknown") {
+                        self.first_refusal.borrow_mut().get_or_insert_with(|| {
+                            Some(SqlErrorMessage::classified(
+                                SqlErrorKind::UndefinedFunction,
+                                format!("function {}({}) does not exist", parts.join("."), type_name(t)),
+                            ))
+                        });
+                    }
+                    return None;
+                }
                 let name = func_name(call)?;
                 if let Some(t) = scalar_result(&name) {
                     return Some(t);
