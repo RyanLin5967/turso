@@ -48,9 +48,11 @@ jobs:
       - name: Self-tests
         run: |
           mkdir -p st
-          python3 -B fastest/linux/v3/blkflush.py self-test 2>&1 | tee st/blkflush-selftest.txt
-          python3 -B fastest/linux/v3/batchgate.py self-test fastest/linux/v3/testdata 2>&1 | tee st/batchgate-selftest.txt
-          python3 -B fastest/linux/v3/check.py --self-test 2>&1 | tee st/check-selftest.txt
+          # each judged by its TALLY and rc through gates/run_selftest.sh (linux-rev-uw3 MED 2: rc plus a summary grep
+          # passed with the TALLY print deleted), the whole output kept as before
+          bash fastest/linux/gates/run_selftest.sh python3 -B fastest/linux/v3/blkflush.py self-test 2>&1 | tee st/blkflush-selftest.txt
+          bash fastest/linux/gates/run_selftest.sh python3 -B fastest/linux/v3/batchgate.py self-test fastest/linux/v3/testdata 2>&1 | tee st/batchgate-selftest.txt
+          bash fastest/linux/gates/run_selftest.sh python3 -B fastest/linux/v3/check.py --self-test 2>&1 | tee st/check-selftest.txt
           for c in ext4 xfs btrfs ext4loop xfsloop btrfsloop; do for a in x86_64 aarch64; do for l in wb wt brd; do
             for v in vm bare; do for f in yes no; do for p in yes no; do
               echo "$c $a $l $v $f $p $(python3 -B fastest/linux/v3/check.py --plan "$c" "$a" "$l" "$v" "$f" "$p" | wc -l)"

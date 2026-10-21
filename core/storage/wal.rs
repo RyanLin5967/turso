@@ -715,7 +715,8 @@ pub trait Wal: Debug + Send + Sync {
 
     /// `write_frame_raw`, the WAL header's sync (after a truncation) reporting a failure to
     /// `pager`'s branch store at once, as every other WAL-internal sync does (engine review 17 LOW
-    /// 10; `Pager::wal_insert_frame`). The default reports nothing.
+    /// 10; `Pager::wal_insert_frame`). No default (engine review 21 LOW 20): one that reported
+    /// nothing would be a silent unwatched sync for any new implementation.
     #[allow(clippy::too_many_arguments)]
     fn write_frame_raw_watched(
         &self,
@@ -726,10 +727,7 @@ pub trait Wal: Debug + Send + Sync {
         db_size: u64,
         page: &[u8],
         sync_type: FileSyncType,
-    ) -> Result<()> {
-        let _ = pager;
-        self.write_frame_raw(buffer_pool, frame_id, page_id, db_size, page, sync_type)
-    }
+    ) -> Result<()>;
 
     /// Prepare WAL header for the future append
     /// Most of the time this method will return Ok(None)
@@ -3921,8 +3919,16 @@ impl Wal for WalFile {
                 self.io.wait_for_completion(c)?;
                 let c = self.watched("raw_header_sync_unwatched", pager, self.prepare_wal_finish(sync_type))?;
                 if let Err(e) = self.io.wait_for_completion(c) {
+                    // Acted on through the copy `watched` noted, which this takes, so the failure
+                    // is reported once (engine review 21 LOW 20: a second report re-reads the
+                    // group's state and can fail-stop later). Mutant `raw_header_sync_reported_twice`
+                    // (test builds only): reported directly, the note left for the next check.
                     if !crate::branch::store::fe_mutant("raw_header_sync_unwatched") {
-                        pager.trunk_wal_sync_failed();
+                        if crate::branch::store::fe_mutant("raw_header_sync_reported_twice") {
+                            pager.trunk_wal_sync_failed();
+                        } else {
+                            pager.check_noted_syncs();
+                        }
                     }
                     return Err(e);
                 }

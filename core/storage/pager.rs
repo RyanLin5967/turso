@@ -4670,6 +4670,12 @@ impl Pager {
         if let IOResult::IO(c) = self.wait_for_spill_completions()? {
             return Ok(IOResult::IO(c));
         }
+        // Test builds (engine review 19 MED 3): one yield here when the store's hook is armed, as
+        // the wait above makes on an async IO (io_uring, MemoryYieldIO, the simulator).
+        #[cfg(test)]
+        if self.branch_store.get().is_some_and(|store| store.take_commit_yield_for_test()) {
+            io_yield_one!(Completion::new_yield());
+        }
 
         // A branch pager commits to its branch (`commit_wal_inner` refuses it too): refused before
         // it could open the TRUNK's commit gate without the WAL write lock (review A-F1).
