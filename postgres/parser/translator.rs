@@ -3577,6 +3577,34 @@ impl PostgreSQLTranslator {
                         ).into()));
                     }
                 }
+                // A decimal literal cast to an integer type is rounded half away from zero, as
+                // PostgreSQL's numeric-to-int conversion rounds it (1.5::int2 is 2); the engine's
+                // CAST truncates (wire-rev-7128c6f73 MED-4). Rounded here, where the literal is
+                // still a decimal. BLIND SPOT: a column or expression of a numeric or float type
+                // cast to an integer is the engine's CAST and truncates (PGDIV-INT-CAST-TRUNCATES).
+                if let (Some(pg_query::protobuf::node::Node::AConst(c)), Some(t)) =
+                    (arg.node.as_ref(), type_cast.type_name.as_ref())
+                {
+                    let integer = t.array_bounds.is_empty()
+                        && t.names.last().is_some_and(|n| {
+                            matches!(&n.node, Some(pg_query::protobuf::node::Node::String(s))
+                                if matches!(s.sval.to_ascii_lowercase().as_str(),
+                                    "int2" | "int4" | "int8" | "int" | "integer" | "smallint" | "bigint"))
+                        });
+                    if let (true, Some(pg_query::protobuf::a_const::Val::Fval(f))) = (integer, &c.val) {
+                        let text = f.fval.replace('_', "");
+                        let is_decimal = text.contains(['.', 'e', 'E']);
+                        if let (true, Ok(v)) = (is_decimal, text.parse::<f64>()) {
+                            let r = v.round();
+                            if r.is_finite() && r.abs() < 9.2e18 {
+                                return Ok(ast::Expr::Cast {
+                                    expr: Box::new(ast::Expr::Literal(ast::Literal::Numeric((r as i64).to_string()))),
+                                    type_name: pg_type_name_to_ast_type(t),
+                                });
+                            }
+                        }
+                    }
+                }
                 let expr = Box::new(self.translate_expr(arg)?);
                 // A regclass is the named relation's pg_class oid, resolved by the frontend's
                 // pg_regclass (recorded, pg18-rev-regclass.out); a cast to INTEGER made every
