@@ -12527,7 +12527,6 @@ replays_postgresql!(
         (13, "PGDIV-NUMERIC-CAST-FLOAT8 value [wire]: a CAST to NUMERIC(p,s) is computed and typed as the engine's REAL (701, '2.5, 10') where PG types it 1700 with its scale ('2.50, 10.00'); it sorts and compares as a number (wire-rev-2a68496d0 H1); numeric waits for the engine's typed CAST (437f337be)"),
         (14, "PGDIV-NUMERIC-CAST-FLOAT8 value [wire]: a CAST to NUMERIC(p,s) is computed and typed as the engine's REAL (701, '123456.78, 2.5') where PG types it 1700 with its scale ('123456.78, 2.50'); it sorts and compares as a number (wire-rev-2a68496d0 H1); numeric waits for the engine's typed CAST (437f337be)"),
         (15, "PGDIV-NUMERIC-TYPMOD-CODE value [engine]: NUMERIC(2,-1), a negative scale PG 15+ accepts (123 rounds to 120), is refused 23000 by the engine's numeric_encode"),
-        (16, "PGDIV-NUMERIC-TYPMOD-CODE error-code [engine]: NUMERIC(1001,2) is refused 23000 (the engine's numeric_encode, a Constraint error) where PG answers 22023"),
         (17, "PGDIV-NUMERIC-TYPMOD-CODE error-code [engine]: NUMERIC(2,5) is refused 23000 'scale must not exceed precision' where PG accepts the type and answers 22003 numeric field overflow"),
         (18, "PGDIV-NUMERIC-CAST-FLOAT8 value [wire]: a CAST to NUMERIC(p,s) is computed and typed as the engine's REAL (701, '2, 4, 6') where PG types it 1700 with its scale ('2.00, 4.00, 6.00'); it sorts and compares as a number (wire-rev-2a68496d0 H1); numeric waits for the engine's typed CAST (437f337be)"),
         (19, "PGDIV-NUMERIC-CAST-FLOAT8 value [wire]: a CAST to NUMERIC(p,s) is computed and typed as the engine's REAL (701, '2.5') where PG types it 1700 with its scale ('2.50'); it sorts and compares as a number (wire-rev-2a68496d0 H1); numeric waits for the engine's typed CAST (437f337be)"),
@@ -12554,9 +12553,7 @@ replays_postgresql!(
     pg18_wirefuzz_alter_column_type_and_add_column_default_coerce_every_row_replays_as_postgresql_answered,
     "pg18-wirefuzz-alter_column_type_and_add_column_default_coerce_every_row.out",
     [
-        (3, "PGDIV-VARCHAR-OVERFLOW-CODE error-code [engine]: the value too long is refused, as in PG, with XX000 'value too long for varchar' (core's varchar ENCODE, a RAISE with no kind) where PG answers 22001 (engine 58045fb81 + the wire's sqlstate arm, at integration)"),
         (5, "PGDIV-ALTER-COLUMN-SAME-NAME value [wire]: the engine's ALTER COLUMN refuses a new definition that keeps the column's name (core alter.rs: 'duplicate column name' for the column itself), so a type change that fits is 42601 where PG answers ALTER TABLE"),
-        (8, "PGDIV-VARCHAR-OVERFLOW-CODE error-code [engine]: the value too long is refused, as in PG, with XX000 'value too long for varchar' (core's varchar ENCODE, a RAISE with no kind) where PG answers 22001 (engine 58045fb81 + the wire's sqlstate arm, at integration)"),
         (11, "PGDIV-ALTER-COLUMN-SAME-NAME value [wire]: the engine's ALTER COLUMN refuses a new definition that keeps the column's name (core alter.rs: 'duplicate column name' for the column itself), so a type change that fits is 42601 where PG answers ALTER TABLE (a PRIMARY KEY column is also refused there)"),
         (12, "PGDIV-ALTER-COLUMN-SAME-NAME value [wire]: a cascade of #11: id stays int4 (23) where PG made it bigint (20); the rows agree"),
     ]
