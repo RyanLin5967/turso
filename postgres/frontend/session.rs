@@ -2022,9 +2022,18 @@ fn try_prepare_special(
             stmt.set_n_change(rows_inserted as i64);
             stmt
         }
+        // Settled only at its last run (CopyDone, its rows in): the asking run and each piece's
+        // run return a no-op as well, but the COPY goes on after them, so a cancel landing in one
+        // must stop the COPY. Settled there, it was dropped with the piece and the COPY loaded
+        // (copy-suite13: a_cancel_or_timeout_during_copys_final_insert_leaves_the_session_usable
+        // red on both kinds under load).
         Special::CopyFromStdin(stmt) => {
-            let rows_inserted = handle_pg_copy_from_stdin(pg_conn, &stmt)?;
-            let stmt = noop_statement(pg_conn)?;
+            let (rows_inserted, done) = handle_pg_copy_from_stdin(pg_conn, &stmt)?;
+            let stmt = if done {
+                noop_statement(pg_conn)?
+            } else {
+                pg_conn.conn.prepare(catalog::sqlite_text("SELECT 0 WHERE 0"))?
+            };
             stmt.set_n_change(rows_inserted as i64);
             stmt
         }
@@ -4778,7 +4787,7 @@ fn line_too_long(limit: usize) -> LimboError {
 fn handle_pg_copy_from_stdin(
     pg_conn: &Arc<PgConnectionInner>,
     stmt: &PgCopyFromStmt,
-) -> Result<usize> {
+) -> Result<(usize, bool)> {
     let Some(copy) = &pg_conn.copy_stdin else {
         return Err(LimboError::InvalidArgument(SqlErrorMessage::classified(
             SqlErrorKind::FeatureNotSupported,
@@ -4799,7 +4808,7 @@ fn handle_pg_copy_from_stdin(
             let mut state = copy.lock();
             state.asked = Some(target.columns.len());
             state.loader = Some(CopyLoader::new(Arc::new(target), stmt));
-            Ok(0)
+            Ok((0, false))
         }
         // The client's CopyFail is the COPY's error, whatever else has changed since it asked.
         Some(CopyEnd::Failed(kind, message)) => {
@@ -4828,7 +4837,7 @@ fn handle_pg_copy_from_stdin(
                 copy.lock().loader = Some(loader);
             }
             fed?;
-            Ok(if last { rows } else { 0 })
+            Ok(if last { (rows, true) } else { (0, false) })
         }
     }
 }
