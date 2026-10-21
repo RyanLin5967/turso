@@ -51,13 +51,18 @@ impl Server {
     /// Start `tursopg DB --server` on a kernel-assigned port, retrying on a lost bind race (see
     /// `start_tursopg_server` in tursopg.rs for why the port is not derived from a seed).
     fn start(db: &Path, extra: &[&str]) -> Self {
+        Self::start_env(db, extra, &[])
+    }
+
+    /// [`Server::start`] with `env` set in the server's environment.
+    fn start_env(db: &Path, extra: &[&str], env: &[(&str, &str)]) -> Self {
         for _ in 0..10 {
             let port = TcpListener::bind("127.0.0.1:0")
                 .unwrap()
                 .local_addr()
                 .unwrap()
                 .port();
-            if let Some(server) = Self::start_on(db, extra, port) {
+            if let Some(server) = Self::start_on_env(db, extra, env, port) {
                 return server;
             }
         }
@@ -71,6 +76,10 @@ impl Server {
     /// (the startup flake). Its stdout and stderr go to `server_log_dir()`, one file each per
     /// server.
     fn start_on(db: &Path, extra: &[&str], port: u16) -> Option<Self> {
+        Self::start_on_env(db, extra, &[], port)
+    }
+
+    fn start_on_env(db: &Path, extra: &[&str], env: &[(&str, &str)], port: u16) -> Option<Self> {
         use std::io::BufRead;
         let addr = format!("127.0.0.1:{port}");
         let logs = server_log_dir();
@@ -83,6 +92,7 @@ impl Server {
             .arg("--server")
             .arg(&addr)
             .args(extra)
+            .envs(env.iter().copied())
             .stdout(Stdio::piped())
             .stderr(Stdio::from(stderr));
         // Observation only: with WIRE_SERVER_TRACE_DIR set, each server writes its log there
@@ -8162,6 +8172,337 @@ fn copy_refuses_a_line_past_its_limit() {
     assert_eq!(r.err("pieces past the limit").code, "54000");
     assert_eq!(r.status, b'I');
     assert_eq!(a.q("SELECT count(*) FROM c").single("count"), "1");
+}
+
+/// Start a COPY over the simple protocol and send `data` in 64 KiB CopyData messages, the COPY
+/// left open: the reply so far (its CopyInResponse).
+fn copy_start(a: &mut Wire, sql: &str, data: &[u8]) -> Reply {
+    let mut body = sql.as_bytes().to_vec();
+    body.push(0);
+    a.send(b'Q', &body);
+    let mut r = Reply::default();
+    assert!(a.read_into(&mut r, true), "{sql}: no CopyInResponse");
+    for piece in data.chunks(65536) {
+        a.send(b'd', piece);
+    }
+    r
+}
+
+/// The COPY spill files the server `pid` holds open: each descriptor whose link names one
+/// (`turso-copy-`), with the link's text and the file's permission bits (read through the
+/// descriptor, so an unlinked file's too).
+#[cfg(target_os = "linux")]
+fn spill_fds(pid: u32) -> Vec<(String, u32)> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut held = Vec::new();
+    for entry in std::fs::read_dir(format!("/proc/{pid}/fd")).unwrap().flatten() {
+        let Ok(link) = std::fs::read_link(entry.path()) else {
+            continue;
+        };
+        let link = link.to_string_lossy().to_string();
+        if link.contains("turso-copy-") {
+            let mode = std::fs::metadata(entry.path()).map_or(u32::MAX, |m| m.permissions().mode() & 0o7777);
+            held.push((link, mode));
+        }
+    }
+    held
+}
+
+/// [`spill_fds`], waited for up to 20 s until the server holds one (it reads a COPY's pieces as
+/// they come): empty when none was opened.
+#[cfg(target_os = "linux")]
+fn wait_for_spill(pid: u32) -> Vec<(String, u32)> {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let held = spill_fds(pid);
+        if !held.is_empty() || Instant::now() >= deadline {
+            return held;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// The directory a spill file's link names (its text without " (deleted)").
+#[cfg(target_os = "linux")]
+fn spill_dir(link: &str) -> PathBuf {
+    Path::new(link.trim_end_matches(" (deleted)")).parent().unwrap().to_path_buf()
+}
+
+/// A COPY that fails lets go of its spill file before it answers: after a duplicate key at its end
+/// (23505, the final insert) or a bad line (22P02, as the line is read) the server holds no spill
+/// file open. The loader, and its unlinked spill, was kept after any error until the session's
+/// next COPY or its end, so a failed 100 GB COPY held its disk (review wire-rev-copystdin3 M2,
+/// `leak`: 13,888,890 bytes still open after 23505, after a SELECT 1 and 2 s).
+#[cfg(target_os = "linux")]
+#[test]
+fn a_failed_copy_lets_go_of_its_spill_file_at_once() {
+    let dir = Scratch::new("copyspillfree");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.s.set_read_timeout(Some(Duration::from_secs(300))).unwrap();
+    a.q("CREATE TABLE sf (id int PRIMARY KEY)").ok("sf");
+    let rows: Vec<u8> = (1..=5000).flat_map(|i| format!("{i}\n").into_bytes()).collect();
+    for (what, last, code) in [
+        ("a duplicate key at the end", &b"1\n"[..], "23505"),
+        ("a bad line", b"x\n", "22P02"),
+    ] {
+        let mut r = copy_start(&mut a, "COPY sf FROM STDIN", &rows);
+        assert!(
+            !wait_for_spill(server.pid()).is_empty(),
+            "premise not met: {what}: the COPY opened no spill file, so its release is not tested"
+        );
+        a.send(b'd', last);
+        a.send(b'c', &[]);
+        a.read_into(&mut r, false);
+        assert_eq!(r.err(what).code, code, "{what}");
+        assert_eq!(r.status, b'I', "{what}");
+        let held = spill_fds(server.pid());
+        assert!(held.is_empty(), "{what}: the failed COPY's spill file is still open: {held:?}");
+    }
+    a.q("SELECT 1").ok("the session after");
+    assert_eq!(a.q("SELECT count(*) FROM sf").single("count"), "0");
+}
+
+/// COPY spills beside its database by default, so a missing TMPDIR changes nothing: a COPY of
+/// 5000 rows with TMPDIR naming no directory spills into the database's directory and loads, as
+/// PostgreSQL (which has no spill) loads it. The spill went to $TMPDIR, so every COPY over 1000
+/// rows failed there with XX000 "COPY FROM: the spill file failed: No such file or directory"
+/// (review wire-rev-copystdin3 M1, `tmpdir`; 970721b5c loaded it).
+#[cfg(target_os = "linux")]
+#[test]
+fn copy_spills_beside_its_database_whatever_tmpdir_is() {
+    let dir = Scratch::new("copyspilltmp");
+    let server = Server::start_env(&dir.db(), &[], &[("TMPDIR", "/nonexistent-turso-copy-tmpdir")]);
+    let mut a = server.connect();
+    a.s.set_read_timeout(Some(Duration::from_secs(300))).unwrap();
+    a.q("CREATE TABLE st (id int)").ok("st");
+    let rows: Vec<u8> = (1..=5000).flat_map(|i| format!("{i}\n").into_bytes()).collect();
+    let mut r = copy_start(&mut a, "COPY st FROM STDIN", &rows);
+    let held = wait_for_spill(server.pid());
+    let db_dir = std::fs::canonicalize(&dir.0).unwrap();
+    assert!(
+        !held.is_empty() && held.iter().all(|(link, _)| spill_dir(link) == db_dir),
+        "the COPY's spill file is not open in the database's directory {db_dir:?}: {held:?}"
+    );
+    a.send(b'c', &[]);
+    a.read_into(&mut r, false);
+    assert_eq!(r.ok("the COPY").tags, vec!["COPY 5000".to_string()]);
+}
+
+/// `--temp-file-limit` caps COPY's spill in kB, as PostgreSQL 18.6's temp_file_limit caps a temp
+/// file: past it the COPY is refused with its 53400 and text, loads nothing and lets go of the
+/// file; a COPY whose spill stays under it loads (run copy-pgprobe11: `ERROR: 53400: temporary
+/// file size exceeds "temp_file_limit" (64kB)`). Nothing bounded the spill (review
+/// wire-rev-copystdin3 M1: 1.0x to 4.4x the data).
+#[test]
+fn copy_refuses_a_spill_past_the_temp_file_limit() {
+    let dir = Scratch::new("copyspillcap");
+    let server = Server::start(&dir.db(), &["--temp-file-limit", "64"]);
+    let mut a = server.connect();
+    a.s.set_read_timeout(Some(Duration::from_secs(300))).unwrap();
+    a.q("CREATE TABLE sc (id int)").ok("sc");
+    let rows = |n: usize| -> Vec<u8> { (1..=n).flat_map(|i| format!("{i}\n").into_bytes()).collect() };
+    // 3000 rows: three spilled batches of about 12 bytes a row, under 64 kB.
+    let r = copy_in_pieces(&mut a, "COPY sc FROM STDIN", &rows(3000)).ok("under the limit");
+    assert_eq!(r.tags, vec!["COPY 3000".to_string()]);
+    // 20000 rows: about 260 kB of spill.
+    let r = copy_in_pieces(&mut a, "COPY sc FROM STDIN", &rows(20000));
+    let e = r.err("past the limit");
+    assert_eq!(
+        (e.code.as_str(), e.message.as_str()),
+        ("53400", "temporary file size exceeds \"temp_file_limit\" (64kB)")
+    );
+    assert_eq!(r.status, b'I');
+    #[cfg(target_os = "linux")]
+    assert!(spill_fds(server.pid()).is_empty(), "the refused COPY's spill file is still open");
+    assert_eq!(a.q("SELECT count(*) FROM sc").single("count"), "3000");
+}
+
+/// `--copy-spill-dir` puts COPY's spill where the operator says, and a directory the server cannot
+/// create a file in stops it at startup, naming the directory and why, before any client meets it
+/// (review wire-rev-copystdin3 M1: the spill's place could not be set, and a bad one failed every
+/// COPY over 1000 rows with XX000).
+#[cfg(target_os = "linux")]
+#[test]
+fn the_copy_spill_dir_is_where_copy_spills_and_is_checked_at_startup() {
+    let dir = Scratch::new("copyspillcfg");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_tursopg"))
+        .arg(dir.db())
+        .arg("--server")
+        .arg("127.0.0.1:0")
+        .arg("--copy-spill-dir")
+        .arg("/nonexistent-turso-copy-spill")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while child.try_wait().unwrap().is_none() {
+        if Instant::now() >= deadline {
+            child.kill().ok();
+            child.wait().ok();
+            panic!("the server started with a --copy-spill-dir that does not exist");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let out = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{stderr}");
+    for part in ["--copy-spill-dir", "/nonexistent-turso-copy-spill", "No such file or directory"] {
+        assert!(stderr.contains(part), "the refusal does not say {part:?}: {stderr}");
+    }
+    let spill = dir.0.join("spill");
+    std::fs::create_dir(&spill).unwrap();
+    let server = Server::start(&dir.db(), &["--copy-spill-dir", spill.to_str().unwrap()]);
+    let mut a = server.connect();
+    a.s.set_read_timeout(Some(Duration::from_secs(300))).unwrap();
+    a.q("CREATE TABLE sp (id int)").ok("sp");
+    let rows: Vec<u8> = (1..=5000).flat_map(|i| format!("{i}\n").into_bytes()).collect();
+    let mut r = copy_start(&mut a, "COPY sp FROM STDIN", &rows);
+    let held = wait_for_spill(server.pid());
+    let spill = std::fs::canonicalize(&spill).unwrap();
+    assert!(
+        !held.is_empty() && held.iter().all(|(link, _)| spill_dir(link) == spill),
+        "the COPY's spill file is not open in --copy-spill-dir {spill:?}: {held:?}"
+    );
+    a.send(b'c', &[]);
+    a.read_into(&mut r, false);
+    assert_eq!(r.ok("the COPY").tags, vec!["COPY 5000".to_string()]);
+}
+
+/// A COPY's spill file is its owner's alone (mode 0600) from its creation: it was created with
+/// the default mode, 0666 under the umask, in a shared directory, so another local user who opened
+/// it before its unlink kept a descriptor to every row the COPY later wrote (review
+/// wire-rev-copystdin3 L4). Read through the server's own descriptor.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_copy_spill_file_is_its_owners_alone() {
+    let dir = Scratch::new("copyspillmode");
+    let server = Server::start(&dir.db(), &[]);
+    let status = std::fs::read_to_string(format!("/proc/{}/status", server.pid())).unwrap();
+    let umask = status
+        .lines()
+        .find_map(|l| l.strip_prefix("Umask:"))
+        .and_then(|v| u32::from_str_radix(v.trim(), 8).ok())
+        .expect("Umask in /proc/PID/status");
+    assert!(
+        umask & 0o066 != 0o066,
+        "premise not met: the server's umask {umask:o} already hides the file from others, so the \
+         file's own mode is not tested"
+    );
+    let mut a = server.connect();
+    a.s.set_read_timeout(Some(Duration::from_secs(300))).unwrap();
+    a.q("CREATE TABLE sm (id int)").ok("sm");
+    let rows: Vec<u8> = (1..=5000).flat_map(|i| format!("{i}\n").into_bytes()).collect();
+    let mut r = copy_start(&mut a, "COPY sm FROM STDIN", &rows);
+    let held = wait_for_spill(server.pid());
+    assert!(!held.is_empty(), "premise not met: the COPY opened no spill file");
+    for (link, mode) in &held {
+        assert_eq!(mode & 0o077, 0, "{link} is mode {mode:o}");
+    }
+    a.send(b'c', &[]);
+    a.read_into(&mut r, false);
+    assert_eq!(r.ok("the COPY").tags, vec!["COPY 5000".to_string()]);
+}
+
+/// numeric_in refuses an exponent past ±(INT32_MAX / 2) = ±1073741823 with 22003 "value
+/// overflows numeric format", whatever its digits (zero ones too); at that bound a value far
+/// below rounds to 0 and loads, one far above is "numeric field overflow" for numeric(6,2)
+/// (recorded, PostgreSQL 18.6, run copy-pgprobe11, and review wire-rev-copystdin3 L2's `l3`).
+/// The exponent was clamped at 2·10^9 and an all-zero value read as 0, so `1e-1073741824`,
+/// `0e5000000000` and the like loaded 0.00, and a large one said "numeric field overflow".
+#[test]
+fn copy_refuses_a_numeric_exponent_past_numeric_ins_range() {
+    let dir = Scratch::new("copyexprange");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE nx (n numeric(6,2))").ok("nx");
+    let sql = "COPY nx FROM STDIN";
+    for (field, message) in [
+        ("1e-1073741824", "value overflows numeric format"),
+        ("1e1073741824", "value overflows numeric format"),
+        ("1e+1073741824", "value overflows numeric format"),
+        ("0e1073741824", "value overflows numeric format"),
+        ("0e-1073741824", "value overflows numeric format"),
+        ("1e-3000000000", "value overflows numeric format"),
+        ("0e5000000000", "value overflows numeric format"),
+        ("1e99999999999999999999", "value overflows numeric format"),
+        ("1e1073741823", "numeric field overflow"),
+        ("1e01073741823", "numeric field overflow"),
+    ] {
+        let data = format!("{field}\n");
+        let e = a.copy(sql, &[CopyIn::Data(data.as_bytes())]).err(field);
+        assert_eq!((e.code.as_str(), e.message.as_str()), ("22003", message), "{field}");
+    }
+    for field in ["1e-1073741823", "0e1073741823", "1.5e-1073741823"] {
+        let data = format!("{field}\n");
+        let r = a.copy(sql, &[CopyIn::Data(data.as_bytes())]).ok(field);
+        assert_eq!(r.tags, vec!["COPY 1".to_string()], "{field}");
+    }
+    assert_eq!(a.q("SELECT count(*) FROM nx").single("count"), "3");
+}
+
+/// A COPY whose client stopped inside a CopyData message, holding its block's write lock, is
+/// ended by a CancelRequest or by statement_timeout (57014) as one stopped between messages is,
+/// and another session's write then runs. The wait watched for them only while no byte of a
+/// message had come, then blocked reading the rest of the message, so a client that stalled
+/// mid-message held the lock until it sent the rest (review wire-rev-copystdin3 L3,
+/// `partialblock`: no answer to the cancel or the timeout, 2 of 2; COMPAT said a stalled COPY is
+/// ended as soon as either comes). PostgreSQL answers neither until the rest comes, and holds no
+/// lock for its COPY: the divergence is timing only, as for a stall between messages.
+#[test]
+fn a_copy_stalled_inside_a_message_ends_at_a_cancel_or_its_timeout() {
+    let dir = Scratch::new("copypartial");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let mut b = server.connect();
+    a.q("CREATE TABLE ph (id int)").ok("ph");
+    a.q("CREATE TABLE ph2 (id int)").ok("ph2");
+    b.q("SET lock_timeout = 2000").ok("lock_timeout");
+    // A CopyData of "7\n", of which the client sends 3 bytes, then stops.
+    let mut message = vec![b'd'];
+    message.extend_from_slice(&6i32.to_be_bytes());
+    message.extend_from_slice(b"7\n");
+    let key = a.key.clone().expect("BackendKeyData at startup");
+    for (what, timeout, why) in [
+        ("a cancel", false, "canceling statement due to user request"),
+        ("statement_timeout", true, "canceling statement due to statement timeout"),
+    ] {
+        if timeout {
+            // Long enough that the 3 bytes are in before it passes: a timeout before them would be
+            // a stall between messages, which the wait already ended.
+            a.q("SET statement_timeout = 1500").ok("timeout");
+        }
+        // The INSERT holds the implicit block's write lock while the COPY waits.
+        let mut r = copy_start(&mut a, "INSERT INTO ph VALUES (0); COPY ph FROM STDIN", b"1\n");
+        a.s.write_all(&message[..3]).unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        let started = Instant::now();
+        if !timeout {
+            let mut s = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+            let mut m = ((8 + key.len()) as i32).to_be_bytes().to_vec();
+            m.extend_from_slice(&80877102i32.to_be_bytes());
+            m.extend_from_slice(&key);
+            s.write_all(&m).unwrap();
+        }
+        a.read_into(&mut r, false);
+        let e = r.err(&format!("{what}: a COPY stalled inside a CopyData"));
+        assert_eq!((e.code.as_str(), e.message.as_str()), ("57014", why), "{what}");
+        assert!(started.elapsed() < Duration::from_secs(20), "{what}: {:?}", started.elapsed());
+        assert_eq!(r.status, b'I', "{what}");
+        let r2 = b.q("INSERT INTO ph2 VALUES (1)").ok(&format!("{what}: another session's write"));
+        assert_eq!(r2.tags, vec!["INSERT 0 1".to_string()]);
+        // The rest of the message and a CopyDone, which the ended COPY ignores.
+        a.s.write_all(&message[3..]).unwrap();
+        a.send(b'c', &[]);
+        if timeout {
+            a.q("RESET statement_timeout").ok("reset");
+        }
+        a.q("SELECT 1").ok(&format!("{what}: the session after"));
+    }
+    assert_eq!(a.q("SELECT count(*) FROM ph").single("count"), "0");
+    assert_eq!(a.q("SELECT count(*) FROM ph2").single("count"), "2");
 }
 
 /// COPY FROM a file with no file granted is 42501 before the table, its columns or its options are
