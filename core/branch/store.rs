@@ -7960,12 +7960,17 @@ impl StoreCore {
         // mechanism; no build a user links can. AD-T5's fire-check binary (PREREG-v1 amendment 2:
         // the one binary that may carry `fe-mutants`, whose readings fill no slot) runs it too
         // (engine-2bdcd32c6 MED 4: refused, every async_s0 arm was VOID at its warm-up). It is
-        // lifted by the compiler flag `--cfg fe_ad_t5_firecheck` (RUSTFLAGS), which only that
-        // binary's build sets (async_s0_firecheck.py), never by a cargo feature: a feature is
+        // lifted by the compiler flag `--cfg fe_ad_t5_firecheck` (with the `fe-mutants` feature),
+        // which only that binary's build sets (async_s0_firecheck.py), never by a cargo feature alone: a feature is
         // turned on by `--all-features`, a build every reader runs (lead ruling, artie DECISIONS
         // 66b4671687). Mutant `fire_check_build_refuses_async` (test and fe-mutants builds):
         // refused there too, as at da850ed1c.
-        if cfg!(not(test)) && (cfg!(not(fe_ad_t5_firecheck)) || fe_mutant("fire_check_build_refuses_async")) {
+        // The flag alone is not enough: it also reaches a build through --config,
+        // CARGO_TARGET_*_RUSTFLAGS, CARGO_ENCODED_RUSTFLAGS and RUSTFLAGS, so a build lifts the
+        // refusal only with BOTH the flag and the `fe-mutants` feature, the fire-check binary's
+        // pair (engine-rev-async addendum 2 L2, artie 50357d61c3).
+        let fire_check_build = cfg!(all(fe_ad_t5_firecheck, feature = "fe-mutants"));
+        if cfg!(not(test)) && (!fire_check_build || fe_mutant("fire_check_build_refuses_async")) {
             return Some("async creates are refused until the id floor lands (ASYNC-DESIGN §9): a lost id could be issued again");
         }
         let device_drained = match self.class {
