@@ -474,7 +474,7 @@ fn refuse_long_decimals(
     sql: &str,
     parse: &turso_pg_parser::pg_query::ParseResult,
 ) -> Result<()> {
-    if sql.bytes().filter(u8::is_ascii_digit).nth(15).is_none() {
+    if !may_hold_long_numeric(sql) {
         return Ok(());
     }
     let exempt = float_target_literals(pg_conn, parse);
@@ -485,6 +485,35 @@ fn refuse_long_decimals(
         ))),
         None => Ok(()),
     }
+}
+
+/// Whether `sql` may hold a numeric literal [`refuse_long_decimals`] refuses: a run of 16 or more
+/// characters that a numeric literal is spelled with (digits, hex digits, '_', '.', the radix
+/// letters), or an exponent (a digit, 'e' or 'E', a sign or a digit). A bound, never a judgment: a
+/// literal of more than 15 digits, a radix literal past int8 (0xFFFFFFFFFFFFFFFF has no 16
+/// decimal digits; wire-rev-1de981755-numeric HIGH-4) and an exponent past a double's range are
+/// each one of these; a statement with none is not scanned.
+fn may_hold_long_numeric(sql: &str) -> bool {
+    let b = sql.as_bytes();
+    let mut run = 0usize;
+    for (i, &c) in b.iter().enumerate() {
+        if c.is_ascii_hexdigit() || matches!(c, b'_' | b'.' | b'x' | b'X' | b'o' | b'O') {
+            run += 1;
+            if run >= 16 {
+                return true;
+            }
+        } else {
+            run = 0;
+        }
+        if matches!(c, b'e' | b'E')
+            && i > 0
+            && (b[i - 1].is_ascii_digit() || b[i - 1] == b'.')
+            && b.get(i + 1).is_some_and(|n| n.is_ascii_digit() || matches!(n, b'+' | b'-'))
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// The byte offsets of the numeric literals an INSERT VALUES item or an UPDATE SET source assigns

@@ -235,16 +235,28 @@ pub fn long_decimal_literal(sql: &str, exempt: &[usize]) -> Option<String> {
             _ => false,
         }
     };
-    // An operand ends with one of these, so a '-' after one is a subtraction, not a sign.
-    let ends_operand = |k: Token| {
-        matches!(k, Token::Iconst | Token::Fconst | Token::Sconst | Token::Ident | Token::Ascii41 | Token::Param)
+    // A '-' is a sign only after a token that cannot end an operand: an allowlist (an operator, an
+    // opening parenthesis, a comma, or a keyword that a value follows). After anything else (a
+    // keyword operand such as a type name, NULL or END) it is a subtraction, and the literal is
+    // judged unsigned, so the refusal errs loud (wire-rev-1de981755-numeric HIGH-5: 2^63 after
+    // b::bigint passed as int8's least).
+    let unary_after = |k: Token| {
+        matches!(
+            k,
+            Token::Ascii40 | Token::Ascii44 | Token::Ascii37 | Token::Ascii42 | Token::Ascii43 | Token::Ascii45
+                | Token::Ascii47 | Token::Ascii60 | Token::Ascii61 | Token::Ascii62 | Token::Ascii94
+                | Token::Op | Token::LessEquals | Token::GreaterEquals | Token::NotEquals
+                | Token::Select | Token::Where | Token::And | Token::Or | Token::Not | Token::When
+                | Token::Then | Token::Else | Token::Limit | Token::Offset | Token::Having | Token::On
+                | Token::By | Token::Between | Token::Returning
+        )
     };
     for (i, kind) in kinds.iter().enumerate() {
         if *kind != Token::Fconst {
             continue;
         }
         // A unary minus is part of the literal's value (-0x8000000000000000 is int8's least).
-        let signed = i >= 1 && kinds[i - 1] == Token::Ascii45 && (i < 2 || !ends_operand(kinds[i - 2]));
+        let signed = i >= 1 && kinds[i - 1] == Token::Ascii45 && (i < 2 || unary_after(kinds[i - 2]));
         let value = if signed { format!("-{}", text(i)) } else { text(i).to_string() };
         if !translator::decimal_past_float8(&value) {
             continue;

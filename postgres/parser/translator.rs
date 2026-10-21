@@ -6289,7 +6289,16 @@ pub fn decimal_past_float8(text: &str) -> bool {
         return false;
     }
     let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
-    digits.trim_start_matches('0').trim_end_matches('0').len() > 15
+    let significant = digits.trim_start_matches('0').trim_end_matches('0');
+    if significant.len() > 15 {
+        return true;
+    }
+    // At most 15 digits round-trip through a double only inside its normal range: 1e400 is
+    // Infinity and 1e-400 is 0 as a REAL (wire-rev-1de981755-numeric HIGH-6).
+    match body.parse::<f64>() {
+        Ok(v) => !significant.is_empty() && (!v.is_finite() || v.abs() < f64::MIN_POSITIVE),
+        Err(_) => false,
+    }
 }
 
 /// A numeric literal as libpg_query hands it (an integer past int4 arrives as text, not Ival), in

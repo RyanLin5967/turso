@@ -6237,6 +6237,16 @@ fn pg_bytes_to_value(bytes: &[u8], pg_type: &Type) -> PgWireResult<Value> {
                     format!("numeric value {trimmed} is not supported: more than 15 significant digits would be rounded"),
                 )));
             }
+            // An integer-shaped numeric is the integer, never an f64: '9007199254740993' was
+            // stored ...992 (wire-rev-1de981755-numeric HIGH-2).
+            if *pg_type == Type::NUMERIC {
+                let body = trimmed.strip_prefix(['+', '-']).unwrap_or(trimmed);
+                if !body.is_empty() && body.bytes().all(|b| b.is_ascii_digit()) {
+                    if let Ok(i) = trimmed.parse::<i64>() {
+                        return Ok(Value::from_i64(i));
+                    }
+                }
+            }
             let f: f64 = trimmed.parse().map_err(|_| syntax(name))?;
             // The engine holds no NaN: a float NaN is stored as NULL, so a bound NaN is refused,
             // as the literal is (PGDIV-NAN; wire-rev-7128c6f73 MED-3: 'NaN' read null).
