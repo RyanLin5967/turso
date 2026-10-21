@@ -151,6 +151,28 @@ pub(crate) fn cast_applies_type(schema: &Schema, ty: &ast::Type) -> bool {
     }
 }
 
+/// The custom type the typed `operands` share (by their operator type, `Schema::operator_type_of`),
+/// unconstrained; None when none is typed or two disagree.
+fn common_type_of(
+    operands: &[&ast::Expr],
+    referenced_tables: &TableReferences,
+    schema: &Schema,
+    values: bool,
+) -> Option<(std::sync::Arc<crate::schema::TypeDef>, std::vec::Vec<Box<ast::Expr>>)> {
+    let mut common: Option<std::sync::Arc<crate::schema::TypeDef>> = None;
+    for operand in operands {
+        if let Some((t, _)) = custom_type_of(operand, referenced_tables, schema, values) {
+            let t = schema.operator_type_of(&t);
+            match &common {
+                Some(c) if !c.name.eq_ignore_ascii_case(&t.name) => return None,
+                Some(_) => {}
+                None => common = Some(t),
+            }
+        }
+    }
+    common.map(|t| (t, std::vec::Vec::new()))
+}
+
 /// `expr_custom_type` (`values` false) or `expr_value_type` (`values` true).
 fn custom_type_of(
     expr: &ast::Expr,
@@ -217,6 +239,32 @@ fn custom_type_of(
                 .filter(|(t, _)| defines(t))
                 .or_else(|| right.filter(|(t, _)| defines(t)))?;
             Some((type_def, std::vec::Vec::new()))
+        }
+        // A function that yields one of its operands, coalesce/ifnull, nullif's first, a CASE's
+        // results, yields their type when the typed ones agree (the others being constants or
+        // untyped, as `coalesce(b, 0)`), as PostgreSQL resolves the common type (engine-rev-types-
+        // 08caaec44 MED 6: `coalesce(b, 0) > 5` compared the numeric text with 5). Unconstrained:
+        // no parameters. Mutant `function_of_type_untyped` (test builds only): None, as before.
+        ast::Expr::FunctionCall { name, args, .. }
+            if !args.is_empty()
+                && (name.as_str().eq_ignore_ascii_case("coalesce")
+                    || name.as_str().eq_ignore_ascii_case("ifnull")
+                    || name.as_str().eq_ignore_ascii_case("nullif"))
+                && !crate::branch::store::fe_mutant("function_of_type_untyped") =>
+        {
+            let operands: std::vec::Vec<&ast::Expr> = if name.as_str().eq_ignore_ascii_case("nullif") {
+                std::vec![args[0].as_ref()]
+            } else {
+                args.iter().map(|a| a.as_ref()).collect()
+            };
+            common_type_of(&operands, referenced_tables, schema, values)
+        }
+        ast::Expr::Case { when_then_pairs, else_expr, .. } if !crate::branch::store::fe_mutant("function_of_type_untyped") => {
+            let mut operands: std::vec::Vec<&ast::Expr> = when_then_pairs.iter().map(|(_, then)| then.as_ref()).collect();
+            if let Some(e) = else_expr {
+                operands.push(e.as_ref());
+            }
+            common_type_of(&operands, referenced_tables, schema, values)
         }
         ast::Expr::Parenthesized(inner) if inner.len() == 1 => {
             custom_type_of(&inner[0], referenced_tables, schema, values)
