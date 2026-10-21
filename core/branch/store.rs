@@ -3827,7 +3827,9 @@ fn run_links_fill(shared: &StoreMutex, writer: &Mutex<Catalog>, group: &Group, m
     };
     let resumed = if fe_mutant("l4_fill_cursor_forgotten") { Ok(None) } else { writer.lock().fill_cursor() };
     match resumed {
-        Ok(Some((g, at, done))) if g == generation => {
+        // Mutant `l4_fill_generation_ignored` (test builds only; h1gap-rev-c MED-2, its REV_IGNORE_GEN): the
+        // cursor is resumed whatever checkpoint committed since, so rows changed behind it keep stale links.
+        Ok(Some((g, at, done))) if g == generation || fe_mutant("l4_fill_generation_ignored") => {
             // A cursor exists, so the columns do: recorded before the store mutex is asked for.
             made.store(true, Ordering::Release);
             let mut inner = shared.lock();
