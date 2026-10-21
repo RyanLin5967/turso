@@ -17496,6 +17496,34 @@ fn a_string_parameter_assigned_to_another_category_is_42804() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// numfuzz (its shard of seeds 21-220 at e4882aaed, PG 18.6's answers in its findings, artie 7ba22e107a; seeds 28, 40,
+/// 107, 155, 164): a numeric function or operator PostgreSQL has no candidate for is 42883, never answered: ceil, floor,
+/// round and trunc over an integer resolve to float8, which has no %, round and trunc with a scale take no float, and
+/// none of them takes text. Each was answered over the float or the text.
+#[test]
+fn a_numeric_function_or_operator_without_a_candidate_is_42883() {
+    let dir = Scratch::new("num-resolve");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in ["CREATE TABLE nt (id int PRIMARY KEY, c0 double precision, c1 real, c2 smallint)", "INSERT INTO nt VALUES (1, 1.5, 2.5, 3)"] {
+        a.q(sql).ok(sql);
+    }
+    let mut wrong = Vec::new();
+    for (sql, message) in [
+        ("SELECT (-(ceil((-2147483648))) % 03747330.66) AS u FROM (SELECT id, c0, c1 FROM nt) s ORDER BY id", "operator does not exist: double precision % numeric"),
+        ("UPDATE nt SET c0 = round(-(((-9223372036854775808))::float8), -2) WHERE id = 1", "function round(double precision, integer) does not exist"),
+        ("SELECT id, (c2 * round(((-32768) + c1), 1)) AS v FROM nt ORDER BY id", "function round(double precision, integer) does not exist"),
+        ("SELECT ceil((NUMERIC '-7')::text) AS v", "function ceil(text) does not exist"),
+        ("WITH w AS (SELECT ('1e5'::numeric % (floor(40.18837110340))::text) AS v) SELECT v, v AS u FROM w", "operator does not exist: numeric % text"),
+    ] {
+        let r = a.q(sql);
+        if !r.error.as_ref().is_some_and(|e| e.code == "42883" && e.message == message) {
+            wrong.push(format!("{sql}: PG 42883 {message}; got {:?} {:?}", r.rows, r.error));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// wire-rev-351702a43 LOW-6 (its PG 18.6 probe3 #161): a CASE is typed by its results (an int4 constant and an int4
 /// function: 23); the walk never typed a CASE column, and the engine announced it text (25).
 #[test]
