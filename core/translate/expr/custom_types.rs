@@ -3598,4 +3598,52 @@ mod tests {
         bad.extend(diverging(&conn, &[("SELECT id, c3 FROM tr ORDER BY id", "1,1.50;2,1.50")], "PostgreSQL 18"));
         assert!(bad.is_empty(), "CLAIM: ALTER TABLE ADD COLUMN checked a domain DEFAULT unlike PostgreSQL: {bad:#?}");
     }
+
+    /// The reviewer's helper (engine-rev-types-08caaec44, artie 8319b0a45e,
+    /// frontier/fastest/reviews/raw-engine-types-08caaec44/zz_rev08c.rs.txt): runs `setup`, then
+    /// each case as `diverging` does, naming PostgreSQL 18.6 as the oracle.
+    fn diverging_after(conn: &Arc<crate::Connection>, setup: &[&str], cases: &[(&str, &str)]) -> Vec<String> {
+        for sql in setup {
+            conn.execute(sql).unwrap();
+        }
+        let mut bad = Vec::new();
+        for (sql, want) in cases {
+            let got = conn.prepare(*sql).and_then(|mut s| s.run_collect_rows()).map(|rows| {
+                rows.iter()
+                    .map(|r| r.iter().map(|v| if matches!(v, Value::Null) { "NULL".to_string() } else { v.to_string() }).collect::<Vec<_>>().join(","))
+                    .collect::<Vec<_>>()
+                    .join(";")
+            }).map_err(|e| e.to_string());
+            if got.as_deref() != Ok(*want) {
+                bad.push(format!("{sql} gave {got:?}, not PostgreSQL 18.6's {want:?}"));
+            }
+        }
+        bad
+    }
+
+    /// The reviewer's numeric(8, 2) fixture.
+    const REV08C_N: [&str; 2] = [
+        "CREATE TABLE n(id INTEGER PRIMARY KEY, b numeric(8, 2)) STRICT",
+        "INSERT INTO n VALUES (1, 1.00), (2, 2.00), (3, NULL), (4, 10.00), (5, 9.50), (6, -3.25)",
+    ];
+
+    /// Adopted verbatim from engine-rev-types-08caaec44 (artie 8319b0a45e,
+    /// frontier/fastest/reviews/REVIEW-engine-types-08caaec44.md and raw-engine-types-08caaec44/
+    /// zz_rev08c.rs.txt); its expected values are that review's PostgreSQL 18.6 recordings
+    /// (raw-engine-types-08caaec44/p*.pgout.txt), never ours.
+    /// HIGH 1: a derived relation's column of CAST(x AS numeric(8, 3)) sums, orders and takes its
+    /// extremes as numeric, as the same CAST does directly (the first two cases are the controls).
+    #[test]
+    fn rev08c_a_derived_cast_to_numeric_sums_and_orders_as_numeric() {
+        let conn = open();
+        let bad = diverging_after(&conn, &REV08C_N, &[
+            ("SELECT sum(CAST(b AS numeric(8, 3))) FROM n", "19.250"),
+            ("SELECT id FROM n WHERE b IS NOT NULL ORDER BY CAST(b AS numeric(8, 3))", "6;1;2;5;4"),
+            ("SELECT sum(x) FROM (SELECT CAST(b AS numeric(8, 3)) AS x FROM n) s", "19.250"),
+            ("WITH s AS MATERIALIZED (SELECT CAST(b AS numeric(8, 3)) AS x FROM n) SELECT sum(x) FROM s", "19.250"),
+            ("SELECT id FROM (SELECT id, CAST(b AS numeric(8, 3)) AS x FROM n WHERE b IS NOT NULL) s ORDER BY x", "6;1;2;5;4"),
+            ("SELECT id FROM (SELECT id, CAST(b AS numeric(8, 3)) AS x FROM n WHERE b IS NOT NULL) s ORDER BY x DESC LIMIT 1", "4"),
+        ]);
+        assert!(bad.is_empty(), "CLAIM: a derived CAST to numeric did not sum or order as numeric: {bad:#?}");
+    }
 }
