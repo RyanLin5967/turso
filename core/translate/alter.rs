@@ -2036,6 +2036,51 @@ pub fn translate_alter_table(
                     (rewrites_physical_layout, Some(replacement_column))
                 }
             };
+            // A retype to, from or between custom types changes how the column's values are
+            // stored and checked (numeric(8, 2) to a domain with a CHECK, INTEGER to numeric's
+            // encoding), and this ALTER rewrites only the declaration, so over existing rows it is
+            // refused instead of leaving rows the new type neither holds nor checks
+            // (engine-rev-types-08caaec44 MED 7: -1.00 stayed under CHECK (VALUE > 0), and an
+            // INTEGER column retyped to numeric read "numeric_decode: expected blob"). PostgreSQL
+            // converts and checks the rows; on an empty table the declaration alone changes.
+            // Mutant `alter_column_retype_unchecked` (test builds only): accepted, as before.
+            if let Some(replacement) = replacement_column.as_ref() {
+                let typed = |c: &Column| {
+                    resolver.schema().get_type_def(&c.ty_str, btree.is_strict).map(|t| {
+                        (
+                            crate::schema::type_key(&t.name),
+                            c.ty_params.iter().map(|p| p.to_string()).collect::<Vec<_>>(),
+                        )
+                    })
+                };
+                let old_type = typed(&btree.columns()[column_index]);
+                let new_type = typed(replacement);
+                if old_type != new_type
+                    && (old_type.is_some() || new_type.is_some())
+                    && !crate::branch::store::fe_mutant("alter_column_retype_unchecked")
+                {
+                    let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(original_btree.clone()));
+                    program.emit_insn(Insn::OpenRead {
+                        cursor_id,
+                        root_page: original_btree.root_page,
+                        db: database_id,
+                    });
+                    let empty = program.allocate_label();
+                    program.emit_insn(Insn::Rewind {
+                        cursor_id,
+                        pc_if_empty: empty,
+                    });
+                    program.emit_insn(Insn::Halt {
+                        err_code: 1,
+                        description: format!(
+                            "cannot change column \"{from}\" to or from a custom type while the table has rows"
+                        ),
+                        on_error: None,
+                        description_reg: None,
+                    });
+                    program.preassign_label_to_next_insn(empty);
+                }
+            }
             let clears_autoincrement_sequence = !rename
                 && btree.has_autoincrement
                 && btree.columns()[column_index].is_rowid_alias()
