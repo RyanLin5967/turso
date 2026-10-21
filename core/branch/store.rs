@@ -9422,6 +9422,16 @@ impl Drop for BranchStore {
         // again from the first row.
         self.stop_links_fill();
         self.join_flights();
+        // h1gap-rev-c HIGH-3: a fill that completed with no operation after it (a session that wrote in a
+        // burst and went idle) leaves the flip owed, and nothing else would start it before the process
+        // exits: the close runs it. Prefilled, it only flips the meta row and relinks around its own
+        // changes. Mutant `l4_no_flip_at_close` (test builds only): not run, as before.
+        let flip_owed = self.inner.lock().cat.as_ref().is_some_and(|c| c.links_prefilled && !c.catalog.links_valid());
+        if flip_owed && !fe_mutant("l4_no_flip_at_close") {
+            if let Err(e) = self.compact_now() {
+                tracing::warn!("branch catalog upgrade not flipped at close: {e}");
+            }
+        }
         // The name filter's build holds the store's files too: stopped, then joined.
         self.name_filter_stop.store(true, Ordering::Release);
         self.wait_name_filter();
