@@ -325,16 +325,19 @@ fn ls_superseded_child() {
     // until a second fill has started.
     let (past, peak) = fork_past_hard_and_cut(&db, &trunk, &path);
     let cut = log_present(&path) < peak;
+    // On until a later fill has started and is the store's running one (filling), so the first, let go next, is
+    // superseded by a live fill (FLAGGED repair, amendment 24 on iccad13: let go while no fill was running, the
+    // first fill ended as any stopped fill does, and the mutant survived).
     let mut k = 0;
-    while db.branches.links_fill_state_for_test().2 < 2 && k < 20_000 {
+    while !(db.branches.links_fill_state_for_test().2 >= 2 && db.branches.links_fill_state_for_test().0) && k < 20_000 {
         let _ = trunk.fork_branch().unwrap().into_id();
         k += 1;
     }
-    let starts = db.branches.links_fill_state_for_test().2;
+    let (filling, _, starts) = db.branches.links_fill_state_for_test();
     super::store::LINKS_FILL_HOLD_UNRECORDED.store(false, Ordering::Release);
     std::thread::sleep(std::time::Duration::from_secs(2));
     let superseded = super::store::LINKS_FILL_SUPERSEDED_BATCHES.load(Ordering::Acquire) - sup0;
-    println!("LS-SUP held={held_first} past={} cut={} starts={starts} superseded={superseded}", u64::from(past), u64::from(cut));
+    println!("LS-SUP held={held_first} past={} cut={} starts={starts} superseded={superseded} filling={}", u64::from(past), u64::from(cut), u64::from(filling));
 }
 
 /// h1-rev-72bfb0127 LOW-3: a fill that a later spawn superseded (past the hard limit the gate stops a fill and a
@@ -350,7 +353,8 @@ fn past_the_hard_log_limit_a_superseded_fill_starts_no_batch() {
     let text = child("ls_superseded_child", &[]);
     let r = readings(&text, "LS-SUP ");
     assert_eq!(r.len(), 1, "premise: the child reported:\n{text}");
-    let (held, past, cut, starts, superseded) = (r[0][0], r[0][1], r[0][2], r[0][3], r[0][4]);
+    let (held, past, cut, starts, superseded, filling) = (r[0][0], r[0][1], r[0][2], r[0][3], r[0][4], r[0][5]);
+    assert_eq!(filling, 1, "premise: no later fill was running when the first was let go");
     println!("LS superseded: held {held} past {past} cut {cut} starts {starts} superseded batches {superseded}");
     assert!(held >= 1, "premise: the first fill's batch was not held");
     assert_eq!((past, cut), (1, 1), "premise: the store did not pass the hard limit and cut its log (past {past}, cut {cut})");
