@@ -2539,11 +2539,26 @@ pub fn translate_expr(
                             // (ALTER TABLE ADD COLUMN) return NULL.  Use
                             // ColumnHasField to detect short records and compute
                             // ENCODE(DEFAULT) at runtime via bytecode.
-                            if let Some(type_def) = resolver
-                                .schema()
-                                .get_type_def(&column.ty_str, table.is_strict())
-                            {
-                                if type_def.encode().is_some() {
+                            // The ENCODEs of the column's whole type chain, as the suppression above
+                            // reads it: a domain over numeric has none of its own (lead ruling on
+                            // engine review 2bdcd32c6 HIGH 8: a short record of such a column read
+                            // NULL). Mutant `alter_domain_default_unchecked` (test builds only):
+                            // the column's own type alone, as before.
+                            let chain = if crate::branch::store::fe_mutant("alter_domain_default_unchecked") {
+                                resolver
+                                    .schema()
+                                    .get_type_def(&column.ty_str, table.is_strict())
+                                    .map(|td| std::vec![td.clone()])
+                            } else {
+                                resolver
+                                    .schema()
+                                    .resolve_type(&column.ty_str, table.is_strict())
+                                    .ok()
+                                    .flatten()
+                                    .map(|resolved| resolved.chain.iter().cloned().collect::<std::vec::Vec<_>>())
+                            };
+                            if let Some(chain) = chain {
+                                if chain.iter().any(|td| td.encode().is_some()) {
                                     if let Some(ref default_expr) = column.default {
                                         // Reconstruct the cursor id used for reading
                                         let read_cursor = if read_from_index {
@@ -2570,16 +2585,18 @@ pub fn translate_expr(
                                             resolver,
                                             NoConstantOptReason::RegisterReuse,
                                         )?;
-                                        if let Some(encode_expr) = type_def.encode() {
-                                            emit_type_expr(
-                                                program,
-                                                encode_expr,
-                                                target_register,
-                                                target_register,
-                                                column,
-                                                type_def,
-                                                resolver,
-                                            )?;
+                                        for type_def in &chain {
+                                            if let Some(encode_expr) = type_def.encode() {
+                                                emit_type_expr(
+                                                    program,
+                                                    encode_expr,
+                                                    target_register,
+                                                    target_register,
+                                                    column,
+                                                    type_def,
+                                                    resolver,
+                                                )?;
+                                            }
                                         }
                                         program.preassign_label_to_next_insn(done_label);
                                     }

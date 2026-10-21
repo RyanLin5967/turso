@@ -16,7 +16,7 @@ use crate::{
     translate::{
         emitter::{emit_check_constraints, gencol::compute_virtual_columns, Resolver},
         expr::{translate_expr, walk_expr, walk_expr_mut, WalkControl},
-        plan::{ColumnMask, ColumnUsedMask, OuterQueryReference, TableReferences},
+        plan::{ColumnMask, ColumnUsedMask, JoinedTable, Operation, OuterQueryReference, TableReferences},
         trigger::create_trigger_to_sql,
     },
     util::{
@@ -792,12 +792,15 @@ fn emit_add_column_check_validation(
     let base_dest_reg = program.alloc_registers(layout.column_count());
     for (idx, table_column) in table.columns().iter().enumerate() {
         if idx == new_column_idx {
-            translate_expr(
+            // Each row's register is ENCODEd in place below (a domain's CHECK), so the DEFAULT is
+            // not hoisted into a constant register the next row would read encoded again.
+            crate::translate::expr::translate_expr_no_constant_opt(
                 program,
                 None,
                 &default_expr,
                 layout.to_register(base_dest_reg, idx),
                 resolver,
+                crate::translate::expr::NoConstantOptReason::RegisterReuse,
             )?;
             continue;
         }
@@ -811,30 +814,91 @@ fn emit_add_column_check_validation(
         );
     }
 
+    // A domain's CHECK reads the domain's value, as an INSERT's does (lead ruling on engine review
+    // 2bdcd32c6 HIGH 8: 323655cfe covered INSERT and UPDATE, not this): the DEFAULT is ENCODEd
+    // for the new column as an INSERT stores it (0.001 under numeric(8, 2) is 0.00), and the
+    // domain's CHECKs run over the table's columns (`referenced_tables`), so their column is read
+    // DECODEd and compared through the base type's operators (`emit_check_constraint_bytecode`).
+    // Only a row takes the DEFAULT, so an empty table checks nothing, as in PostgreSQL 18.6. Other
+    // CHECKs are unchanged. Mutant `alter_domain_default_unchecked` (test builds only): every
+    // CHECK as before, over the DEFAULT as given.
+    let (domain_checks, other_checks): (Vec<CheckConstraint>, Vec<CheckConstraint>) = new_checks
+        .iter()
+        .cloned()
+        .partition(|c| c.domain.is_some() && btree.is_strict && !crate::branch::store::fe_mutant("alter_domain_default_unchecked"));
+    if !domain_checks.is_empty() {
+        let mut only = ColumnMask::default();
+        only.set(new_column_idx)?;
+        crate::translate::expr::emit_custom_type_encode_columns(
+            program,
+            resolver,
+            table.columns(),
+            base_dest_reg,
+            Some(&only),
+            table.name.as_str(),
+            &layout,
+        )?;
+    }
+
     let dml_ctx = DmlColumnContext::layout(table.columns(), base_dest_reg, rowid_reg, layout);
     if table.columns().iter().any(|c| c.is_virtual_generated()) {
         let table_arc = Arc::new(table.clone());
         compute_virtual_columns(program, &table.columns_topo_sort()?, &dml_ctx, resolver, &table_arc)?;
     }
 
-    let mut check_resolver = resolver.fork();
     let skip_row_label = program.allocate_label();
-    emit_check_constraints(
-        program,
-        &new_checks,
-        &mut check_resolver,
-        table.name.as_str(),
-        rowid_reg,
+    let column_regs = || {
         table
             .columns()
             .iter()
             .enumerate()
-            .filter_map(|(idx, col)| col.name.as_deref().map(|name| (name, dml_ctx.to_column_reg(idx)))),
-        connection,
-        ast::ResolveType::Abort,
-        skip_row_label,
-        None,
-    )?;
+            .filter_map(|(idx, col)| col.name.as_deref().map(|name| (name, dml_ctx.to_column_reg(idx))))
+    };
+    if !other_checks.is_empty() {
+        let mut check_resolver = resolver.fork();
+        emit_check_constraints(
+            program,
+            &other_checks,
+            &mut check_resolver,
+            table.name.as_str(),
+            rowid_reg,
+            column_regs(),
+            connection,
+            ast::ResolveType::Abort,
+            skip_row_label,
+            None,
+        )?;
+    }
+    if !domain_checks.is_empty() {
+        let refs = TableReferences::new(
+            vec![JoinedTable {
+                table: Table::BTree(Arc::new(table.clone())),
+                identifier: normalize_ident(table.name.as_str()),
+                internal_id: program.table_reference_counter.next(),
+                op: Operation::default_scan_for(&Table::BTree(Arc::new(table.clone()))),
+                join_info: None,
+                col_used_mask: ColumnUsedMask::default(),
+                column_use_counts: Vec::new(),
+                expression_index_usages: Vec::new(),
+                database_id,
+                indexed: None,
+            }],
+            vec![],
+        );
+        let mut check_resolver = resolver.fork();
+        emit_check_constraints(
+            program,
+            &domain_checks,
+            &mut check_resolver,
+            table.name.as_str(),
+            rowid_reg,
+            column_regs(),
+            connection,
+            ast::ResolveType::Abort,
+            skip_row_label,
+            Some(&refs),
+        )?;
+    }
     program.preassign_label_to_next_insn(skip_row_label);
 
     program.emit_insn(Insn::Next {
