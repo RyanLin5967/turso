@@ -16356,6 +16356,65 @@ fn a_bound_nan_is_refused_never_stored_as_null() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// wire-rev-4a1934c89-beb4 MED-3, MED-4, MED-5 (its PG 18.6 probe #142-#158, probe2 #24-#45, #268, #270): a quoted
+/// "Public" on the search path names no schema (public is lower case), so v resolves past it to s1.v, and alone it
+/// leaves v unresolved (42P01); ours read and wrote public.v. An unqualified CREATE TABLE is made in the first schema of
+/// the path that exists, and with none it is 3F000; ours always made it in public. pg_catalog and information_schema
+/// are found whatever the path names; under a path naming nothing they vanished (42601 'no such object').
+#[test]
+fn the_search_path_is_read_as_written_for_public_create_and_the_catalog() {
+    let dir = Scratch::new("search-path-written");
+    // The branch server refuses CREATE SCHEMA: the schema is made by the CLI first.
+    cli_script(
+        &dir,
+        b"CREATE TABLE v(a int, d text);\n\
+          INSERT INTO v VALUES (1, 'pub');\n\
+          CREATE SCHEMA s1;\n\
+          CREATE TABLE s1.v(a int, d text);\n\
+          INSERT INTO s1.v VALUES (1, 'lower');\n",
+    );
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let mut wrong = Vec::new();
+    a.q("SET search_path TO \"Public\", s1").ok("path");
+    let r = a.q("SELECT d FROM v");
+    if r.rows != vec![vec![Some("lower".to_string())]] {
+        wrong.push(format!("\"Public\", s1: v read {:?} {:?}, PostgreSQL s1.v ('lower')", r.rows, r.error));
+    }
+    a.q("INSERT INTO v VALUES (34, 'ins')").ok("insert");
+    a.q("SET search_path TO public").ok("reset");
+    let r = a.q("SELECT (SELECT count(*) FROM s1.v), (SELECT count(*) FROM public.v)");
+    if r.rows != vec![vec![Some("2".to_string()), Some("1".to_string())]] {
+        wrong.push(format!("the INSERT under \"Public\", s1 landed: s1.v, public.v counts {:?}, PostgreSQL 2, 1", r.rows));
+    }
+    a.q("SET search_path TO \"Public\"").ok("path");
+    let r = a.q("SELECT d FROM v");
+    if r.error.as_ref().map(|e| e.code.as_str()) != Some("42P01") {
+        wrong.push(format!("\"Public\" alone: rows {:?} error {:?}, PostgreSQL 42P01", r.rows, r.error));
+    }
+    a.q("SET search_path TO s1").ok("path");
+    a.q("CREATE TABLE made_in_s1(a int)").ok("create under s1");
+    a.q("SET search_path TO public").ok("reset");
+    if a.q("SELECT count(*) FROM s1.made_in_s1").error.is_some() {
+        wrong.push("CREATE TABLE under search_path s1 did not make s1.made_in_s1".to_string());
+    }
+    if a.q("SELECT count(*) FROM public.made_in_s1").error.is_none() {
+        wrong.push("CREATE TABLE under search_path s1 made public.made_in_s1".to_string());
+    }
+    a.q("SET search_path TO \"nosuch\"").ok("path");
+    let r = a.q("CREATE TABLE nowhere(a int)");
+    if !r.error.as_ref().is_some_and(|e| e.code == "3F000" && e.message == "no schema has been selected to create in") {
+        wrong.push(format!("CREATE TABLE under a path naming nothing: {:?}, PostgreSQL 3F000", r.error));
+    }
+    for sql in ["SELECT count(*) > 0 FROM pg_catalog.pg_class", "SELECT count(*) > 0 FROM information_schema.tables"] {
+        let r = a.q(sql);
+        if r.error.is_some() || r.rows != vec![vec![Some("t".to_string())]] {
+            wrong.push(format!("{sql} under \"nosuch\": rows {:?} error {:?}, PostgreSQL t", r.rows, r.error));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// wire-rev-4a1934c89-beb4 MED-7 and MED-2 (its PG 18.6 probe #284, #290): now() and transaction_timestamp() are the
 /// transaction's start, the same in every statement of a block; statement_timestamp() is the statement's start; and
 /// clock_timestamp() is read at each call. now() was read at each call (two statements of one block stored two values),
