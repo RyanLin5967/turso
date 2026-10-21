@@ -880,6 +880,11 @@ def self_test():
     # hosts refuse the private PID namespace that let iccad11 run the branch live. Blind spot, stated: if the load was
     # triggered BY the self-test's own processes (the uid-0 s1-agent reacting to them, say), it is another uid's, so it
     # reads N/A here, not FAIL. On T3 that changes nothing: --require-all refuses any N/A.
+    # A SAME-SHAPE INSTANCE, MEASURED with reasons (ecetesla4, 2026-10-21, raw linux-fc2fix-ecetesla4-void): a VALID
+    # baseline at load 2.3, then the child case VOIDed on rule 1 ("foreign CPU > 100% in 3 of 20 ticks"), the named
+    # processes being short-lived git of OUR uid with run unknown (exited before the stop) plus another uid's s1-agent.
+    # late_busy rightly kept only s1-agent, which alone did not explain the VOID, so it read FAIL. That shows one
+    # mechanism for the eceubuntu4 FAIL; it does not prove that one was the same.
     # LATE LOAD (found 2026-10-21 on eceubuntu4, raws linux-f6gate/linux-f6cal): the quiet baseline passed, then load
     # that arrived later VOIDed a VALID-wanting live case, which read FAIL ("SUT burners only: want VALID, got VOID")
     # attributed to the host (UNEXPLAINED, above). Such a case is N/A-on-busy-host only on evidence that cannot be
