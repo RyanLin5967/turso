@@ -578,15 +578,22 @@ pub fn computed_targets(parse: &ParseResult) -> Vec<bool> {
         match node.node.as_ref() {
             Some(Node::ColumnRef(c)) => !top
                 && !matches!(c.fields.last().and_then(|f| f.node.as_ref()), Some(Node::AStar(_))),
+            // An integer literal past int4 (pg_query gives it as a float's text) is an int8, a
+            // boolean literal a boolean, and a parameter its context's type, inside a computed
+            // column (wire-rev-1de981755-rest HIGH-1: CASE ... THEN 1 ELSE 3000000000 is int8).
             Some(Node::AConst(c)) => {
-                !top && (c.isnull || matches!(c.val, Some(Val::Ival(_) | Val::Sval(_))))
+                !top && (c.isnull
+                    || matches!(&c.val, Some(Val::Ival(_) | Val::Sval(_) | Val::Boolval(_)))
+                    || matches!(&c.val, Some(Val::Fval(f)) if integer_literal_type(&f.fval).is_some()))
             }
+            Some(Node::ParamRef(_)) => !top,
             Some(Node::AExpr(e)) => {
                 e.kind() == AExprKind::AexprOp
                     && matches!(
                         e.name.as_slice(),
                         [op] if matches!(op.node.as_ref(),
-                            Some(Node::String(s)) if matches!(s.sval.as_str(), "+" | "-" | "*" | "/" | "%"))
+                            Some(Node::String(s)) if matches!(s.sval.as_str(), "+" | "-" | "*" | "/" | "%")
+                                || (!top && s.sval == "||"))
                     )
                     && e.lexpr.as_deref().is_none_or(|l| plain(l, false))
                     && e.rexpr.as_deref().is_some_and(|r| plain(r, false))
@@ -606,6 +613,9 @@ pub fn computed_targets(parse: &ParseResult) -> Vec<bool> {
                     _ => false,
                 }) && c.defresult.as_deref().is_none_or(|d| plain(d, false))
             }
+            // COALESCE, GREATEST and LEAST are typed by their arguments as a CASE is by its results.
+            Some(Node::CoalesceExpr(c)) => c.args.iter().all(|a| plain(a, false)),
+            Some(Node::MinMaxExpr(m)) => m.args.iter().all(|a| plain(a, false)),
             // An operand cast to a type the walk names (2::int2 in 2::int2 + 2::int2 is int2, where
             // the engine's INTEGER announced int4; wire-rev-cfdebc06d LOW-5).
             Some(Node::TypeCast(c)) => {
@@ -1056,10 +1066,6 @@ enum Arithmetic {
 /// date int4, date +/- an integer date, an integer + date date, timestamp(tz) - timestamp(tz)
 /// interval. A character or boolean operand has no arithmetic operator.
 fn arithmetic(op: &str, a: u32, b: u32) -> Arithmetic {
-    const DATE: u32 = 1082;
-    const TIMESTAMP: u32 = 1114;
-    const TIMESTAMPTZ: u32 = 1184;
-    const INTERVAL: u32 = 1186;
     let int = |t: u32| matches!(t, INT2 | INT4 | INT8);
     let num = |t: u32| int(t) || matches!(t, NUMERIC | FLOAT4 | FLOAT8);
     let chars = |t: u32| matches!(t, TEXT | VARCHAR | BOOL | 1042);
@@ -1107,8 +1113,95 @@ fn type_name(t: u32) -> &'static str {
         BOOL => "boolean",
         1042 => "character",
         1082 => "date",
+        NAME => "name",
+        17 => "bytea",
+        TIME => "time without time zone",
+        TIMETZ => "time with time zone",
+        TIMESTAMP => "timestamp without time zone",
+        TIMESTAMPTZ => "timestamp with time zone",
+        INTERVAL => "interval",
         _ => "unknown",
     }
+}
+
+const DATE: u32 = 1082;
+const TIME: u32 = 1083;
+const TIMETZ: u32 = 1266;
+const TIMESTAMP: u32 = 1114;
+const TIMESTAMPTZ: u32 = 1184;
+const INTERVAL: u32 = 1186;
+
+/// A type's category (pg_type.typcategory) and whether it is the category's preferred type, for the
+/// types the walk names; None for the rest, which [`common_of`] matches only with themselves.
+fn category(t: u32) -> Option<(char, bool)> {
+    Some(match t {
+        INT2 | INT4 | INT8 | NUMERIC | FLOAT4 => ('N', false),
+        FLOAT8 => ('N', true),
+        VARCHAR | 1042 | NAME => ('S', false),
+        TEXT => ('S', true),
+        BOOL => ('B', true),
+        DATE | TIME | TIMETZ | TIMESTAMP => ('D', false),
+        TIMESTAMPTZ => ('D', true),
+        INTERVAL => ('T', true),
+        _ => return None,
+    })
+}
+
+/// Whether pg_cast has an implicit cast from `a` to `b` (a != b), among the types [`category`] names.
+fn implicit_cast(a: u32, b: u32) -> bool {
+    let rank = |t: u32| match t {
+        INT2 => 1,
+        INT4 => 2,
+        INT8 => 3,
+        NUMERIC => 4,
+        FLOAT4 => 5,
+        FLOAT8 => 6,
+        _ => 0,
+    };
+    match (a, b) {
+        _ if rank(a) > 0 && rank(b) > 0 => rank(a) < rank(b),
+        (VARCHAR | 1042 | NAME, TEXT) | (VARCHAR, 1042) | (1042, VARCHAR) => true,
+        (DATE, TIMESTAMP | TIMESTAMPTZ) | (TIMESTAMP, TIMESTAMPTZ) | (TIME, TIMETZ) => true,
+        _ => false,
+    }
+}
+
+/// What [`common_of`] resolves a list of input types to.
+#[derive(Debug, PartialEq)]
+enum Common {
+    /// The common type.
+    Type(u32),
+    /// Two inputs of different categories: 42804 '<context> types <first> and <second> cannot be
+    /// matched'.
+    Mismatch(u32, u32),
+    /// A pair the walk cannot resolve (a type [`category`] does not name beside another type).
+    Unresolved,
+}
+
+/// PostgreSQL's select_common_type (parse_coerce.c) over the typed inputs, in PostgreSQL's order
+/// (a CASE's default result first); the untyped ones (an unknown literal, NULL, a parameter no
+/// context typed) are left out by the caller. The first input's type stands unless a later one of
+/// its category is preferred, or the first implicitly casts to it and not back; no input gives text.
+fn common_of(types: &[u32]) -> Common {
+    let Some((&first, rest)) = types.split_first() else {
+        return Common::Type(TEXT);
+    };
+    let mut common = first;
+    for &next in rest {
+        if next == common {
+            continue;
+        }
+        let (Some((pcat, preferred)), Some((ncat, _))) = (category(common), category(next)) else {
+            return Common::Unresolved;
+        };
+        if pcat != ncat {
+            return Common::Mismatch(common, next);
+        }
+        if !preferred && implicit_cast(common, next) && !implicit_cast(next, common) {
+            common = next;
+        }
+    }
+    Common::Type(common)
 }
 
 impl Infer<'_> {
@@ -2040,17 +2133,19 @@ impl Infer<'_> {
                 }
                 self.exprs(f.agg_filter.as_deref(), scope);
             }
+            // A parameter among the arguments takes the others' common type ($1 in coalesce($1, b)
+            // is int8, PG 18.6 recording conditional_expressions_take_postgresqls_common_type).
             Some(Node::CoalesceExpr(c)) => {
-                let first = c.args.iter().find_map(|a| self.type_of(a, scope));
+                let common = Self::conditional_inputs(node).and_then(|(context, inputs)| self.common_type_of(context, &inputs, scope));
                 for arg in &c.args {
-                    self.set(arg, first);
+                    self.set(arg, common);
                     self.expr(arg, scope);
                 }
             }
             Some(Node::MinMaxExpr(m)) => {
-                let first = m.args.iter().find_map(|a| self.type_of(a, scope));
+                let common = Self::conditional_inputs(node).and_then(|(context, inputs)| self.common_type_of(context, &inputs, scope));
                 for arg in &m.args {
-                    self.set(arg, first);
+                    self.set(arg, common);
                     self.expr(arg, scope);
                 }
             }
@@ -2080,12 +2175,8 @@ impl Infer<'_> {
                         }
                     }
                 }
-                // The results share the first typed one's type.
-                let result = whens
-                    .iter()
-                    .filter_map(|w| w.result.as_deref())
-                    .chain(c.defresult.as_deref())
-                    .find_map(|r| self.type_of(r, scope));
+                // The results share their common type.
+                let result = Self::conditional_inputs(node).and_then(|(context, inputs)| self.common_type_of(context, &inputs, scope));
                 for r in whens
                     .iter()
                     .filter_map(|w| w.result.as_deref())
@@ -2225,6 +2316,107 @@ impl Infer<'_> {
     }
 
     /// The type `node` has where a parameter is compared with it, if the parse says.
+    /// The type of a CASE, COALESCE, GREATEST or LEAST over `inputs` (in PostgreSQL's order: a
+    /// CASE's default result first), as select_common_type resolves it ([`common_of`]), with
+    /// PostgreSQL's refusals: 42804 across categories, and an untyped literal its input function
+    /// refuses as the common type (22P02 'invalid input syntax for type integer: "x"', 22003). A
+    /// form the engine would answer otherwise than PostgreSQL is refused 0A000: an untyped literal
+    /// the common type reads (CASE ... THEN true ELSE 'yes' writes t; the engine wrote 'yes'), and a
+    /// result read as another type except numbers as wider numbers and strings as text (a date as a
+    /// timestamp writes '2026-01-02 00:00:00'). It took the first typed result's type, so a wider
+    /// later one was refused 22003 and a float went out under int4 (wire-rev-1de981755-rest HIGH-1).
+    fn common_type_of(&self, context: &str, inputs: &[&PgNode], scope: &Scope) -> Option<u32> {
+        use turso_pg_parser::pg_query::protobuf::a_const::Val;
+        let refuse = |kind: SqlErrorKind, message: String| {
+            self.first_refusal
+                .borrow_mut()
+                .get_or_insert_with(|| Some(SqlErrorMessage::classified(kind, message)));
+            None
+        };
+        let mut literals = Vec::new();
+        let mut typed = Vec::new();
+        let mut untyped = false;
+        for input in inputs {
+            match input.node.as_ref() {
+                Some(Node::AConst(c)) if c.isnull => {}
+                Some(Node::AConst(c)) if matches!(c.val, Some(Val::Sval(_))) => {
+                    if let Some(Val::Sval(s)) = &c.val {
+                        literals.push(s.sval.as_str());
+                    }
+                }
+                Some(Node::ParamRef(_)) if self.type_of(input, scope).is_none() => {}
+                _ => match self.type_of(input, scope) {
+                    Some(t) => typed.push(t),
+                    None => untyped = true,
+                },
+            }
+        }
+        if untyped {
+            return None;
+        }
+        let common = match common_of(&typed) {
+            Common::Type(t) => t,
+            Common::Mismatch(a, b) if type_name(a) != "unknown" && type_name(b) != "unknown" => {
+                return refuse(
+                    SqlErrorKind::DatatypeMismatch,
+                    format!("{context} types {} and {} cannot be matched", type_name(a), type_name(b)),
+                );
+            }
+            Common::Mismatch(..) | Common::Unresolved => return None,
+        };
+        let string = |t: u32| matches!(category(t), Some(('S', _)));
+        if !string(common) {
+            if let Some((message, kind)) =
+                literals.iter().find_map(|l| crate::functions::validate_pg_input(l, type_name(common)))
+            {
+                return refuse(kind, message);
+            }
+            if !literals.is_empty() {
+                return refuse(
+                    SqlErrorKind::FeatureNotSupported,
+                    format!("an untyped literal read as {} in {context} is not supported; cast it", type_name(common)),
+                );
+            }
+        }
+        let number = |t: u32| matches!(category(t), Some(('N', _)));
+        if let Some(&other) = typed
+            .iter()
+            .find(|&&t| t != common && !(number(t) && number(common)) && !(matches!(t, VARCHAR | NAME) && common == TEXT))
+        {
+            return refuse(
+                SqlErrorKind::FeatureNotSupported,
+                format!("{context} reading {} as {} is not supported", type_name(other), type_name(common)),
+            );
+        }
+        Some(common)
+    }
+
+    /// The inputs of a conditional expression and its name in PostgreSQL's 42804 message, for
+    /// [`Infer::common_type_of`]: a CASE's results with its default result first, COALESCE's and
+    /// GREATEST's or LEAST's arguments.
+    fn conditional_inputs(node: &PgNode) -> Option<(&'static str, Vec<&PgNode>)> {
+        use turso_pg_parser::pg_query::protobuf::MinMaxOp;
+        match node.node.as_ref()? {
+            Node::CaseExpr(c) => Some((
+                "CASE",
+                c.defresult
+                    .as_deref()
+                    .into_iter()
+                    .chain(c.args.iter().filter_map(|w| match w.node.as_ref() {
+                        Some(Node::CaseWhen(w)) => w.result.as_deref(),
+                        _ => None,
+                    }))
+                    .collect(),
+            )),
+            Node::CoalesceExpr(c) => Some(("COALESCE", c.args.iter().collect())),
+            Node::MinMaxExpr(m) => Some((
+                if MinMaxOp::try_from(m.op) == Ok(MinMaxOp::IsLeast) { "LEAST" } else { "GREATEST" },
+                m.args.iter().collect(),
+            )),
+            _ => None,
+        }
+    }
+
     fn type_of(&self, node: &PgNode, scope: &Scope) -> Option<u32> {
         use turso_pg_parser::pg_query::protobuf::a_const::Val;
         use turso_pg_parser::pg_query::protobuf::{AExprKind, SubLinkType};
@@ -2321,6 +2513,9 @@ impl Infer<'_> {
             }
             Node::AConst(c) => match c.val.as_ref()? {
                 Val::Ival(_) => Some(INT4),
+                // An integer past int4 is int8 in PostgreSQL's grammar; pg_query gives it as a
+                // float's text ([`integer_literal_type`]).
+                Val::Fval(f) if integer_literal_type(&f.fval).is_some() => integer_literal_type(&f.fval),
                 Val::Fval(_) => Some(NUMERIC),
                 Val::Boolval(_) => Some(BOOL),
                 // An untyped literal resolves as text against an undeclared parameter.
@@ -2422,17 +2617,10 @@ impl Infer<'_> {
                 }
             }
             Node::BoolExpr(_) | Node::NullTest(_) | Node::BooleanTest(_) => Some(BOOL),
-            Node::CoalesceExpr(c) => c.args.iter().find_map(|a| self.type_of(a, scope)),
-            Node::MinMaxExpr(m) => m.args.iter().find_map(|a| self.type_of(a, scope)),
-            Node::CaseExpr(c) => c
-                .args
-                .iter()
-                .filter_map(|w| match w.node.as_ref() {
-                    Some(Node::CaseWhen(w)) => w.result.as_deref(),
-                    _ => None,
-                })
-                .chain(c.defresult.as_deref())
-                .find_map(|r| self.type_of(r, scope)),
+            Node::CoalesceExpr(_) | Node::MinMaxExpr(_) | Node::CaseExpr(_) => {
+                let (context, inputs) = Self::conditional_inputs(node)?;
+                self.common_type_of(context, &inputs, scope)
+            }
             Node::SubLink(l) => {
                 let kind = SubLinkType::try_from(l.sub_link_type).unwrap_or(SubLinkType::Undefined);
                 match kind {
