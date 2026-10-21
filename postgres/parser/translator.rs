@@ -3747,7 +3747,7 @@ impl PostgreSQLTranslator {
                     match pg_bytea_source(arg) {
                         PgByteaSource::Integer(width) => {
                             let send = ast::Expr::FunctionCall {
-                                name: ast::Name::from_string(format!("int{width}send")),
+                                name: pg_name(&format!("int{width}send")),
                                 distinctness: None,
                                 args: vec![expr],
                                 order_by: vec![],
