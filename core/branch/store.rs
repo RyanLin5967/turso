@@ -3416,7 +3416,13 @@ fn checkpoint_write(catalog: &mut Catalog, cap: &Captured, hold: Option<&AtomicU
         // complete keeps the store at its version (the capture chose it), and where the fill has made the
         // link columns it relinks around its own changes as an upgraded store does, so the rows the fill
         // already linked stay right and its cursor stays usable (carried to this generation below).
-        let nonflip = !super::journal::carries_links(cap.meta.format) && catalog.links();
+        // h1-rev-72bfb0127 HIGH-1: only a writer that knows the links does this (this build: its format for
+        // the store's arm carries them). The older build test builds stand in for (`CREATE_LEGACY`) writes
+        // 17-20 and, like the real one, neither relinks nor carries the cursor (its checkpoint moves the
+        // generation; this build then refills from row 0). Always true outside test builds.
+        let nonflip = !super::journal::carries_links(cap.meta.format)
+            && super::journal::carries_links(super::journal::current_format_of(cap.meta.format))
+            && catalog.links();
         // Mutant `l4_flip_without_fill` (test builds only): the capture flips with its fill incomplete and
         // nothing links the rest (the crash red's plant).
         if flip && !(cap.links_prefilled && catalog.links()) && !fe_mutant("l4_flip_without_fill") {
