@@ -13441,7 +13441,6 @@ replays_postgresql!(
         (4, "PGDIV-INT-RANGE value [engine]: SILENT: -9223372036854775808::int8 (cast binds before minus, so 2^63 overflows) answers -9223372036854775807 typed 23; PG 22003 bigint out of range"),
         (5, "PGDIV-INT-RANGE value [engine]: SILENT: abs(-9223372036854775808::int8) answers 9223372036854775807 typed 25; PG 22003"),
         (6, "PGDIV-INT-RANGE value [engine]: SILENT: '9223372036854775808'::int8 clamps to 9223372036854775807 typed 23; PG 22003 out of range for type bigint"),
-        (7, "PGDIV-INT-RANGE value [engine]: SILENT: 9223372036854775807 + 1 answers float '9.223372036854776e+18' typed 23; PG 22003 bigint out of range"),
         (8, "PGDIV-INT-RANGE value [engine]: SILENT: bigint column v + 1 answers '9.223372036854776e+18' typed 23; PG RowDescription 20 then 22003"),
         (9, "PGDIV-INT-RANGE value [engine]: SILENT: v * 2 answers '1.8446744073709552e+19' typed 23; PG 20 then 22003"),
         (10, "PGDIV-INT-RANGE value [engine]: SILENT: -v - 2 answers '-9.223372036854776e+18' typed 23; PG 20 then 22003"),
