@@ -1845,3 +1845,268 @@ fn a_failed_read_in_an_explicit_transaction_ends_only_itself() {
         );
     }
 }
+
+// ---- review wire-rev-copystdin5 (artie 1ac5a77f07, raws rv5c_tests.rs): the poison mark's savepoint
+// clearing, written by the reviewer and adopted as reds for the four over-clearing mutants (m-noclear,
+// m-norelmin, m-always, m-le), each run in WAL, MVCC and WAL with an attached `aux` ----
+
+/// rv5c env: a connection and an observer on one fresh database, WAL or MVCC, optionally with an
+/// attached database `aux`. Table `rows` (60 rows, v 'orig') and `keep` in `main` (or in `aux`).
+fn rv5c_env(name: &str, mvcc: bool, attach: bool) -> (Arc<Connection>, Arc<Connection>, &'static str) {
+    let io = Arc::new(MemoryIO::new());
+    let db = Database::open_file_with_flags(
+        io,
+        &format!(":memory:rv5c-{name}"),
+        OpenFlags::default(),
+        DatabaseOpts::new().with_attach(attach),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let conn = db.connect().unwrap();
+    if mvcc {
+        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+    }
+    let schema = if attach {
+        drive_attach(&conn, &format!("rv5c-{name}-aux.db"), "aux");
+        "aux"
+    } else {
+        "main"
+    };
+    conn.execute(format!("CREATE TABLE {schema}.rows(id INTEGER PRIMARY KEY, v TEXT)")).unwrap();
+    conn.execute(format!("CREATE TABLE {schema}.keep(x INTEGER)")).unwrap();
+    for i in 1..=60 {
+        conn.execute(format!("INSERT INTO {schema}.rows VALUES ({i}, 'orig')")).unwrap();
+    }
+    let observer = db.connect().unwrap();
+    if attach {
+        drive_attach(&observer, &format!("rv5c-{name}-aux.db"), "aux");
+    }
+    (conn, observer, schema)
+}
+
+/// Interrupt `UPDATE rows SET v = 'partial'` part-way through with the progress handler (as the
+/// wire server's statement_timeout does) and drop it. Premise, asserted: the transaction is now
+/// poisoned and some, not all, rows read 'partial' on this connection.
+fn rv5c_poison(conn: &Arc<Connection>, schema: &str) {
+    let calls = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let c = calls.clone();
+    conn.set_progress_handler(
+        1,
+        Some(Box::new(move || c.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= 200)),
+    );
+    let mut stmt = conn.prepare(format!("UPDATE {schema}.rows SET v = 'partial'")).unwrap();
+    loop {
+        match stmt.step().unwrap() {
+            crate::StepResult::Interrupt => break,
+            crate::StepResult::IO => stmt.get_pager().io.step().unwrap(),
+            other => panic!("premise: expected the UPDATE to be interrupted, got {other:?}"),
+        }
+    }
+    conn.set_progress_handler(0, None);
+    drop(stmt);
+    assert!(conn.tx_is_poisoned(), "premise: the interrupted UPDATE poisoned the transaction");
+    let partial = scalar_i64(conn, &format!("SELECT count(*) FROM {schema}.rows WHERE v = 'partial'"));
+    assert!(partial > 0 && partial < 60, "premise: a partial write, got {partial} of 60");
+}
+
+fn rv5c_partial(conn: &Arc<Connection>, schema: &str) -> i64 {
+    scalar_i64(conn, &format!("SELECT count(*) FROM {schema}.rows WHERE v = 'partial'"))
+}
+
+fn rv5c_keep(conn: &Arc<Connection>, schema: &str) -> i64 {
+    scalar_i64(conn, &format!("SELECT count(*) FROM {schema}.keep"))
+}
+
+/// COMMIT must succeed, and the committed state must hold `keep` rows and no partial write.
+fn rv5c_commit_ok(conn: &Arc<Connection>, observer: &Arc<Connection>, schema: &str, keep: i64) {
+    conn.execute("COMMIT").expect("COMMIT after a ROLLBACK TO that undid every poisoning");
+    assert_eq!(rv5c_partial(observer, schema), 0, "no partial write committed");
+    assert_eq!(rv5c_keep(observer, schema), keep, "the work before the savepoint committed");
+}
+
+/// COMMIT must refuse (the poison survives), and nothing of the transaction is committed.
+fn rv5c_commit_refused(conn: &Arc<Connection>, observer: &Arc<Connection>, schema: &str) {
+    expect_unfinished_write_commit_error(conn.execute("COMMIT"));
+    assert_eq!(rv5c_partial(observer, schema), 0, "no partial write committed");
+    assert_eq!(rv5c_keep(observer, schema), 0, "the poisoned transaction committed nothing");
+}
+
+fn rv5c_each(f: impl Fn(&Arc<Connection>, &Arc<Connection>, &str)) {
+    for (label, mvcc, attach) in [("wal", false, false), ("mvcc", true, false), ("attach", false, true)] {
+        eprintln!("rv5c variant {label}");
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let (conn, observer, schema) = rv5c_env(&format!("{label}-{}-{n}", std::process::id()), mvcc, attach);
+        f(&conn, &observer, schema);
+    }
+}
+
+/// A: the fix's claim. A poisoning after SAVEPOINT s, ROLLBACK TO s: the partial write is gone and
+/// COMMIT keeps the work before s (PostgreSQL 18.6's ROLLBACK TO after a failed statement).
+#[test]
+fn rv5c_a_rollback_to_a_savepoint_before_the_poison_clears_it() {
+    rv5c_each(|conn, observer, schema| {
+        conn.execute("BEGIN").unwrap();
+        conn.execute(format!("INSERT INTO {schema}.keep VALUES (1)")).unwrap();
+        conn.execute("SAVEPOINT s").unwrap();
+        rv5c_poison(conn, schema);
+        conn.execute("ROLLBACK TO s").unwrap();
+        assert!(!conn.tx_is_poisoned());
+        assert_eq!(rv5c_partial(conn, schema), 0, "ROLLBACK TO undid the partial write");
+        rv5c_commit_ok(conn, observer, schema, 1);
+    });
+}
+
+/// B: a savepoint opened after the poisoning does not clear it.
+#[test]
+fn rv5c_b_a_savepoint_opened_after_the_poison_does_not_clear_it() {
+    rv5c_each(|conn, observer, schema| {
+        conn.execute("BEGIN").unwrap();
+        conn.execute(format!("INSERT INTO {schema}.keep VALUES (1)")).unwrap();
+        rv5c_poison(conn, schema);
+        conn.execute("SAVEPOINT s").unwrap();
+        conn.execute("ROLLBACK TO s").unwrap();
+        assert!(conn.tx_is_poisoned());
+        rv5c_commit_refused(conn, observer, schema);
+    });
+}
+
+/// C: RELEASE of the savepoint around the poisoning, then a new savepoint at the same depth.
+#[test]
+fn rv5c_c_release_then_a_new_savepoint_at_the_same_depth_does_not_clear_it() {
+    rv5c_each(|conn, observer, schema| {
+        conn.execute("BEGIN").unwrap();
+        conn.execute(format!("INSERT INTO {schema}.keep VALUES (1)")).unwrap();
+        conn.execute("SAVEPOINT a").unwrap();
+        rv5c_poison(conn, schema);
+        conn.execute("RELEASE a").unwrap();
+        conn.execute("SAVEPOINT b").unwrap();
+        conn.execute("ROLLBACK TO b").unwrap();
+        assert!(conn.tx_is_poisoned());
+        rv5c_commit_refused(conn, observer, schema);
+    });
+}
+
+/// D: a reused name. ROLLBACK TO the inner s (opened after the poisoning) keeps it; after RELEASE
+/// of the inner s, ROLLBACK TO the outer s clears it.
+#[test]
+fn rv5c_d_a_reused_savepoint_name_clears_only_at_the_outer_one() {
+    rv5c_each(|conn, observer, schema| {
+        conn.execute("BEGIN").unwrap();
+        conn.execute(format!("INSERT INTO {schema}.keep VALUES (1)")).unwrap();
+        conn.execute("SAVEPOINT s").unwrap();
+        rv5c_poison(conn, schema);
+        conn.execute("SAVEPOINT s").unwrap();
+        conn.execute("ROLLBACK TO s").unwrap();
+        assert!(conn.tx_is_poisoned(), "the inner s was opened after the poisoning");
+        conn.execute("RELEASE s").unwrap();
+        assert!(conn.tx_is_poisoned());
+        conn.execute("ROLLBACK TO s").unwrap();
+        assert!(!conn.tx_is_poisoned(), "the outer s predates the poisoning");
+        rv5c_commit_ok(conn, observer, schema, 1);
+    });
+}
+
+/// E: two poisonings, one before and one after SAVEPOINT b: ROLLBACK TO b undoes only the second.
+#[test]
+fn rv5c_e_two_poisonings_need_the_savepoint_before_both() {
+    rv5c_each(|conn, observer, schema| {
+        conn.execute("BEGIN").unwrap();
+        conn.execute(format!("INSERT INTO {schema}.keep VALUES (1)")).unwrap();
+        conn.execute("SAVEPOINT a").unwrap();
+        rv5c_poison(conn, schema);
+        conn.execute("SAVEPOINT b").unwrap();
+        rv5c_poison(conn, schema);
+        conn.execute("ROLLBACK TO b").unwrap();
+        assert!(conn.tx_is_poisoned());
+        conn.execute("ROLLBACK TO a").unwrap();
+        assert!(!conn.tx_is_poisoned());
+        rv5c_commit_ok(conn, observer, schema, 1);
+    });
+}
+
+/// F: RELEASE of the inner savepoint, a new one at its depth: only the outer one clears.
+#[test]
+fn rv5c_f_release_collapses_into_the_outer_savepoint() {
+    rv5c_each(|conn, observer, schema| {
+        conn.execute("BEGIN").unwrap();
+        conn.execute(format!("INSERT INTO {schema}.keep VALUES (1)")).unwrap();
+        conn.execute("SAVEPOINT a").unwrap();
+        conn.execute("SAVEPOINT b").unwrap();
+        rv5c_poison(conn, schema);
+        conn.execute("RELEASE b").unwrap();
+        conn.execute("SAVEPOINT c").unwrap();
+        conn.execute("ROLLBACK TO c").unwrap();
+        assert!(conn.tx_is_poisoned(), "c was opened after the poisoning");
+        conn.execute("ROLLBACK TO a").unwrap();
+        assert!(!conn.tx_is_poisoned());
+        rv5c_commit_ok(conn, observer, schema, 1);
+    });
+}
+
+/// G: a transaction a SAVEPOINT opened (no BEGIN): RELEASE of it commits, and refuses while
+/// poisoned; after ROLLBACK TO the inner savepoint it commits the earlier work.
+#[test]
+fn rv5c_g_a_savepoint_started_transaction() {
+    rv5c_each(|conn, observer, schema| {
+        conn.execute("SAVEPOINT a").unwrap();
+        conn.execute(format!("INSERT INTO {schema}.keep VALUES (1)")).unwrap();
+        conn.execute("SAVEPOINT b").unwrap();
+        rv5c_poison(conn, schema);
+        conn.execute("ROLLBACK TO b").unwrap();
+        assert!(!conn.tx_is_poisoned());
+        conn.execute("RELEASE a").expect("RELEASE a commits");
+        assert_eq!(rv5c_partial(observer, schema), 0);
+        assert_eq!(rv5c_keep(observer, schema), 1);
+        conn.execute("SAVEPOINT a").unwrap();
+        conn.execute(format!("INSERT INTO {schema}.keep VALUES (2)")).unwrap();
+        rv5c_poison(conn, schema);
+        expect_unfinished_write_commit_error(conn.execute("RELEASE a"));
+        assert_eq!(rv5c_partial(observer, schema), 0);
+        assert_eq!(rv5c_keep(observer, schema), 1, "the poisoned RELEASE committed nothing");
+    });
+}
+
+/// H: a poisoning after a clearing ROLLBACK TO poisons again.
+#[test]
+fn rv5c_h_a_poisoning_after_the_clear_counts() {
+    rv5c_each(|conn, observer, schema| {
+        conn.execute("BEGIN").unwrap();
+        conn.execute(format!("INSERT INTO {schema}.keep VALUES (1)")).unwrap();
+        conn.execute("SAVEPOINT a").unwrap();
+        rv5c_poison(conn, schema);
+        conn.execute("ROLLBACK TO a").unwrap();
+        assert!(!conn.tx_is_poisoned());
+        conn.execute("RELEASE a").unwrap();
+        rv5c_poison(conn, schema);
+        conn.execute("SAVEPOINT z").unwrap();
+        conn.execute("ROLLBACK TO z").unwrap();
+        rv5c_commit_refused(conn, observer, schema);
+    });
+}
+
+/// I: a ROLLBACK TO whose rollback of an attached database fails (the failpoint) commits no partial
+/// write of that database: the poison is cleared only once every database's rollback succeeded.
+/// It was cleared before the attached and temp pagers were rolled back, so a failure there left
+/// the attached partial write in the transaction, unpoisoned, for COMMIT to commit (review
+/// wire-rev-copystdin5 LOW 4, unverified there: this test is its check).
+#[test]
+fn rv5c_i_a_failed_attached_rollback_commits_no_partial_write() {
+    let (conn, observer, schema) = rv5c_env(&format!("i-{}", std::process::id()), false, true);
+    conn.execute("BEGIN").unwrap();
+    conn.execute(format!("INSERT INTO {schema}.keep VALUES (1)")).unwrap();
+    conn.execute("SAVEPOINT s").unwrap();
+    rv5c_poison(&conn, schema);
+    super::execute::fail_next_mirror_rollback();
+    assert!(
+        conn.execute("ROLLBACK TO s").is_err(),
+        "premise: the failpoint failed the attached database's rollback"
+    );
+    let _ = conn.execute("COMMIT");
+    assert_eq!(
+        rv5c_partial(&observer, schema),
+        0,
+        "the attached database's partial write, which the failed ROLLBACK TO did not undo, was committed"
+    );
+}

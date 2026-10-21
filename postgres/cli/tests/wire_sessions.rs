@@ -8566,22 +8566,28 @@ fn a_timeout_or_cancel_during_an_alter_add_constraint_leaves_the_session_usable(
 /// timeout still armed, so it was stopped too: 57014 with the session 'T' in a transaction the
 /// client never opened, another session's write 55P03, and the client's next COMMIT committed
 /// d1's drop and not d2's (review HIGH 1, runs rv4-3017-tip and rv4-3017-tr, the same at
-/// 121844bd2). Written by the reviewer (`rv4_tests.rs`); it refuses to pass with no DROP stopped.
+/// 121844bd2). And a DROP that answers 57014 has committed nothing: at efe74caf5 the DROP's work
+/// committed in its own transaction and the no-op statement it then returned was stopped, so the
+/// client was told 'canceled' with both tables gone (review wire-rev-copystdin5 HIGH 1, 6 of 68
+/// rounds at tip, PostgreSQL 0 of 51; run rv5-t6 at t=40). The fixture is the second reviewer's
+/// (`rv5w_tests.rs`): 20,000 rows, one index, t = 1..40 ms. FLAGGED TEST EDIT, ruled by the lead
+/// (DECISIONS c932bf7572): it replaces this test's 200,000-row, 3-index, t = 150..450 ms shape,
+/// which took about 1,335 s, never landed a deadline after the commit, and fails at a91f190c2's
+/// parent on the same assertion as this one. It refuses to pass with no DROP stopped.
 #[test]
 fn a_timeout_during_a_multi_object_drop_drops_nothing() {
+    let n = 20_000;
     let dir = Scratch::new("dropstop");
     let server = Server::start(&dir.db(), &[]);
     let mut a = server.connect();
     a.s.set_read_timeout(Some(Duration::from_secs(600))).unwrap();
     let mut stopped = 0;
-    for t in [150, 200, 250, 300, 350, 400, 450] {
+    for t in [1, 2, 5, 10, 20, 40] {
         a.q("DROP TABLE IF EXISTS d1").ok("d1 gone");
         a.q("DROP TABLE IF EXISTS d2").ok("d2 gone");
         a.q("CREATE TABLE d1 (id int)").ok("d1");
-        for i in 0..3 {
-            a.q(&format!("CREATE INDEX d1_i{i} ON d1 (id)")).ok("index");
-        }
-        copy_in_pieces(&mut a, "COPY d1 FROM STDIN", &int_rows(200_000)).ok("load d1");
+        a.q("CREATE INDEX d1_i0 ON d1 (id)").ok("index");
+        copy_in_pieces(&mut a, "COPY d1 FROM STDIN", &int_rows(n)).ok("load d1");
         a.q("CREATE TABLE d2 (id int)").ok("d2");
         a.q(&format!("SET statement_timeout = {t}")).ok("timeout");
         let r = a.q("DROP TABLE d1, d2");
@@ -8595,7 +8601,7 @@ fn a_timeout_during_a_multi_object_drop_drops_nothing() {
         assert_eq!(r.status, b'I', "t={t}: the session after a stopped DROP is idle");
         a.q("COMMIT");
         let mut b = server.connect();
-        assert_eq!(b.q("SELECT count(*) FROM d1").single("d1 after a stopped DROP"), "200000", "t={t}");
+        assert_eq!(b.q("SELECT count(*) FROM d1").single("d1 after a stopped DROP"), n.to_string(), "t={t}");
         assert_eq!(b.q("SELECT count(*) FROM d2").single("d2 after a stopped DROP"), "0", "t={t}");
     }
     assert!(stopped > 0, "no DROP was stopped: the test did not reach its case");
@@ -8607,8 +8613,9 @@ fn a_timeout_during_a_multi_object_drop_drops_nothing() {
 /// 3017001a2 the ALTER's COMMIT answered XX000 "cannot commit - an unfinished write statement
 /// was abandoned" and rolled the whole block back, its row before the savepoint with it (review
 /// MED 1, run rv4-3017-tip; FATAL 08006 at the ALTER at 121844bd2): a silent loss of work the
-/// client was told was done. The ALTER case is the reviewer's (`rv4_tests.rs`); the CREATE INDEX
-/// case asks whether the same holds for a statement the client sent itself.
+/// client was told was done. The ALTER case is the reviewer's (`rv4_tests.rs`). The CREATE INDEX
+/// case, a statement the client sent itself, is coverage, not a red: it already kept the row at
+/// a91f190c2's parent (review wire-rev-copystdin5 LOW 1, run rv5-scen; a doc edit only).
 #[test]
 fn a_timeout_after_a_savepoint_keeps_the_blocks_earlier_work() {
     let dir = Scratch::new("svptstop");

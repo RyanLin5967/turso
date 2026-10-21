@@ -4311,12 +4311,30 @@ fn mirror_named_savepoint_to_active_non_main_databases(
                     let _ = pager.release_named_savepoint(name)?;
                 }
                 SavepointMirror::Rollback(name) => {
+                    #[cfg(test)]
+                    if FAIL_NEXT_MIRROR_ROLLBACK.with(|f| f.replace(false)) {
+                        return Err(LimboError::InternalError(
+                            "failpoint: an attached database's ROLLBACK TO failed".to_string(),
+                        ));
+                    }
                     let _ = pager.rollback_to_named_savepoint(name)?;
                 }
             }
         }
         Ok(())
     })
+}
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_NEXT_MIRROR_ROLLBACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Test failpoint: the next ROLLBACK TO's rollback of an attached (WAL) database, on this thread,
+/// fails (review wire-rev-copystdin5 LOW 4).
+#[cfg(test)]
+pub(crate) fn fail_next_mirror_rollback() {
+    FAIL_NEXT_MIRROR_ROLLBACK.with(|f| f.set(true));
 }
 
 pub fn op_transaction_inner(
