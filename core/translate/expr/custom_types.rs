@@ -1657,6 +1657,72 @@ mod tests {
         assert!(wrong.is_empty(), "CLAIM: exact numeric through any expression, as PostgreSQL 18.6: {wrong:#?}");
     }
 
+    /// The INTERVAL stopgap (lead order 2026-10-21; RESUME item 9; fastest-wire's known-red
+    /// interval_columns_are_never_compared_or_computed_over_text, PostgreSQL 18.6 recording
+    /// rec24-interval): until a real interval type exists, an `interval` column keeps its declared
+    /// type name (so a server can announce it, 1186) and holds its value as written, and everything
+    /// that would compare or compute over that text is refused as not supported (0A000 at a server,
+    /// `LimboError::FeatureNotSupported`), never answered: as text, '1 day' and '24 hours' are two
+    /// values and '00:30:00' sorts before '1 day' only by accident, where PostgreSQL compares
+    /// durations. Refused: ORDER BY, GROUP BY, DISTINCT, count(DISTINCT), min, max, sum, avg, a
+    /// comparison with a literal or another interval, arithmetic, and UNION's dedupe. Answered: the
+    /// value read back, its declared type, count(*), and UNION ALL. At the base `interval` is no type.
+    #[test]
+    fn an_interval_column_keeps_its_type_and_refuses_what_text_would_answer_wrong() {
+        let conn = open();
+        let mut wrong = Vec::new();
+        for sql in [
+            "CREATE TABLE it(id INTEGER PRIMARY KEY, i interval, j interval) STRICT",
+            "INSERT INTO it VALUES (1, '1 day', '24 hours'), (2, '24 hours', '30 minutes'), (3, '30 minutes', '1 day')",
+        ] {
+            if let Err(e) = conn.execute(sql) {
+                wrong.push(format!("setup {sql}: {e}"));
+            }
+        }
+        if wrong.is_empty() {
+            match conn.prepare("SELECT i FROM it WHERE id = 1") {
+                Ok(stmt) => {
+                    let ty = stmt.get_column_type_info(0).ok().flatten().map(|i| i.declared_name.to_ascii_lowercase());
+                    if ty.as_deref() != Some("interval") {
+                        wrong.push(format!("the column's declared type reads {ty:?}, not interval"));
+                    }
+                    let got = { let mut stmt = stmt; stmt.run_collect_rows().map(|r| r[0][0].to_string()) };
+                    if got.as_ref().ok().map(String::as_str) != Some("1 day") {
+                        wrong.push(format!("the value read back as {got:?}, not '1 day'"));
+                    }
+                }
+                Err(e) => wrong.push(format!("SELECT i: {e}")),
+            }
+            for (sql, want) in [("SELECT count(*) FROM it", "3"), ("SELECT count(*) FROM (SELECT i FROM it UNION ALL SELECT j FROM it)", "6")] {
+                match conn.prepare(sql).and_then(|mut s| s.run_collect_rows()) {
+                    Ok(r) if r[0][0].to_string() == want => {}
+                    other => wrong.push(format!("{sql}: {other:?}, want {want}")),
+                }
+            }
+            for sql in [
+                "SELECT i FROM it ORDER BY i",
+                "SELECT i, count(*) FROM it GROUP BY i",
+                "SELECT DISTINCT i FROM it",
+                "SELECT count(DISTINCT i) FROM it",
+                "SELECT max(i) FROM it",
+                "SELECT min(i) FROM it",
+                "SELECT sum(i) FROM it",
+                "SELECT avg(i) FROM it",
+                "SELECT count(*) FROM it WHERE i > '2 hours'",
+                "SELECT count(*) FROM it WHERE i = j",
+                "SELECT i + j FROM it",
+                "SELECT i * 2 FROM it",
+                "SELECT i FROM it UNION SELECT j FROM it",
+            ] {
+                match conn.prepare(sql).and_then(|mut s| s.run_collect_rows()) {
+                    Err(e) if format!("{e:?}").starts_with("FeatureNotSupported(") => {}
+                    other => wrong.push(format!("{sql}: {other:?}, must be refused as not supported")),
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "CLAIM: an interval keeps its type and nothing compares its text: {wrong:#?}");
+    }
+
     /// Engine review 20 LOW 27 (b): 150a70db0's arm, a type whose value input is `any` (numeric)
     /// takes any non-literal constant operand but a COLLATE one, had no test: `x = abs(-1.5)` and
     /// `x = 1 + 1` on numeric(10, 2) find 1.50 and 2.00, through the type's '=', as a scan.
