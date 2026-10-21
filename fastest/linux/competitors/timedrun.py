@@ -290,7 +290,7 @@ PAIR_KEYS = ("loop", "mode", "rate", "clients", "seed")  # one command line: bot
 # comp-rev-89ec-b3c3 LOW 3: and the keys that define each producer's command, which both runs must RECORD (None ==
 # None had passed): bbload (mode closed/open) runs one spec at one seed and rate; clonebench (b1/b0) has no seed or
 # rate, and its command is its op and sync
-PAIR_KEYS_BY_PRODUCER = {"bbload": ("loop", "mode", "rate", "clients", "seed", "spec"),
+PAIR_KEYS_BY_PRODUCER = {"bbload": ("loop", "mode", "rate", "clients", "seed", "spec", "home_per_cycle"),
                          "clonebench": ("loop", "mode", "clients", "op", "sync")}
 # comp-rev-89ec-b3c3 LOW 1: PREREG M3's open-loop lateness bound; a run is judged against it, not against the bound it
 # carries (bbload accepts --max-send-late-us up to 1e9)
@@ -433,6 +433,32 @@ def raw_problems(nm, d, sm, require_ok=True):
                        f"<= end)")
         if bad_lat:
             why.append(f"{nm} run's raw.tsv has {bad_lat} row(s) whose lat_ns is not end_ns - intended_ns")
+    # comp-rev-9bc7d894a final LOW A: a `home per-cycle` run's connect (bbload, the lead's Doltgres b-m1 ruling) must
+    # sit OUTSIDE the timed window. The timed run is the latency file, so there: every row records home_connect_ns, and
+    # each claim comes at or after the same client's previous row's after-steps end (end_ns + after_ns) plus this row's
+    # connect. A connect moved after the claim would put it into every op's latency, handicapping the competitor.
+    if nm == "timed" and sm.get("home_per_cycle") is True:
+        need = ("client", "seq", "claim_ns", "end_ns", "after_ns", "home_connect_ns")
+        if "home_connect_ns" not in cols:
+            why.append(f"{nm} run is home per-cycle but its raw.tsv has no home_connect_ns column")
+        elif any(c not in cols for c in need):
+            why.append(f"{nm} run is home per-cycle but its raw.tsv lacks {[c for c in need if c not in cols]}")
+        else:
+            try:
+                by = {}
+                for r in rows:
+                    by.setdefault(r["client"], []).append(
+                        (int(r["seq"]), int(r["claim_ns"]), int(r["end_ns"]), int(r["after_ns"]), int(r["home_connect_ns"])))
+            except (ValueError, TypeError):
+                return why + [f"{nm} run's raw.tsv has a home per-cycle column that is not a count"]
+            early = 0
+            for ops in by.values():
+                ops.sort()
+                for (_, _, pe, pa, _), (_, c, _, _, hc) in zip(ops, ops[1:]):
+                    early += c < pe + pa + hc
+            if early:
+                why.append(f"{nm} run has {early} claim(s) earlier than the client's previous after-steps end plus "
+                           f"this cycle's home_connect_ns: the connect cannot have preceded the claim")
     tm1 = sm.get("tm1_ns")
     if not _count(tm1) or not tm1:
         why.append(f"{nm} run has no tm1_ns: its window's end in intended time is unknown")
@@ -674,7 +700,8 @@ RUN = {"warmup_ops": 1500, "warmup_s": 10.0005, "warmup_capped": False, "warmup_
        "window_s": 5.0, "t0_ns": T0, "tm0_ns": T0 + 10_000_500_000, "tm1_ns": T0 + 15_000_500_000,
        "clock": "CLOCK_MONOTONIC", "mode": "closed", "rate": 0.0, "clients": 1, "seed": 1, "send_late_us": None,
        "pool_late_us": None, "max_send_late_us": 100.0, "after_steps": 0, "skip_after": False, "tput_unit": "op",
-       "no_drain": False, "spec": "pg18-create.spec"}
+       "no_drain": False, "spec": "pg18-create.spec",
+       "home_per_cycle": False}  # (comp-rev-9bc7d894a LOW A: every bbload summary writes it from 943a7b9db)
 # (comp-rev-89ec-b3c3 LOW 3: with the spec every bbload summary names; a clonebench run's op and sync are its case's)
 CB = {"mode": "b1", "op": "m1c", "sync": "d2"}
 # (comp review 1 MED 9: a bbload run's after record -- its spec's after-step count, whether --skip-after ran none, and
@@ -724,14 +751,22 @@ def raw_tsv(sm, extra_rows=(), drop_warm=0, after_cols=None, claimed_rows=None):
     return "".join(out)
 
 
-def raw_tsv_full(sm, swap_claim_intended=False, end_before_start_row=None):
+def raw_tsv_full(sm, swap_claim_intended=False, end_before_start_row=None, home_connect=None, no_home_column=False,
+                 no_after_column=False):
     """comp-rev-89ec-b3c3 LOW 16: a raw.tsv with the clock columns a closed-loop producer writes (bbload and clonebench:
     claim_ns, then intended_ns = start_ns, end_ns, lat_ns = end_ns - intended_ns), agreeing with summary SM; each op is
     claimed 300 ns before it starts and takes 1000 ns. SWAP_CLAIM_INTENDED writes each row's claim_ns and intended_ns
     values in each other's columns (a row printf whose arguments are out of order against its header).
     END_BEFORE_START_ROW: that row (0-based, warm-up rows first) ends 5 ns before it starts, its lat_ns still
-    end - intended (so only the clock-order guard can refuse it)."""
-    out = ["client\tseq\tphase\tok\tclaim_ns\tintended_ns\tstart_ns\tend_ns\tlat_ns\n"]
+    end - intended (so only the clock-order guard can refuse it).
+    HOME_CONNECT (ns): a `home per-cycle` producer's rows (comp-rev-9bc7d894a LOW A): after_ns 200 and home_connect_ns
+    HOME_CONNECT on every row; with ops 2000 ns apart, the gap from one cycle's after-steps end to the next claim is
+    500 ns, so HOME_CONNECT <= 500 fits before the claim and more cannot have. NO_HOME_COLUMN drops that column, and
+    NO_AFTER_COLUMN the after_ns one."""
+    pc = home_connect is not None
+    out = ["client\tseq\tphase\tok\tclaim_ns\tintended_ns\tstart_ns\tend_ns\tlat_ns"
+           + ("\tafter_ns" if pc and not no_after_column else "")
+           + ("\thome_connect_ns" if pc and not no_home_column else "") + "\n"]
     wo, mo, t0, tm0 = sm.get("warmup_ops"), sm.get("measured_ops"), sm.get("t0_ns"), sm.get("tm0_ns")
     rows = [("warmup", t0 + 1000 + 2000 * i) for i in range(wo)] + [("measure", tm0 + 1000 + 2000 * i) for i in range(mo)]
     for i, (ph, s) in enumerate(rows):
@@ -739,7 +774,8 @@ def raw_tsv_full(sm, swap_claim_intended=False, end_before_start_row=None):
         if swap_claim_intended:
             c, t = t, c
         e = s - 5 if i == end_before_start_row else s + 1000
-        out.append(f"0\t{i}\t{ph}\t1\t{c}\t{t}\t{s}\t{e}\t{e - s}\n")  # lat from the TRUE intended start, s
+        tail = ("\t200" if pc and not no_after_column else "") + (f"\t{home_connect}" if pc and not no_home_column else "")
+        out.append(f"0\t{i}\t{ph}\t1\t{c}\t{t}\t{s}\t{e}\t{e - s}{tail}\n")  # lat from the TRUE intended start, s
     return "".join(out)
 
 
@@ -1130,6 +1166,27 @@ def selftest():
          False),
         ("a raw.tsv row that ends before it starts",
          dict(tracer=clean, timed_raw=raw_tsv_full(dict(RUN, measured_ops=200), end_before_start_row=1600)), False),
+        # comp-rev-9bc7d894a LOW A: a `home per-cycle` run's connect must sit OUTSIDE the timed window: every row records
+        # home_connect_ns, and each claim comes at or after the client's previous after-steps end plus that connect
+        # (a connect moved after the claim would put it into every op's latency); both runs must agree on home_per_cycle
+        ("control: a home per-cycle run whose connects fit before each claim",
+         dict(tracer=clean, lab_extra={"home_per_cycle": True}, timed_extra={"home_per_cycle": True},
+              timed_raw=raw_tsv_full(dict(RUN, measured_ops=200), home_connect=400)), True),
+        ("a home per-cycle run whose connect cannot have preceded its claim",
+         dict(tracer=clean, lab_extra={"home_per_cycle": True}, timed_extra={"home_per_cycle": True},
+              timed_raw=raw_tsv_full(dict(RUN, measured_ops=200), home_connect=600)), False),
+        ("a home per-cycle run whose raw.tsv has no home_connect_ns",
+         dict(tracer=clean, lab_extra={"home_per_cycle": True}, timed_extra={"home_per_cycle": True},
+              timed_raw=raw_tsv_full(dict(RUN, measured_ops=200), home_connect=400, no_home_column=True)), False),
+        ("the labelling and timed runs differ in home_per_cycle",
+         dict(tracer=clean, lab_extra={"home_per_cycle": True}, timed_extra={"home_per_cycle": False}), False),
+        # (the two guards runs/uw-20261021-g6-*'s timedrun_mutants found no case reaching)
+        ("a home per-cycle run whose raw.tsv has no after_ns",
+         dict(tracer=clean, lab_extra={"home_per_cycle": True}, timed_extra={"home_per_cycle": True},
+              timed_raw=raw_tsv_full(dict(RUN, measured_ops=200), home_connect=400, no_after_column=True)), False),
+        ("a home per-cycle run whose home_connect_ns is not a count",
+         dict(tracer=clean, lab_extra={"home_per_cycle": True}, timed_extra={"home_per_cycle": True},
+              timed_raw=raw_tsv_full(dict(RUN, measured_ops=200), home_connect="x")), False),
         ("a raw.tsv with a clock column that is not a count",
          dict(tracer=clean, timed_raw=raw_tsv_full(dict(RUN, measured_ops=200)).replace("\t1000\n", "\tx\n", 1)), False),
     ]
@@ -1294,6 +1351,15 @@ def selftest():
         "a timed summary with no measured_ops": ("timed run has no measured_ops count (None)",),
         "a timed summary whose measured_ok is not a count": ("timed run's measured_ok 'x' is not a count",),
         "a timed summary with no measured_ok (the cell path)": ("timed run has no measured_ok count (None)",),
+        "a home per-cycle run whose connect cannot have preceded its claim":
+            ("timed run has 1698 claim(s) earlier than the client's previous after-steps end plus this cycle's "
+             "home_connect_ns",),
+        "a home per-cycle run whose raw.tsv has no home_connect_ns":
+            ("timed run is home per-cycle but its raw.tsv has no home_connect_ns column",),
+        "the labelling and timed runs differ in home_per_cycle": ("the labelling and timed runs differ in home_per_cycle",),
+        "a home per-cycle run whose raw.tsv has no after_ns": ("timed run is home per-cycle but its raw.tsv lacks ['after_ns']",),
+        "a home per-cycle run whose home_connect_ns is not a count":
+            ("timed run's raw.tsv has a home per-cycle column that is not a count",),
         "a raw.tsv row that ends before it starts": ("timed run's raw.tsv has 1 row(s) out of clock order",),
         "a raw.tsv with a clock column that is not a count": ("timed run's raw.tsv has a clock column that is not a count",),
     })

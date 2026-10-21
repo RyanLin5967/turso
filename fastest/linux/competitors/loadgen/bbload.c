@@ -1520,7 +1520,9 @@ int main(int argc, char **argv) {
             conn |= S.step[k].k == K_CONNECT || S.step[k].k == K_CLOSE;
             serial |= S.step[k].serial;
         }
-        const char *what = S.nafter ? "after-steps" : conn ? "a connect or close step" : serial ? "a sql-serial step" : NULL;
+        /* comp-rev-9bc7d894a LOW C: and home per-cycle, whose connect before every claim would be charged likewise */
+        const char *what = S.nafter ? "after-steps" : conn ? "a connect or close step" : serial ? "a sql-serial step"
+                         : S.home_per_cycle ? "home per-cycle" : NULL;
         if (what) {
             fprintf(stderr, "bbload: REFUSED: open loop with %s: its time would be charged to the server as queueing; "
                             "run it closed loop\n", what);
