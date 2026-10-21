@@ -3743,6 +3743,19 @@ impl PostgreSQLTranslator {
                                 )))
                             }
                         };
+                        // The length's bounds, as varchartypmodin and bpchartypmodin read them
+                        // (wire-rev-1de981755-rest LOW-4: varchar(0) cut to '').
+                        let kind = if varchar { "varchar" } else { "char" };
+                        if n < 1 || n > 10_485_760 {
+                            return Err(ParseError::ParseError(SqlErrorMessage::classified(
+                                SqlErrorKind::InvalidParameterValue,
+                                if n < 1 {
+                                    format!("length for type {kind} must be at least 1")
+                                } else {
+                                    format!("length for type {kind} cannot exceed 10485760")
+                                },
+                            )));
+                        }
                         let mut bare = (**type_cast).clone();
                         if let Some(bt) = bare.type_name.as_mut() {
                             bt.typmods.clear();
@@ -4081,6 +4094,20 @@ impl PostgreSQLTranslator {
                             )));
                         }
                         Some(v) => return Ok(unsigned(v)),
+                        // Any other operand is its 32-bit unsigned value, as int4's binary
+                        // coercion to oid reads it ((-i)::oid is 4294967295; wire-rev-1de981755-rest
+                        // LOW-6: it wrote -1 under oid): ((x % 2^32) + 2^32) % 2^32, x read once.
+                        // BLIND SPOT: an int8 past the oid range wraps where PG answers 22003.
+                        None if !matches!(arg.node.as_ref(), Some(pg_query::protobuf::node::Node::AConst(_))) => {
+                            let x = ast::Expr::Cast {
+                                expr: Box::new(self.translate_expr(arg)?),
+                                type_name: Some(ast::Type { name: "INTEGER".to_string(), size: None, array_dimensions: 0 }),
+                            };
+                            let modulus = || Box::new(ast::Expr::Literal(ast::Literal::Numeric("4294967296".to_string())));
+                            let rem = |e: ast::Expr| ast::Expr::Binary(Box::new(ast::Expr::Parenthesized(vec![Box::new(e)])), ast::Operator::Modulus, modulus());
+                            let shifted = ast::Expr::Binary(Box::new(rem(x)), ast::Operator::Add, modulus());
+                            return Ok(rem(shifted));
+                        }
                         None => {}
                     }
                 }

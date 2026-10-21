@@ -4268,7 +4268,7 @@ fn engine_info(e: &LimboError) -> Box<ErrorInfo> {
     // so its condition survives a rewording (wire-rev-1de981755-rest MED-9; 3d31f21b9 moved it to
     // another variant, and c44_rewording_a_parser_error_preserves_its_condition caught it).
     if let LimboError::ParseError(message) = e {
-        if message.kind() == Some(SqlErrorKind::InvalidTextRepresentation) {
+        if matches!(message.kind(), Some(SqlErrorKind::InvalidTextRepresentation | SqlErrorKind::InvalidParameterValue)) {
             return error(e.sql_error_kind(), message.to_string());
         }
     }
@@ -5537,7 +5537,7 @@ fn encode_row<'a>(
 /// engine's bytes under that type's name.
 /// The column types [`encode_binary`] encodes; a binary column of any other type is refused before
 /// its statement runs.
-const BINARY_ENCODED: [Type; 13] = [
+const BINARY_ENCODED: [Type; 14] = [
     Type::BOOL,
     Type::INT2,
     Type::INT4,
@@ -5551,6 +5551,9 @@ const BINARY_ENCODED: [Type; 13] = [
     Type::UNKNOWN,
     Type::JSON,
     Type::BYTEA,
+    // An oid is always an integer in the engine (an INTEGER column or a cast), sent as its four
+    // unsigned bytes (wire-rev-1de981755-rest LOW-6).
+    Type::OID,
 ];
 
 fn encode_binary(encoder: &mut DataRowEncoder, val: &Value, pg_type: &Type) -> PgWireResult<()> {
@@ -5577,6 +5580,8 @@ fn encode_binary(encoder: &mut DataRowEncoder, val: &Value, pg_type: &Type) -> P
             _ if *t == Type::INT2 => encoder.encode_field(&i16::try_from(*i).map_err(range)?),
             _ if *t == Type::INT4 => encoder.encode_field(&i32::try_from(*i).map_err(range)?),
             _ if *t == Type::INT8 => encoder.encode_field(i),
+            // An oid is its four unsigned bytes (wire-rev-1de981755-rest LOW-6: refused 0A000).
+            _ if *t == Type::OID => encoder.encode_field(&u32::try_from(*i).map_err(range)?),
             _ if *t == Type::FLOAT4 => encoder.encode_field(&(*i as f32)),
             _ if *t == Type::FLOAT8 => encoder.encode_field(&(*i as f64)),
             _ if text_like => encoder.encode_field(&i.to_string().as_str()),
