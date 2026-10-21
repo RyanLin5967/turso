@@ -15,8 +15,24 @@ pub type SharedProgressHandler = std::sync::Arc<dyn Fn() -> bool + Send + Sync>;
 /// - a non-zero callback result interrupts the running operation
 #[derive(Default)]
 pub(crate) struct ProgressHandler {
-    callback: RwLock<Option<ProgressHandlerCallback>>,
+    callback: RwLock<Option<Callback>>,
     ops: AtomicU64,
+}
+
+/// The installed callback, as its caller handed it over: a box it gave up, or a handler it shares
+/// across connections, kept as given so installing it allocates nothing (fastest-wire M4).
+enum Callback {
+    Boxed(ProgressHandlerCallback),
+    Shared(SharedProgressHandler),
+}
+
+impl Callback {
+    fn call(&self) -> bool {
+        match self {
+            Callback::Boxed(f) => f(),
+            Callback::Shared(f) => f(),
+        }
+    }
 }
 
 impl std::fmt::Debug for ProgressHandler {
@@ -38,6 +54,19 @@ impl ProgressHandler {
     /// SQLite disables the handler when `N < 1` or the callback is null, so we
     /// do the same here by clearing both the callback and opcode interval.
     pub(crate) fn set(&self, ops: u64, callback: Option<ProgressHandlerCallback>) {
+        self.install(ops, callback.map(Callback::Boxed));
+    }
+
+    /// Install or clear a handler shared across connections, as `set`, without boxing it.
+    /// Mutant `progress_shared_reboxed` (test builds only): boxed again, as at the red.
+    pub(crate) fn set_shared(&self, ops: u64, callback: Option<SharedProgressHandler>) {
+        if crate::branch::store::fe_mutant("progress_shared_reboxed") {
+            return self.set(ops, callback.map(|h| Box::new(move || h()) as ProgressHandlerCallback));
+        }
+        self.install(ops, callback.map(Callback::Shared));
+    }
+
+    fn install(&self, ops: u64, callback: Option<Callback>) {
         if ops == 0 || callback.is_none() {
             *self.callback.write() = None;
             self.ops.store(0, Ordering::SeqCst);
@@ -67,7 +96,7 @@ impl ProgressHandler {
         }
         let callback = self.callback.read();
         match callback.as_ref() {
-            Some(callback) => callback(),
+            Some(callback) => callback.call(),
             None => false,
         }
     }

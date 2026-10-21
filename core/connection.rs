@@ -5231,7 +5231,7 @@ impl Connection {
     /// connection it opens with one handler over its interrupts, and a branch switch opens one, so
     /// the boxed form cost an allocation per switch).
     pub fn set_progress_handler_shared(&self, ops: u64, handler: Option<crate::progress::SharedProgressHandler>) {
-        self.progress_handler.set(ops, handler.map(|h| Box::new(move || h()) as ProgressHandlerCallback));
+        self.progress_handler.set_shared(ops, handler);
     }
 
     /// Returns true when the step-based progress handler requests interruption.
