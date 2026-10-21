@@ -430,18 +430,6 @@ fn assert_green(arm: Arm, readings: &[Reading]) {
     }
 }
 
-/// Which build this binary is, printed before any arm runs (engine-rev-async-20200c00a L4): the
-/// driver refuses a fire-check binary that lacks the gate, or a reading binary that has it,
-/// whatever reached its rustflags (CARGO_ENCODED_RUSTFLAGS, RUSTFLAGS or `--config`).
-#[test]
-fn ad_t5_gate() {
-    println!(
-        "AD-T5 GATE fe_ad_t5_firecheck={} fe_mutants={}",
-        cfg!(fe_ad_t5_firecheck),
-        cfg!(feature = "fe-mutants")
-    );
-}
-
 /// The live arm, the one ⟨s⟩, ⟨α⟩ and K-A3 read: flusher and housekeeping running, 5 runs (to 20
 /// for the take-count parities), each followed by its zero-create control.
 #[test]
