@@ -15683,6 +15683,46 @@ fn a_cast_to_numeric_p_s_and_a_numeric_domain_column_are_numeric() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// wire-rev-351702a43 HIGH-1 (its PG 18.6 probe3 #89): a type modifier written as a string constant is the same modifier
+/// to PostgreSQL (typenameTypeMod), so NUMERIC('20','0') is NUMERIC(20,0). The translator read only integer modifiers and
+/// took any other spelling as bare NUMERIC, the engine's REAL: CAST('9007199254740993' AS NUMERIC('20','0')) answered
+/// 9.007199254740992e+15 past the p > 15 refusal. Every spelling is read in one place: a cast to NUMERIC('20','0') is
+/// refused as one to NUMERIC(20,0) is, a cast or a column with NUMERIC('8','2') rounds as NUMERIC(8,2) does, and a
+/// modifier that is no integer is refused, never dropped.
+#[test]
+fn a_numeric_type_modifier_is_read_in_every_spelling() {
+    let dir = Scratch::new("numeric-typmod-spellings");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let mut wrong = Vec::new();
+    for sql in [
+        "SELECT CAST('9007199254740993' AS NUMERIC('20','0'))",
+        "SELECT CAST('1' AS \"numeric\"('38','10'))",
+        "SELECT '1'::numeric('16')",
+    ] {
+        let r = a.q(sql);
+        if r.error.as_ref().map(|e| e.code.as_str()) != Some("0A000") {
+            wrong.push(format!("{sql}: rows {:?} error {:?}, refused 0A000 as its integer spelling is", r.rows, r.error));
+        }
+    }
+    let r = a.q("SELECT CAST(1.005 AS NUMERIC('8','2'))");
+    if r.error.is_some() || r.rows != vec![vec![Some("1.01".to_string())]] {
+        wrong.push(format!("CAST(1.005 AS NUMERIC('8','2')): rows {:?} error {:?}, rounded to 1.01 as NUMERIC(8,2) is", r.rows, r.error));
+    }
+    for sql in ["CREATE TABLE nt(id int, n numeric('8','2'))", "INSERT INTO nt VALUES (1, 1.005)"] {
+        a.q(sql).ok(sql);
+    }
+    let r = a.q("SELECT n FROM nt");
+    if r.rows != vec![vec![Some("1.01".to_string())]] {
+        wrong.push(format!("numeric('8','2') column: {:?} {:?}, PostgreSQL 1.01", r.rows, r.error));
+    }
+    let r = a.q("SELECT CAST(1 AS NUMERIC('x'))");
+    if r.error.is_none() {
+        wrong.push(format!("NUMERIC('x'): rows {:?}, refused (no integer modifier)", r.rows));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// wire-rev-cfdebc06d HIGH-1: a CAST to NUMERIC(p, s) is computed as the engine's REAL (96e5b7571), and
 /// a float8 holds every decimal of at most 15 significant digits exactly (DBL_DIG) but not more: past
 /// 15 the cast answered 9007199254740992 for 9007199254740993, so =, IN, GROUP BY and DISTINCT merged
