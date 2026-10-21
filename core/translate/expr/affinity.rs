@@ -76,6 +76,20 @@ pub(crate) fn get_expr_affinity(
         ast::Expr::RowId { .. } => Affinity::Integer,
         ast::Expr::Cast { type_name, .. } => {
             if let Some(type_name) = type_name {
+                // A CAST that applies a custom type yields its base primitive's values (a domain
+                // over text yields text), so it has that primitive's affinity, not the one
+                // SQLite's name rules give the type's name (engine-rev-types-08caaec44 MED 2:
+                // CAST(k AS du) < '9' compared as numbers). Needs the schema; with custom types off
+                // no name is registered. Mutant `cast_affinity_by_type_name` (test builds only):
+                // the name's, as before.
+                if let Some(resolver) = resolver.filter(|_| !crate::branch::store::fe_mutant("cast_affinity_by_type_name")) {
+                    let schema = resolver.schema();
+                    if type_name.array_dimensions == 0 && crate::translate::order_by::cast_applies_type(schema, type_name) {
+                        if let Ok(Some(resolved)) = schema.resolve_type_unchecked(&type_name.name) {
+                            return Affinity::affinity(&resolved.primitive);
+                        }
+                    }
+                }
                 Affinity::affinity(&type_name.name)
             } else {
                 Affinity::None
