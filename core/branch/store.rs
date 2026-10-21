@@ -4019,6 +4019,11 @@ fn run_links_fill(shared: &StoreMutex, writer: &Mutex<Catalog>, group: &Group, m
         let Some(cat) = inner.cat.as_mut() else {
             return;
         };
+        // h1-rev-72bfb0127 LOW-3: a fill superseded while its batch was in flight records nothing (the cursor
+        // and the store's fill state are the new fill's). Mutant `l4_fill_superseded_runs`: it records.
+        if !std::ptr::eq(&*cat.links_fill_stop, stop) && !fe_mutant("l4_fill_superseded_runs") {
+            return;
+        }
         if batch.is_ok() {
             cat.links_columns_made.store(true, Ordering::Release);
         }

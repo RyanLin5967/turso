@@ -279,19 +279,64 @@ fn past_the_hard_log_limit_no_sharp_checkpoint_links_the_whole_catalog() {
     assert!(log < peak, "sharp: the log was not cut past the hard limit ({log} B at the end, {peak} B at the limit)");
 }
 
-/// h1-rev-72bfb0127 LOW-3: past the hard limit the gate stops the fill and a later checkpoint starts a new
-/// one; a fill superseded so (still in its batch or pause) starts no further batch, so two fills never run
-/// batches together, write cursors at a stale generation, or outlive the store unjoined. Read from the
-/// whole-catalog child at 1,000 rows. Premise: the fill was started more than once.
+/// The LOW-3 schedule, forced: a fill's first committed batch is held before it is recorded
+/// (`LINKS_FILL_HOLD_UNRECORDED`); past the hard limit the gate stops it and a checkpoint cuts the log; a later
+/// threshold starts a second fill (it is held after its first batch too); then the hold is let go, and the
+/// first fill, superseded, must record nothing and start no batch.
+#[test]
+fn ls_superseded_child() {
+    if !in_child() {
+        return;
+    }
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("s.db");
+    older_store(&path, 1_000);
+    super::journal::set_compact_threshold(4 << 10);
+    super::store::LINKS_FILL_HELD_BATCHES.store(0, Ordering::Release);
+    super::store::LINKS_FILL_HOLD_UNRECORDED.store(true, Ordering::Release);
+    let db = open(&path);
+    db.branch_wait_name_filter();
+    let trunk = db.connect().unwrap();
+    let sup0 = super::store::LINKS_FILL_SUPERSEDED_BATCHES.load(Ordering::Acquire);
+    let mut k = 0;
+    while super::store::LINKS_FILL_HELD_BATCHES.load(Ordering::Acquire) < 1 && k < 20_000 {
+        let _ = trunk.fork_branch().unwrap().into_id();
+        k += 1;
+    }
+    let held_first = super::store::LINKS_FILL_HELD_BATCHES.load(Ordering::Acquire);
+    // Past the hard limit (the columns are made: the gate stops the fill and lets a checkpoint cut), then on
+    // until a second fill has started.
+    let (past, peak) = fork_past_hard_and_cut(&db, &trunk, &path);
+    let cut = log_present(&path) < peak;
+    let mut k = 0;
+    while db.branches.links_fill_state_for_test().2 < 2 && k < 20_000 {
+        let _ = trunk.fork_branch().unwrap().into_id();
+        k += 1;
+    }
+    let starts = db.branches.links_fill_state_for_test().2;
+    super::store::LINKS_FILL_HOLD_UNRECORDED.store(false, Ordering::Release);
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    let superseded = super::store::LINKS_FILL_SUPERSEDED_BATCHES.load(Ordering::Acquire) - sup0;
+    println!("LS-SUP held={held_first} past={} cut={} starts={starts} superseded={superseded}", u64::from(past), u64::from(cut));
+}
+
+/// h1-rev-72bfb0127 LOW-3: a fill that a later spawn superseded (past the hard limit the gate stops a fill and a
+/// later checkpoint starts a new one) starts no further batch, so two fills never run batches together or write
+/// cursors at a stale generation; superseded fill threads are joined with the flights. Premises: the first fill
+/// was held after a committed batch, the store passed the hard limit and cut its log, and a second fill started
+/// while the first was held. Mutant `l4_fill_superseded_runs` must fail it.
 #[test]
 fn past_the_hard_log_limit_a_superseded_fill_starts_no_batch() {
     if in_child() {
         return;
     }
-    let text = child("ls_hard_whole_child", &[("FE_LS_ROWS", "1000")]);
-    let r = readings(&text, "LS-WHOLE ");
+    let text = child("ls_superseded_child", &[]);
+    let r = readings(&text, "LS-SUP ");
     assert_eq!(r.len(), 1, "premise: the child reported:\n{text}");
-    let (starts, superseded) = (r[0][9], r[0][10]);
+    let (held, past, cut, starts, superseded) = (r[0][0], r[0][1], r[0][2], r[0][3], r[0][4]);
+    println!("LS superseded: held {held} past {past} cut {cut} starts {starts} superseded batches {superseded}");
+    assert!(held >= 1, "premise: the first fill's batch was not held");
+    assert_eq!((past, cut), (1, 1), "premise: the store did not pass the hard limit and cut its log (past {past}, cut {cut})");
     assert!(starts >= 2, "premise: the fill was started {starts} time(s), never superseded");
     assert_eq!(superseded, 0, "a superseded fill started {superseded} batches (fill started {starts} times)");
 }
@@ -1176,7 +1221,10 @@ fn start_fill_past(db: &Arc<Database>, trunk: &Arc<crate::Connection>, path: &st
 }
 
 /// Fork from trunk until the log passes the hard limit (`past`, read then), then 200 more, then wait (30 s at
-/// most) for a checkpoint to cut the log under `peak`, its size at the limit. `(past, peak)`.
+/// most) for a checkpoint to cut the log under `peak`, its size at the limit, forking one more every 50 ms
+/// meanwhile (operations go on, as in use: a checkpoint the fill gate held starts at the next one; measured on
+/// iccad13, amendment 22, where 200 creates ran before the fill's column-only transaction was recorded).
+/// `(past, peak)`.
 fn fork_past_hard_and_cut(db: &Arc<Database>, trunk: &Arc<crate::Connection>, path: &std::path::Path) -> (bool, u64) {
     let mut k = 0;
     while !db.branches.past_hard_limit_for_test() && k < 20_000 {
@@ -1190,7 +1238,8 @@ fn fork_past_hard_and_cut(db: &Arc<Database>, trunk: &Arc<crate::Connection>, pa
     }
     let t = std::time::Instant::now();
     while log_present(path) >= peak && t.elapsed() < std::time::Duration::from_secs(30) {
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let _ = trunk.fork_branch().unwrap().into_id();
     }
     (past, peak)
 }
