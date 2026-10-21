@@ -13,6 +13,7 @@ competitors/fthelp.py	selftest	any	pure Python over records
 competitors/gen_seed.py	selftest	any	pure Python over records
 competitors/pins.py	selftest	any	pure Python over records
 competitors/raw_schema.py	selftest	any	pure Python over the load producers' sources
+competitors/reduce.py	selftest	any	pure Python over records (test_reduce_concurrency's cases, comp-rev-89ec-b3c3 MED 3 and LOW 5)
 competitors/sched_check.py	selftest	any	pure Python over records
 competitors/smoke_table.py	selftest	any	pure Python over records
 competitors/spec_lint.py	selftest	any	pure Python over records
