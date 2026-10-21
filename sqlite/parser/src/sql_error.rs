@@ -67,6 +67,10 @@ pub enum SqlErrorKind {
     BadCopyFileFormat,
     // A limit an input is past (COPY's longest line).
     ProgramLimitExceeded,
+    // A limit the configuration sets (COPY's spill past --temp-file-limit, as temp_file_limit).
+    ConfigurationLimitExceeded,
+    // A file or directory that does not exist (errcode_for_file_access's ENOENT).
+    UndefinedFile,
 }
 
 /// A diagnostic's text and optional, explicitly assigned SQL condition.

@@ -125,6 +125,25 @@ struct Opts {
 
     #[clap(
         long,
+        help = "The directory COPY FROM spills its rows to until it inserts them (an unlinked file, \
+                mode 0600); checked at startup. Default: the database's own directory, then \
+                $TMPDIR, then /tmp"
+    )]
+    copy_spill_dir: Option<PathBuf>,
+
+    #[clap(
+        long,
+        default_value_t = -1,
+        allow_negative_numbers = true,
+        value_parser = clap::value_parser!(i64).range(-1..=i32::MAX as i64),
+        help = "The largest spill a COPY FROM writes, in kB, past which it refuses the COPY with \
+                53400, as PostgreSQL's temp_file_limit (COPY's spill is the only file it limits); \
+                -1 (the default, as PostgreSQL's) for no limit"
+    )]
+    temp_file_limit: i64,
+
+    #[clap(
+        long,
         default_value_t = turso_pg_server::DEFAULT_AUTHENTICATION_TIMEOUT_S,
         value_parser = clap::value_parser!(u64).range(1..=600),
         help = "With --server: how long a client has to complete its startup before the session \
@@ -1178,6 +1197,22 @@ fn main() -> anyhow::Result<()> {
     if let Some(bytes) = opts.copy_line_limit {
         turso_pg::set_copy_line_limit(bytes as usize);
     }
+    // COPY's spill: the operator's directory, checked now so a bad one stops the server before a
+    // client meets it (review wire-rev-copystdin3 M1); else beside the database.
+    if let Some(dir) = &opts.copy_spill_dir {
+        turso_pg::check_copy_spill_dir(dir).map_err(|e| {
+            anyhow::anyhow!("--copy-spill-dir {}: COPY cannot create its spill file there: {e}", dir.display())
+        })?;
+    }
+    let beside = (db_file != ":memory:").then(|| {
+        let parent = std::path::Path::new(&db_file)
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(std::path::Path::new("."));
+        std::fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf())
+    });
+    turso_pg::set_copy_spill_place(opts.copy_spill_dir.clone(), beside);
+    turso_pg::set_temp_file_limit_kb(opts.temp_file_limit);
     // Server mode: start PG wire protocol server and exit. Every session opens its own
     // connection.
     if let Some(ref address) = opts.server {

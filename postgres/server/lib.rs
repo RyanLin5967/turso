@@ -1021,32 +1021,70 @@ impl<S: std::ops::Deref<Target = SessionSockets>> Drop for Registered<S> {
 /// allows (and PostgreSQL's authentication_timeout's default); `--authentication-timeout` sets it.
 pub const DEFAULT_AUTHENTICATION_TIMEOUT_S: u64 = 60;
 
-/// Wait, during COPY FROM STDIN, until the client's next message can be read (or its stream
-/// ends), polling every 100 ms for what ends a stalled COPY ([`Session::copy_interrupted`]):
-/// Some(its message) when it came first. The caller reads at once a message already in the
-/// codec's buffer, or from a socket that is not a plain blocking one.
-fn wait_for_copy_data(
-    io: &mut pgwire::tokio::server::BlockingTcp,
-    session: &Session,
-) -> Option<String> {
-    let poll = std::time::Duration::from_millis(100);
-    let mut byte = [0u8; 1];
-    let answer = loop {
-        if io.socket.set_read_timeout(Some(poll)).is_err() {
-            break None;
-        }
-        match io.socket.peek(&mut byte) {
-            Ok(_) => break None,
-            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
-                if let Some(why) = session.copy_interrupted() {
-                    break Some(why);
-                }
-            }
-            Err(_) => break None,
-        }
+/// The longest CopyData the codec reads (pgwire's LARGE_PACKET_SIZE_LIMIT) and the longest
+/// CopyDone or CopyFail (its SMALL_PACKET_SIZE_LIMIT), counting the length word.
+const COPY_DATA_LIMIT: usize = 0x3fff_fffe;
+const COPY_END_LIMIT: usize = 10000;
+
+/// Whether `buf`, the codec's unread bytes during COPY, is the start of a CopyData, CopyDone or
+/// CopyFail not yet whole (or empty), which serve_session's COPY wait reads on; false for a whole
+/// message, or for any other the codec is to read or refuse at once (another type, a length the
+/// codec refuses).
+fn copy_message_incomplete(buf: &[u8]) -> bool {
+    let Some(&kind) = buf.first() else {
+        return true;
     };
-    let _ = io.socket.set_read_timeout(None);
-    answer
+    let limit = match kind {
+        b'd' => COPY_DATA_LIMIT,
+        b'c' | b'f' => COPY_END_LIMIT,
+        _ => return false,
+    };
+    let Some(len) = buf.get(1..5) else {
+        return true;
+    };
+    let len = u32::from_be_bytes(len.try_into().expect("four bytes")) as usize;
+    if !(4..=limit).contains(&len) {
+        return false;
+    }
+    buf.len() < 1 + len
+}
+
+/// What one read of a COPY's socket gave ([`read_copy_bytes`]).
+enum CopyRead {
+    /// This many bytes, at the front of the chunk.
+    Bytes(usize),
+    /// Nothing within the poll: the caller looks for a cancel or the timeout.
+    Quiet,
+    /// The stream's end or an error: the codec reads it next, and the session ends as it does.
+    End,
+}
+
+/// One read of a COPY's socket into `chunk`, waiting at most 100 ms ([`serve_session`]'s COPY
+/// wait).
+fn read_copy_bytes(io: &mut pgwire::tokio::server::BlockingTcp, chunk: &mut [u8]) -> CopyRead {
+    if io
+        .socket
+        .set_read_timeout(Some(std::time::Duration::from_millis(100)))
+        .is_err()
+    {
+        return CopyRead::End;
+    }
+    loop {
+        match std::io::Read::read(&mut io.socket, chunk) {
+            Ok(0) => return CopyRead::End,
+            Ok(n) => return CopyRead::Bytes(n),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                return CopyRead::Quiet
+            }
+            Err(_) => return CopyRead::End,
+        }
+    }
 }
 
 /// A frontend message's type byte, as the client sent it (0 for the startup-phase messages, which
@@ -1147,6 +1185,8 @@ async fn serve_session(
     let cancel_handler = Arc::new(CancelSessions(session.shared.clone()));
     let error_handler = NoopHandler;
     let mut started = false;
+    // The COPY wait's read buffer, made at a session's first COPY.
+    let mut copy_chunk: Option<Vec<u8>> = None;
     let result = loop {
         let starting = matches!(
             socket.state(),
@@ -1165,14 +1205,44 @@ async fn serve_session(
         // its wait is watched: a CancelRequest or its statement_timeout ends it at once, with
         // PostgreSQL's 57014, as the next message would (review wire-rev-copystdin M3; PostgreSQL
         // answers only at that next message, its COPY blocking no other writer).
+        //
+        // The wait lasts until the codec's buffer holds the client's next whole message (or the
+        // stream ends), the bytes read into that buffer here, so a client stopped inside a
+        // message is watched as one stopped between messages: the wait watched only while no
+        // byte had come, then the read blocked on the rest, and a cancel or the timeout went
+        // unanswered while a block's write lock stayed held (review wire-rev-copystdin3 L3,
+        // `partialblock`). A socket that is not a plain blocking one is read by the codec at
+        // once. The codec decodes from its buffer before it reads as long as its last read gave
+        // it a frame (tokio_util's FramedImpl `is_readable`), which holds: during COPY the
+        // session reads only whole messages, so what is put in the buffer is decoded with no
+        // further read.
         if matches!(socket.state(), PgWireConnectionState::CopyInProgress(_)) {
-            let buffered = !socket.read_buffer().is_empty();
-            let why = match socket.get_mut() {
-                pgwire::tokio::server::MaybeTls::Blocking(io) if !buffered => {
-                    wait_for_copy_data(io, &session)
+            let mut read = false;
+            let why = loop {
+                if !copy_message_incomplete(socket.read_buffer()) {
+                    break None;
                 }
-                _ => None,
+                let pgwire::tokio::server::MaybeTls::Blocking(io) = socket.get_mut() else {
+                    break None;
+                };
+                let chunk = copy_chunk.get_or_insert_with(|| vec![0u8; 65536]);
+                read = true;
+                match read_copy_bytes(io, chunk) {
+                    CopyRead::Bytes(n) => socket.read_buffer_mut().extend_from_slice(&chunk[..n]),
+                    CopyRead::Quiet => {}
+                    CopyRead::End => break None,
+                }
+                // Looked for after every read that leaves the message unfinished, not only after
+                // a quiet poll: a client that trickles a byte at a time never leaves one quiet.
+                if copy_message_incomplete(socket.read_buffer()) {
+                    if let Some(why) = session.copy_interrupted() {
+                        break Some(why);
+                    }
+                }
             };
+            if let (true, pgwire::tokio::server::MaybeTls::Blocking(io)) = (read, socket.get_mut()) {
+                let _ = io.socket.set_read_timeout(None);
+            }
             if let Some(why) = why {
                 let extended = matches!(socket.state(), PgWireConnectionState::CopyInProgress(true));
                 let info = session.copy_failed(SqlErrorKind::QueryCanceled, why);
@@ -2491,6 +2561,11 @@ impl Session {
         let _ = self.copy_asked();
         if piece && result.is_ok() {
             return None;
+        }
+        // The COPY is over: its loader and spill file go before it is answered, whatever kept
+        // them (review wire-rev-copystdin3 M2).
+        if let Some(conn) = &conn {
+            conn.end_copy();
         }
         let PendingCopy {
             statements,

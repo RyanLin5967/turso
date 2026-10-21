@@ -546,6 +546,15 @@ impl PgConnection {
         }
     }
 
+    /// The COPY FROM STDIN is over, however it ended: its loader, and the spill file it holds, go
+    /// now. The server calls it once a COPY's last run is answered, so a failure the run keeps
+    /// the loader for (a lock wait whose final attempt also met the lock) frees it too.
+    pub fn end_copy(&self) {
+        if let Some(copy) = &self.inner.copy_stdin {
+            copy.lock().loader = None;
+        }
+    }
+
     /// The relations named by statements prepared inside the open block since the last take.
     pub fn take_block_reads(&self) -> Vec<turso_pg_parser::translator::PgRelationName> {
         std::mem::take(&mut *self.inner.block_reads.lock())
@@ -4217,6 +4226,90 @@ pub fn set_copy_line_limit(bytes: usize) {
     COPY_LINE_LIMIT.store(bytes, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Where COPY's spill file goes ([`CopySpill`]): the directory the operator set
+/// (`--copy-spill-dir`), else the database's own directory, as PostgreSQL keeps its temporary
+/// files under its data directory. None of either: $TMPDIR, then /tmp.
+struct SpillPlace {
+    configured: Option<std::path::PathBuf>,
+    beside: Option<std::path::PathBuf>,
+}
+
+static COPY_SPILL_PLACE: std::sync::RwLock<SpillPlace> = std::sync::RwLock::new(SpillPlace {
+    configured: None,
+    beside: None,
+});
+
+/// The largest spill a COPY writes, in kB, or -1 for none (the server's `--temp-file-limit`, as
+/// PostgreSQL's temp_file_limit, whose default is -1).
+static TEMP_FILE_LIMIT_KB: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(-1);
+
+/// Where COPY FROM spills, process-wide: `configured` (the server's `--copy-spill-dir`, checked
+/// by [`check_copy_spill_dir`] first) alone when set; else `beside`, the database's directory,
+/// then $TMPDIR, then /tmp, the first that takes the file.
+pub fn set_copy_spill_place(configured: Option<std::path::PathBuf>, beside: Option<std::path::PathBuf>) {
+    let mut place = COPY_SPILL_PLACE.write().unwrap_or_else(|e| e.into_inner());
+    *place = SpillPlace { configured, beside };
+}
+
+/// The largest spill a COPY writes, in kB; -1 for no limit (`--temp-file-limit`).
+pub fn set_temp_file_limit_kb(kb: i64) {
+    TEMP_FILE_LIMIT_KB.store(kb, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether COPY can spill into `dir`: a file is created there, as a spill is, and removed. The
+/// server checks its `--copy-spill-dir` so at startup, so a directory it cannot use stops it
+/// before any client meets it.
+pub fn check_copy_spill_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    let (file, path) = create_spill_file(dir)?;
+    drop(file);
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
+
+/// A new spill file in `dir`, open for reading and writing, its owner's alone (0600) from its
+/// creation (review wire-rev-copystdin3 L4: the default 0666 under the umask let another local
+/// user open it before its unlink), never an existing file or a link (O_EXCL).
+fn create_spill_file(dir: &std::path::Path) -> std::io::Result<(std::fs::File, std::path::PathBuf)> {
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let path = dir.join(format!(
+        "turso-copy-{}-{}",
+        std::process::id(),
+        N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let file = options.open(&path)?;
+    Ok((file, path))
+}
+
+/// A file error of COPY's spill, as PostgreSQL's errcode_for_file_access classes it, in its words
+/// (`could not create temporary file "…": …`): a full disk 53100, a missing directory 58P01, a
+/// refused one 42501, anything else XX000. The spill failed with XX000 "the spill file failed"
+/// whatever the cause (review wire-rev-copystdin3 M1).
+fn spill_file_error(doing: &str, path: &std::path::Path, e: &std::io::Error) -> LimboError {
+    use std::io::ErrorKind;
+    let kind = match e.kind() {
+        ErrorKind::StorageFull => SqlErrorKind::DiskFull,
+        ErrorKind::NotFound => SqlErrorKind::UndefinedFile,
+        ErrorKind::PermissionDenied | ErrorKind::ReadOnlyFilesystem => {
+            SqlErrorKind::InsufficientPrivilege
+        }
+        _ => SqlErrorKind::InternalError,
+    };
+    // The system's text alone, as %m prints it: Rust appends " (os error N)".
+    let text = e.to_string();
+    let text = match text.rfind(" (os error ") {
+        Some(at) => text[..at].to_string(),
+        None => text,
+    };
+    LimboError::InvalidArgument(SqlErrorMessage::classified(
+        kind,
+        format!("could not {doing} \"{}\": {text}", path.display()),
+    ))
+}
+
 /// PostgreSQL's multi-insert buffer: rows are inserted once 1000 are read, or their lines hold
 /// 64 KB (CopyMultiInsertBufferFull's MAX_BUFFERED_TUPLES, MAX_BUFFERED_BYTES; the bytes are the
 /// lines', as PostgreSQL's line_buf counts them: the review's `order-bytes` agrees), and at the end.
@@ -4340,9 +4433,10 @@ impl CopyLoader {
 
     /// A line failed with `e`: PostgreSQL had inserted every full batch before it, so their
     /// insert's error, if any, is the COPY's (in a transaction or savepoint rolled back at once).
-    /// A lock wait or any failure of the spill itself leaves `e` the answer.
+    /// A lock wait or any failure of the spill itself leaves `e` the answer; a spill whose write
+    /// failed (its limit, a full disk) is not read back, as it may end inside a row.
     fn fail(&mut self, pg_conn: &Arc<PgConnectionInner>, e: LimboError) -> LimboError {
-        let Some(spill) = &mut self.spill else {
+        let Some(spill) = self.spill.as_mut().filter(|s| !s.failed) else {
             return e;
         };
         let target = &self.target;
@@ -4402,41 +4496,96 @@ fn insert_copy_rows(
 }
 
 /// COPY's full batches, written to an unlinked temporary file until the COPY inserts them: per row
-/// its number of values, then each value's length (u32::MAX for NULL) and bytes.
+/// its number of values, then each value's length (u32::MAX for NULL) and bytes. That is 1.0x
+/// (wide rows) to 4.4x (one-byte fields) the data (review wire-rev-copystdin3 M1, `spillsize`),
+/// up to `--temp-file-limit`.
 struct CopySpill {
     file: std::fs::File,
     writer: std::io::BufWriter<std::fs::File>,
+    /// Where it was created (unlinked since), for its errors' text.
+    path: std::path::PathBuf,
+    /// Bytes written, against the limit.
+    written: u64,
+    /// A write failed, so the file may end inside a row: it is never read back.
+    failed: bool,
 }
 
 impl CopySpill {
+    /// A spill file in its place ([`set_copy_spill_place`]): the configured directory alone, else
+    /// the first of the database's directory, $TMPDIR and /tmp that takes it, so a missing or
+    /// refused TMPDIR does not fail the COPY (review wire-rev-copystdin3 M1, `tmpdir`: XX000 for
+    /// every COPY over 1000 rows). Every place refusing: the first one's error.
     fn new() -> Result<Self> {
-        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let io = |e: std::io::Error| {
-            LimboError::InternalError(format!("COPY FROM: the spill file failed: {e}"))
+        let candidates: Vec<std::path::PathBuf> = {
+            let place = COPY_SPILL_PLACE.read().unwrap_or_else(|e| e.into_inner());
+            match &place.configured {
+                Some(dir) => vec![dir.clone()],
+                None => {
+                    let mut dirs: Vec<std::path::PathBuf> = place.beside.iter().cloned().collect();
+                    for dir in [std::env::temp_dir(), std::path::PathBuf::from("/tmp")] {
+                        if !dirs.contains(&dir) {
+                            dirs.push(dir);
+                        }
+                    }
+                    dirs
+                }
+            }
         };
-        let path = std::env::temp_dir().join(format!(
-            "turso-copy-{}-{}",
-            std::process::id(),
-            N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ));
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .map_err(io)?;
-        // Unlinked at once: the file goes with its last handle, however the COPY ends.
-        let _ = std::fs::remove_file(&path);
-        let writer = std::io::BufWriter::new(file.try_clone().map_err(io)?);
-        Ok(Self { file, writer })
+        let mut first: Option<LimboError> = None;
+        for dir in &candidates {
+            match create_spill_file(dir) {
+                Ok((file, path)) => {
+                    // Unlinked at once: the file goes with its last handle, however the COPY ends.
+                    let _ = std::fs::remove_file(&path);
+                    let writer = std::io::BufWriter::new(
+                        file.try_clone()
+                            .map_err(|e| spill_file_error("create temporary file", &path, &e))?,
+                    );
+                    return Ok(Self {
+                        file,
+                        writer,
+                        path,
+                        written: 0,
+                        failed: false,
+                    });
+                }
+                Err(e) => {
+                    let path = dir.join("turso-copy-*");
+                    first.get_or_insert_with(|| spill_file_error("create temporary file", &path, &e));
+                }
+            }
+        }
+        Err(first.unwrap_or_else(|| {
+            LimboError::InternalError("COPY FROM has no place to spill to".to_string())
+        }))
     }
 
+    /// `rows` appended. Past `--temp-file-limit` the write is refused before the row that would
+    /// pass it, with PostgreSQL 18.6's 53400 for its temp_file_limit (run copy-pgprobe11).
     fn write(&mut self, rows: Vec<crate::copy::CopyRow>) -> Result<()> {
+        let written = self.write_rows(rows);
+        if written.is_err() {
+            self.failed = true;
+        }
+        written
+    }
+
+    fn write_rows(&mut self, rows: Vec<crate::copy::CopyRow>) -> Result<()> {
         use std::io::Write;
-        let io = |e: std::io::Error| {
-            LimboError::InternalError(format!("COPY FROM: the spill file failed: {e}"))
-        };
+        let limit_kb = TEMP_FILE_LIMIT_KB.load(std::sync::atomic::Ordering::Relaxed);
         for row in rows {
+            let size = 4 + row
+                .iter()
+                .map(|v| 4 + v.as_ref().map_or(0, |s| s.len() as u64))
+                .sum::<u64>();
+            if limit_kb >= 0 && self.written + size > limit_kb as u64 * 1024 {
+                return Err(LimboError::InvalidArgument(SqlErrorMessage::classified(
+                    SqlErrorKind::ConfigurationLimitExceeded,
+                    format!("temporary file size exceeds \"temp_file_limit\" ({limit_kb}kB)"),
+                )));
+            }
+            let path = &self.path;
+            let io = |e: std::io::Error| spill_file_error("write to file", path, &e);
             self.writer.write_all(&(row.len() as u32).to_le_bytes()).map_err(io)?;
             for value in row {
                 match value {
@@ -4447,6 +4596,7 @@ impl CopySpill {
                     None => self.writer.write_all(&u32::MAX.to_le_bytes()).map_err(io)?,
                 }
             }
+            self.written += size;
         }
         Ok(())
     }
@@ -4454,20 +4604,23 @@ impl CopySpill {
     /// Every row written, from the first.
     fn rows(&mut self) -> Result<impl Iterator<Item = Result<crate::copy::CopyRow>>> {
         use std::io::{Read, Seek, Write};
-        let io = |e: std::io::Error| {
-            LimboError::InternalError(format!("COPY FROM: the spill file failed: {e}"))
-        };
-        self.writer.flush().map_err(io)?;
-        let mut file = self.file.try_clone().map_err(io)?;
-        let end = file.seek(std::io::SeekFrom::End(0)).map_err(io)?;
-        file.seek(std::io::SeekFrom::Start(0)).map_err(io)?;
+        let path = self.path.clone();
+        let io = move |e: std::io::Error| spill_file_error("read from file", &path, &e);
+        if let Err(e) = self.writer.flush() {
+            self.failed = true;
+            return Err(spill_file_error("write to file", &self.path, &e));
+        }
+        let mut file = self.file.try_clone().map_err(&io)?;
+        let end = file.seek(std::io::SeekFrom::End(0)).map_err(&io)?;
+        file.seek(std::io::SeekFrom::Start(0)).map_err(&io)?;
         let mut reader = std::io::BufReader::new(file.take(end));
+        let word_io = io.clone();
         let word = move |reader: &mut std::io::BufReader<std::io::Take<std::fs::File>>| {
             let mut b = [0u8; 4];
             match reader.read_exact(&mut b) {
                 Ok(()) => Ok(Some(u32::from_le_bytes(b))),
                 Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(None),
-                Err(e) => Err(io(e)),
+                Err(e) => Err(word_io(e)),
             }
         };
         Ok(std::iter::from_fn(move || {
@@ -4554,13 +4707,20 @@ fn handle_pg_copy_from_stdin(
         }
         // The loader is taken for the piece and put back after, never copied. A piece only reads
         // (no row goes in before the end, [`CopyLoader`]), so a run the server repeats after a
-        // lock wait is the end's insert, which [`CopyLoader::feed`] does again without reading.
+        // lock wait is the end's insert, which [`CopyLoader::feed`] does again without reading:
+        // the loader is kept for that alone. Any other failure ends the COPY, and the loader,
+        // with its spill file and the disk it holds, goes at once (review wire-rev-copystdin3
+        // M2: it was kept until the session's next COPY or its end).
         Some(CopyEnd::Chunk(bytes)) | Some(CopyEnd::Done(bytes)) => {
             let last = matches!(end.as_deref(), Some(CopyEnd::Done(_)));
             let mut loader = copy.lock().loader.take().ok_or_else(missing)?;
             let fed = loader.feed(pg_conn, bytes, last);
             let rows = loader.rows;
-            if !last || fed.is_err() {
+            let retried = matches!(
+                fed,
+                Err(LimboError::Busy | LimboError::BusySnapshot | LimboError::SchemaUpdated)
+            );
+            if (!last && fed.is_ok()) || retried {
                 copy.lock().loader = Some(loader);
             }
             fed?;
@@ -4994,6 +5154,13 @@ fn numeric_fits(field: &str, p: i64, s: i64) -> std::result::Result<NumericFit, 
             exponent = -exponent;
         }
     }
+    // numeric_in refuses an exponent past ±(INT32_MAX / 2) whatever the digits, zeros too
+    // (set_var_from_str; recorded, PostgreSQL 18.6 run copy-pgprobe11: `1e-1073741824`,
+    // `0e1073741824` 22003 "value overflows numeric format", `1e-1073741823` 0.00; review
+    // wire-rev-copystdin3 L2). The clamp above is past it.
+    if exponent.abs() > 1_073_741_823 {
+        return Ok(NumericFit::FormatOverflow);
+    }
     if !digits.iter().any(|&d| d != 0) {
         return Ok(NumericFit::Zero);
     }
@@ -5039,11 +5206,13 @@ fn numeric_fits(field: &str, p: i64, s: i64) -> std::result::Result<NumericFit, 
 
 /// [`numeric_fits`]'s answer: the value fits as written, rounds to 0 (stored as `0`, which the
 /// engine reads whatever the exponent was: `1e-2000000` was its 22003 "value overflows numeric
-/// format"), or overflows.
+/// format"), overflows numeric(p, s) ("numeric field overflow"), or has an exponent numeric_in
+/// itself cannot hold ("value overflows numeric format").
 enum NumericFit {
     Fits,
     Zero,
     Overflow,
+    FormatOverflow,
 }
 
 /// Why [`pg_integer`] refused a field: its syntax (22P02) or its range (22003).
@@ -5220,6 +5389,10 @@ impl CopyInput {
                 Ok(NumericFit::Overflow) => refuse(
                     SqlErrorKind::NumericValueOutOfRange,
                     "numeric field overflow".to_string(),
+                ),
+                Ok(NumericFit::FormatOverflow) => refuse(
+                    SqlErrorKind::NumericValueOutOfRange,
+                    "value overflows numeric format".to_string(),
                 ),
                 Err(()) => refuse(
                     SqlErrorKind::InvalidTextRepresentation,
@@ -5531,6 +5704,32 @@ fn attached_schema_file(conn: &Arc<Connection>, schema_name: &str) -> Result<Opt
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A spill file's error takes PostgreSQL's errcode_for_file_access class and its words: a
+    /// full disk 53100, a missing directory 58P01, a refused one 42501, anything else XX000
+    /// (review wire-rev-copystdin3 M1: every one was XX000 "the spill file failed"). The full disk
+    /// cannot be made without privilege, so it is read from the errno here, not met at a COPY.
+    #[test]
+    fn a_spill_files_error_takes_postgresqls_file_access_class() {
+        let path = std::path::Path::new("/d/turso-copy-1-0");
+        for (errno, code, text) in [
+            (28, "53100", "could not write to file \"/d/turso-copy-1-0\": No space left on device"),
+            (2, "58P01", "could not write to file \"/d/turso-copy-1-0\": No such file or directory"),
+            (13, "42501", "could not write to file \"/d/turso-copy-1-0\": Permission denied"),
+            (30, "42501", "could not write to file \"/d/turso-copy-1-0\": Read-only file system"),
+            (5, "XX000", "could not write to file \"/d/turso-copy-1-0\": Input/output error"),
+        ] {
+            let e = spill_file_error("write to file", path, &std::io::Error::from_raw_os_error(errno));
+            let LimboError::InvalidArgument(m) = &e else {
+                panic!("errno {errno}: {e:?}");
+            };
+            assert_eq!(
+                (crate::sqlstate(m.kind().expect("classified")), m.as_str()),
+                (code, text),
+                "errno {errno}"
+            );
+        }
+    }
 
     fn run(conn: &crate::Connection, sql: &str) {
         let mut stmt = conn.prepare(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));

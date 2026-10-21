@@ -69,5 +69,7 @@ pub fn sqlstate(kind: SqlErrorKind) -> &'static str {
         InvalidDatetimeFormat => "22007",
         BadCopyFileFormat => "22P04",
         ProgramLimitExceeded => "54000",
+        ConfigurationLimitExceeded => "53400",
+        UndefinedFile => "58P01",
     }
 }
