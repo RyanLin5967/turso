@@ -9651,6 +9651,21 @@ impl Drop for BranchStore {
             if let Err(e) = self.compact_now() {
                 tracing::warn!("branch catalog upgrade not flipped at close: {e}");
             }
+        } else {
+            // Lead ruling 2026-10-21T17:58:38Z: past the hard limit the fill gate defers each checkpoint until
+            // the fill's column-only transaction is recorded, and a deferred one starts at the next operation;
+            // the close is the last one, so it cuts here (the fill stopped and joined above, so no schema
+            // change can land under it), at the store's current version, never a flip. Mutant
+            // `l4_no_cut_at_close` (test builds only): not cut, as before.
+            let mut inner = self.inner.lock();
+            let cut_owed = inner.cat.is_some()
+                && !inner.cat.as_ref().is_some_and(|c| c.flight)
+                && inner.journal.as_ref().is_some_and(Journal::past_hard_limit);
+            if cut_owed && !fe_mutant("l4_no_cut_at_close") {
+                if let Err(e) = self.compact(&mut inner, false) {
+                    tracing::warn!("branch log not cut at close: {e}");
+                }
+            }
         }
         // The name filter's build holds the store's files too: stopped, then joined.
         self.name_filter_stop.store(true, Ordering::Release);
