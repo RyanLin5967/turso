@@ -17797,6 +17797,77 @@ fn a_float_numeric_or_boolean_column_reads_its_literal_as_its_input_routine_does
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// The lead's ruling (LEAD-RULINGS 9d87841628, 4): an array literal assigned to a float, real, numeric(p,s), boolean or
+/// varchar(n) array column is read element by element by the element type's input routine: out-of-range and
+/// malformed elements are refused with the element routine's code (22003, 22P02, 22001), even when no row matches,
+/// numeric elements are rounded to the column's scale, and a varchar element's excess spaces are cut. Expected
+/// answers: PG 18.6, recorded (artie 4a4b465a38,
+/// rec46-array-assign/pg18-wirefuzz-an_array_of_non_integer_elements_is_read_by_its_element_input_routine.out).
+#[test]
+fn an_array_of_non_integer_elements_is_read_by_its_element_input_routine() {
+    let dir = Scratch::new("array-element-assign");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let ddl = "CREATE TABLE na (id int PRIMARY KEY, f float8[], r real[], n numeric(5,2)[], b boolean[], t text[], v varchar(3)[])";
+    a.q(ddl).ok(ddl);
+    let mut wrong = Vec::new();
+    for (sql, code, message) in [
+        ("INSERT INTO na (id, f) VALUES (1, '{1.5,2e308}')", "22003", r#""2e308" is out of range for type double precision"#),
+        ("INSERT INTO na (id, f) VALUES (1, '{1.5,abc}')", "22P02", r#"invalid input syntax for type double precision: "abc""#),
+        ("INSERT INTO na (id, f) VALUES (1, '{1.5,NaN,-Infinity}')", "", ""),
+        ("INSERT INTO na (id, r) VALUES (2, '{1e39}')", "22003", r#""1e39" is out of range for type real"#),
+        ("INSERT INTO na (id, r) VALUES (2, '{0.1,1e-50}')", "22003", r#""1e-50" is out of range for type real"#),
+        ("INSERT INTO na (id, n) VALUES (3, '{1.005,999.995}')", "22003", "numeric field overflow"),
+        ("INSERT INTO na (id, n) VALUES (3, '{1.005,2.5}')", "", ""),
+        ("INSERT INTO na (id, b) VALUES (4, '{t,maybe}')", "22P02", r#"invalid input syntax for type boolean: "maybe""#),
+        ("INSERT INTO na (id, b) VALUES (4, '{yes,off,NULL}')", "", ""),
+        ("INSERT INTO na (id, v) VALUES (5, '{abcd}')", "22001", "value too long for type character varying(3)"),
+        ("INSERT INTO na (id, v) VALUES (5, '{\"ab \",\"abc   \"}')", "", ""),
+        ("INSERT INTO na (id, t) VALUES (6, '{a,\"b,c\",NULL}')", "", ""),
+        ("INSERT INTO na (id, f) VALUES (7, ARRAY[1.5, 2])", "", ""),
+        ("INSERT INTO na (id, n) VALUES (8, ARRAY[1.005, 2])", "", ""),
+        ("UPDATE na SET n = '{1234.5}' WHERE id = 1000", "22003", "numeric field overflow"),
+        ("UPDATE na SET b = '{x}' WHERE id = 1000", "22P02", r#"invalid input syntax for type boolean: "x""#),
+    ] {
+        let r = a.q(sql);
+        let fine = if code.is_empty() {
+            r.error.is_none()
+        } else {
+            r.error.as_ref().is_some_and(|e| e.code == code && e.message == message)
+        };
+        if !fine {
+            wrong.push(format!("{sql}: PG {code:?} {message:?}; got {:?} {:?}", r.tags, r.error));
+        }
+    }
+    let rows = |rows: &[&[&str]]| -> Vec<Vec<Option<String>>> {
+        rows.iter().map(|row| row.iter().map(|v| (!v.is_empty()).then(|| v.to_string())).collect()).collect()
+    };
+    for (sql, want) in [
+        (
+            "SELECT id, f, r, n, b, t, v FROM na ORDER BY id",
+            rows(&[
+                &["1", "{1.5,NaN,-Infinity}", "", "", "", "", ""],
+                &["3", "", "", "{1.01,2.50}", "", "", ""],
+                &["4", "", "", "", "{t,f,NULL}", "", ""],
+                &["5", "", "", "", "", "", "{\"ab \",abc}"],
+                &["6", "", "", "", "", "{a,\"b,c\",NULL}", ""],
+                &["7", "{1.5,2}", "", "", "", "", ""],
+                &["8", "", "", "{1.01,2.00}", "", "", ""],
+            ]),
+        ),
+        (
+            "SELECT n[1], n[2], r[2], f[2] FROM na WHERE id IN (1, 2, 3) ORDER BY id",
+            rows(&[&["", "", "", "NaN"], &["1.01", "2.50", "", ""]]),
+        ),
+    ] {
+        let r = a.q(sql);
+        if r.error.is_some() || r.rows != want {
+            wrong.push(format!("{sql}: PG {want:?}; got {:?} {:?}", r.rows, r.error));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// The lead's ruling (LEAD-RULINGS 9d87841628, 3): an INSERT ... SELECT whose query is a set operation is coerced to
 /// its columns after the branches' types resolve together: untyped literals in every branch resolve to text (42804),
 /// a string-typed branch makes the column text, and a constant past the column in a UNION of constant branches is
