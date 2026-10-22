@@ -17736,6 +17736,64 @@ fn a_constant_cast_past_numeric_p_s_is_22003_with_no_row() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// The lead's ruling (LEAD-RULINGS 3abd61b6d3 (b), arrays and domains): an integer array column reads a string literal
+/// element by element as its element type's input routine reads it, and a domain over an integer type as its base type
+/// (a 42804 names the domain), even when no row matches. Expected answers: PG 18.6, recorded (artie 3b8380247f,
+/// rec41-array-domain-assign/pg18-wirefuzz-an_array_or_domain_column_reads_its_literal_as_its_element_type.out).
+#[test]
+fn an_array_or_domain_column_reads_its_literal_as_its_element_type() {
+    let dir = Scratch::new("array-domain-assign");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in [
+        "CREATE DOMAIN posint AS int CHECK (VALUE > 0)",
+        "CREATE DOMAIN small AS smallint",
+        "CREATE TABLE ad (id int PRIMARY KEY, xs int[], ys bigint[], p posint, s small)",
+    ] {
+        a.q(sql).ok(sql);
+    }
+    let mut wrong = Vec::new();
+    for (sql, code, message) in [
+        ("INSERT INTO ad (id, xs) VALUES (1, '{1,2,x}')", "22P02", r#"invalid input syntax for type integer: "x""#),
+        ("INSERT INTO ad (id, xs) VALUES (1, '{1,2,3000000000}')", "22003", r#"value "3000000000" is out of range for type integer"#),
+        ("INSERT INTO ad (id, xs) VALUES (1, '{1, 0x1F, 1_000}')", "", ""),
+        ("INSERT INTO ad (id, ys) VALUES (2, '{9223372036854775808}')", "22003", r#"value "9223372036854775808" is out of range for type bigint"#),
+        ("INSERT INTO ad (id, xs) VALUES (3, '{{1,2},{3,4}}')", "", ""),
+        ("INSERT INTO ad (id, p) VALUES (4, 'x')", "22P02", r#"invalid input syntax for type integer: "x""#),
+        ("INSERT INTO ad (id, p) VALUES (4, '0x10')", "", ""),
+        ("INSERT INTO ad (id, p) VALUES (5, '-1')", "23514", r#"value for domain posint violates check constraint "posint_check""#),
+        ("INSERT INTO ad (id, s) VALUES (6, '40000')", "22003", r#"value "40000" is out of range for type smallint"#),
+        ("INSERT INTO ad (id, s) VALUES (6, 40000)", "22003", "smallint out of range"),
+        ("INSERT INTO ad (id, s) VALUES (6, 2.5)", "", ""),
+        ("INSERT INTO ad (id, p) VALUES (7, 'abc'::text)", "42804", r#"column "p" is of type posint but expression is of type text"#),
+        ("UPDATE ad SET xs = '{a}' WHERE id = 1000", "22P02", r#"invalid input syntax for type integer: "a""#),
+    ] {
+        let r = a.q(sql);
+        let fine = if code.is_empty() {
+            r.error.is_none()
+        } else {
+            r.error.as_ref().is_some_and(|e| e.code == code && e.message == message)
+        };
+        if !fine {
+            wrong.push(format!("{sql}: PG {code:?} {message:?}; got {:?} {:?}", r.tags, r.error));
+        }
+    }
+    let r = a.q("SELECT id, xs, ys, p, s FROM ad ORDER BY id");
+    let want: Vec<Vec<Option<String>>> = [
+        ["1", "{1,31,1000}", "", "", ""],
+        ["3", "{{1,2},{3,4}}", "", "", ""],
+        ["4", "", "", "16", ""],
+        ["6", "", "", "", "3"],
+    ]
+    .iter()
+    .map(|row| row.iter().map(|v| (!v.is_empty()).then(|| v.to_string())).collect())
+    .collect();
+    if r.error.is_some() || r.rows != want {
+        wrong.push(format!("SELECT: PG {want:?}; got {:?} {:?}", r.rows, r.error));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// The lead's ruling (LEAD-RULINGS 3abd61b6d3 (b), DEFAULT): a column's DEFAULT is coerced as PostgreSQL coerces it. A
 /// string constant to an integer column is read by its input routine when the table is made or altered (22P02,
 /// 22003); a cast to a string type is 42804 ('default expression'); a numeric constant is cast at each INSERT that
