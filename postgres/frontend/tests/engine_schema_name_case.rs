@@ -15,7 +15,8 @@ fn a_quoted_schema_name_stays_exact_through_the_frontend() {
         Arc::new(turso_core::PlatformIO::new().unwrap()),
         path.to_str().unwrap(),
         turso_core::OpenFlags::default(),
-        turso_core::DatabaseOpts::new().with_custom_types(true),
+        // ATTACH on, as the server opens it (postgres/server/lib.rs database_opts): CREATE SCHEMA attaches.
+        turso_core::DatabaseOpts::new().with_custom_types(true).with_attach(true),
     )
     .unwrap();
     let c = turso_pg::Connection::new(db.connect().unwrap());
