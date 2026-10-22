@@ -360,6 +360,73 @@ fn integer_default(col_def: &pg_query::protobuf::ColumnDef, expr: &pg_query::pro
     Some(ast::Expr::Literal(ast::Literal::Numeric(value.to_string())))
 }
 
+/// An operand of a binary or unary operator, parenthesized when the engine's printer would
+/// otherwise write it so that it reads back as another tree. A pg_query tree keeps nesting as
+/// structure and drops the parentheses, and the engine's printer writes operands bare (a SQLite
+/// parse keeps explicit parentheses as Parenthesized), so a view's or a CHECK's stored text read
+/// a - (b - c) back as a - b - c (numfuzz seed 3269: -5826 for PG's 5828; recorded,
+/// rec48-stored-expression-nesting). Wrapped by SQLite's precedence: a left operand binding looser
+/// than its parent, a right one binding looser or as tightly (every binary operator groups to the
+/// left), except an AND under AND and an OR under OR (the same value; the engine splits a WHERE
+/// at its AND boundaries); a unary operator's operand binding looser than it; and a unary under a
+/// unary always, so `- -x` never reads as a comment. `parent` is None under a unary or postfix
+/// operator, whose level is `unary_level`.
+fn nested(e: Box<ast::Expr>, parent: Option<&ast::Operator>) -> Box<ast::Expr> {
+    nested_at(e, parent, false, 11)
+}
+
+/// [`nested`] for a right operand, or under a unary or postfix operator of level `unary_level`
+/// (NOT is 3, IS NULL and NOT NULL are 4, - + ~ are 11).
+fn nested_at(e: Box<ast::Expr>, parent: Option<&ast::Operator>, right: bool, unary_level: u8) -> Box<ast::Expr> {
+    fn level(op: &ast::Operator) -> u8 {
+        use ast::Operator::*;
+        match op {
+            Or => 1,
+            And => 2,
+            Equals | NotEquals | Is | IsNot => 4,
+            Less | LessEquals | Greater | GreaterEquals => 5,
+            BitwiseAnd | BitwiseOr | LeftShift | RightShift | BitwiseNot => 6,
+            Add | Subtract => 7,
+            Multiply | Divide | Modulus => 8,
+            Concat | ArrowRight | ArrowRightShift | ArrayContains | ArrayOverlap => 9,
+        }
+    }
+    let child = match &*e {
+        ast::Expr::Binary(_, op, _) => {
+            if matches!((parent, op), (Some(ast::Operator::And), ast::Operator::And) | (Some(ast::Operator::Or), ast::Operator::Or)) {
+                return e;
+            }
+            level(op)
+        }
+        ast::Expr::Unary(ast::UnaryOperator::Not, _) => 3,
+        ast::Expr::Unary(..) => {
+            // Under a unary, or right of a - or + (a - -b), the two signs would print side by side.
+            if parent.is_none() || (right && matches!(parent, Some(ast::Operator::Subtract | ast::Operator::Add))) {
+                return Box::new(ast::Expr::Parenthesized(vec![e]));
+            }
+            11
+        }
+        ast::Expr::Between { .. }
+        | ast::Expr::Like { .. }
+        | ast::Expr::InList { .. }
+        | ast::Expr::InSelect { .. }
+        | ast::Expr::InTable { .. }
+        | ast::Expr::IsNull(_)
+        | ast::Expr::NotNull(_) => 4,
+        ast::Expr::Collate(..) => 10,
+        _ => return e,
+    };
+    let (at, right) = match parent {
+        Some(op) => (level(op), right),
+        None => (unary_level, false),
+    };
+    if child < at || (right && child == at) {
+        Box::new(ast::Expr::Parenthesized(vec![e]))
+    } else {
+        e
+    }
+}
+
 /// The key a cast's rewrite ([`PostgreSQLTranslator::with_integer_literals`]) stands under: the
 /// cast's own parse location, or, for a typed literal (NUMERIC '0.1'), which has none (-1, shared by
 /// every typed literal), its constant's; None when neither is known.
@@ -4341,8 +4408,8 @@ impl PostgreSQLTranslator {
                     .ok_or_else(|| ParseError::ParseError("NullTest missing arg".to_string().into()))?;
                 let expr = self.translate_expr(arg)?;
                 match null_test.nulltesttype() {
-                    NullTestType::IsNotNull => Ok(ast::Expr::NotNull(Box::new(expr))),
-                    _ => Ok(ast::Expr::IsNull(Box::new(expr))),
+                    NullTestType::IsNotNull => Ok(ast::Expr::NotNull(nested_at(Box::new(expr), None, false, 4))),
+                    _ => Ok(ast::Expr::IsNull(nested_at(Box::new(expr), None, false, 4))),
                 }
             }
             Some(pg_query::protobuf::node::Node::ParamRef(param_ref)) => {
@@ -4362,27 +4429,27 @@ impl PostgreSQLTranslator {
                 // Map IS TRUE / IS FALSE / IS NOT TRUE / IS NOT FALSE / IS UNKNOWN / IS NOT UNKNOWN
                 match BoolTestType::try_from(bt.booltesttype) {
                     Ok(BoolTestType::IsTrue) => Ok(ast::Expr::Binary(
-                        Box::new(expr),
+                        nested(Box::new(expr), Some(&ast::Operator::Is)),
                         ast::Operator::Is,
                         Box::new(ast::Expr::Literal(ast::Literal::Numeric("1".into()))),
                     )),
                     Ok(BoolTestType::IsNotTrue) => Ok(ast::Expr::Binary(
-                        Box::new(expr),
+                        nested(Box::new(expr), Some(&ast::Operator::IsNot)),
                         ast::Operator::IsNot,
                         Box::new(ast::Expr::Literal(ast::Literal::Numeric("1".into()))),
                     )),
                     Ok(BoolTestType::IsFalse) => Ok(ast::Expr::Binary(
-                        Box::new(expr),
+                        nested(Box::new(expr), Some(&ast::Operator::Is)),
                         ast::Operator::Is,
                         Box::new(ast::Expr::Literal(ast::Literal::Numeric("0".into()))),
                     )),
                     Ok(BoolTestType::IsNotFalse) => Ok(ast::Expr::Binary(
-                        Box::new(expr),
+                        nested(Box::new(expr), Some(&ast::Operator::IsNot)),
                         ast::Operator::IsNot,
                         Box::new(ast::Expr::Literal(ast::Literal::Numeric("0".into()))),
                     )),
-                    Ok(BoolTestType::IsUnknown) => Ok(ast::Expr::IsNull(Box::new(expr))),
-                    Ok(BoolTestType::IsNotUnknown) => Ok(ast::Expr::NotNull(Box::new(expr))),
+                    Ok(BoolTestType::IsUnknown) => Ok(ast::Expr::IsNull(nested_at(Box::new(expr), None, false, 4))),
+                    Ok(BoolTestType::IsNotUnknown) => Ok(ast::Expr::NotNull(nested_at(Box::new(expr), None, false, 4))),
                     _ => Err(ParseError::ParseError(
                         "BooleanTest: unsupported test type".into(),
                     )),
@@ -4705,9 +4772,9 @@ impl PostgreSQLTranslator {
                     .as_ref()
                     .ok_or_else(|| ParseError::ParseError("DISTINCT FROM: missing rhs".into()))?;
                 Ok(ast::Expr::Binary(
-                    Box::new(self.translate_expr(lhs)?),
+                    nested(Box::new(self.translate_expr(lhs)?), Some(&ast::Operator::IsNot)),
                     ast::Operator::IsNot,
-                    Box::new(self.translate_expr(rhs)?),
+                    nested_at(Box::new(self.translate_expr(rhs)?), Some(&ast::Operator::IsNot), true, 11),
                 ))
             }
             AExprKind::AexprNotDistinct => {
@@ -4719,9 +4786,9 @@ impl PostgreSQLTranslator {
                     ParseError::ParseError("NOT DISTINCT FROM: missing rhs".into())
                 })?;
                 Ok(ast::Expr::Binary(
-                    Box::new(self.translate_expr(lhs)?),
+                    nested(Box::new(self.translate_expr(lhs)?), Some(&ast::Operator::Is)),
                     ast::Operator::Is,
-                    Box::new(self.translate_expr(rhs)?),
+                    nested_at(Box::new(self.translate_expr(rhs)?), Some(&ast::Operator::Is), true, 11),
                 ))
             }
             AExprKind::AexprNullif => {
@@ -4872,15 +4939,15 @@ impl PostgreSQLTranslator {
             return match op_name {
                 "+" => Ok(ast::Expr::Unary(
                     ast::UnaryOperator::Positive,
-                    Box::new(operand),
+                    nested(Box::new(operand), None),
                 )),
                 "-" => Ok(ast::Expr::Unary(
                     ast::UnaryOperator::Negative,
-                    Box::new(operand),
+                    nested(Box::new(operand), None),
                 )),
                 "~" => Ok(ast::Expr::Unary(
                     ast::UnaryOperator::BitwiseNot,
-                    Box::new(operand),
+                    nested(Box::new(operand), None),
                 )),
                 _ => Err(ParseError::ParseError(SqlErrorMessage::classified(SqlErrorKind::FeatureNotSupported, format!(
                     "Unsupported unary operator: {op_name}"
@@ -4991,7 +5058,7 @@ impl PostgreSQLTranslator {
             }
         };
 
-        Ok(ast::Expr::Binary(left, binary_op, right))
+        Ok(ast::Expr::Binary(nested(left, Some(&binary_op)), binary_op, nested_at(right, Some(&binary_op), true, 11)))
     }
 
     fn translate_in_expr(
@@ -6052,7 +6119,7 @@ impl PostgreSQLTranslator {
                         "NOT expression must have exactly 1 argument".to_string().into(),
                     ));
                 }
-                let operand = Box::new(self.translate_expr(&bool_expr.args[0])?);
+                let operand = nested_at(Box::new(self.translate_expr(&bool_expr.args[0])?), None, false, 3);
                 Ok(ast::Expr::Unary(ast::UnaryOperator::Not, operand))
             }
             BoolExprType::AndExpr => {
@@ -6065,8 +6132,11 @@ impl PostgreSQLTranslator {
                 let mut result = self.translate_expr(&bool_expr.args[0])?;
                 for arg in &bool_expr.args[1..] {
                     let right = self.translate_expr(arg)?;
-                    result =
-                        ast::Expr::Binary(Box::new(result), ast::Operator::And, Box::new(right));
+                    result = ast::Expr::Binary(
+                        nested(Box::new(result), Some(&ast::Operator::And)),
+                        ast::Operator::And,
+                        nested_at(Box::new(right), Some(&ast::Operator::And), true, 11),
+                    );
                 }
                 Ok(result)
             }
@@ -6080,8 +6150,11 @@ impl PostgreSQLTranslator {
                 let mut result = self.translate_expr(&bool_expr.args[0])?;
                 for arg in &bool_expr.args[1..] {
                     let right = self.translate_expr(arg)?;
-                    result =
-                        ast::Expr::Binary(Box::new(result), ast::Operator::Or, Box::new(right));
+                    result = ast::Expr::Binary(
+                        nested(Box::new(result), Some(&ast::Operator::Or)),
+                        ast::Operator::Or,
+                        nested_at(Box::new(right), Some(&ast::Operator::Or), true, 11),
+                    );
                 }
                 Ok(result)
             }
