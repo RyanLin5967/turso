@@ -17796,6 +17796,57 @@ fn a_float_numeric_or_boolean_column_reads_its_literal_as_its_input_routine_does
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// numfuzz seeds 4029, 4207, 4074 and 4252 (artie d101e52932, f7f5e008d0): numeric Infinity assigned to a numeric(p, s)
+/// column is 22003 'numeric field overflow' on every assignment path, even when no row matches (it was stored), and an
+/// integer of more than 15 significant digits written as text and read as a numeric is refused 0A000 as the same
+/// digits written as a literal are (the interim refusal, PGDIV-NUMERIC-LITERAL-WIDE; LEAD-RULINGS 7ba23121db), where it
+/// answered a float (-6.0204742850066944e+16). PG's answers, recorded (artie f83e43df9b,
+/// rec49-numeric-infinity-wide/pg18-wirefuzz-a_numeric_infinity_or_a_wide_integer_text_answers_as_postgresql_does.out),
+/// for everything but the wide texts, which PG holds exactly.
+#[test]
+fn numeric_infinity_into_a_typmod_column_and_a_wide_integer_text_are_refused() {
+    let dir = Scratch::new("numeric-infinity-wide");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in ["CREATE TABLE ni (id int PRIMARY KEY, n numeric(10,2), m numeric, k numeric(5))", "INSERT INTO ni (id, n) VALUES (1, 1.5)"] {
+        a.q(sql).ok(sql);
+    }
+    let mut wrong = Vec::new();
+    for sql in [
+        "UPDATE ni SET n = 'Infinity'::numeric WHERE id = 1",
+        "UPDATE ni SET n = 'Infinity'::numeric WHERE id = 1000",
+        "UPDATE ni SET n = '-Infinity' WHERE id = 1",
+        "INSERT INTO ni (id, n) VALUES (2, 'Infinity')",
+        "INSERT INTO ni (id, k) VALUES (2, 'inf'::numeric)",
+        "INSERT INTO ni (id, n) VALUES (1, 0) ON CONFLICT (id) DO UPDATE SET n = 'Infinity'::numeric",
+    ] {
+        let r = a.q(sql);
+        if !r.error.as_ref().is_some_and(|e| e.code == "22003" && e.message == "numeric field overflow") {
+            wrong.push(format!("{sql}: PG 22003 'numeric field overflow'; got {:?} {:?}", r.tags, r.error));
+        }
+    }
+    let r = a.q("SELECT id, n FROM ni ORDER BY id");
+    if r.error.is_some() || r.rows != vec![vec![Some("1".to_string()), Some("1.50".to_string())]] {
+        wrong.push(format!("SELECT id, n: PG [[1, 1.50]]; got {:?} {:?}", r.rows, r.error));
+    }
+    for sql in [
+        "SELECT '-60204742850066943'::numeric + 0 AS v",
+        "SELECT '-458593628112012096'::numeric AS v",
+        "SELECT CAST('9007199254740993' AS numeric) AS v",
+        "SELECT NUMERIC '9007199254740993' AS v",
+    ] {
+        let r = a.q(sql);
+        if r.error.as_ref().map(|e| e.code.as_str()) != Some("0A000") {
+            wrong.push(format!("{sql}: refused 0A000 (PG holds it exactly; the engine's float8 does not); got {:?} {:?} {:?}", r.tags, r.rows, r.error));
+        }
+    }
+    let r = a.q("SELECT '123456789012345'::numeric * 2 AS v");
+    if r.error.is_some() || r.rows != vec![vec![Some("246913578024690".to_string())]] {
+        wrong.push(format!("15 digits: PG [[246913578024690]]; got {:?} {:?}", r.rows, r.error));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// numfuzz seed 3269 at d5600475b (artie 5be9a9ed6b): a view's and a CHECK constraint's expressions keep their operands'
 /// nesting as written, before and after a restart: a - (b - c) is not a - b - c, a / (b / c) not a / b / c, -(a - b)
 /// not -a - b. A view read answered -5826 for PG's 5828: the stored text dropped the parentheses the parse tree
