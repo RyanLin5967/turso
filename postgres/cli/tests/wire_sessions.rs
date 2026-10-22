@@ -18039,6 +18039,31 @@ fn a_from_subquery_alias_column_list_names_its_columns() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// The lead's condition on seed 8183's probe (LEAD-RULINGS 1710ba2857): an assignment probe's constants cannot change
+/// between executions, so it runs ONCE per statement text and connection, never per Execute (a probe per Execute is
+/// an extra statement on every write). The same in-range UPDATE three times over each protocol runs exactly one probe
+/// (turso_branch_probes(), the server's count of probes run): not 0 (the probe exists) and not 6 (per Execute).
+#[test]
+fn an_assignment_probe_runs_once_per_statement_text() {
+    let dir = Scratch::new("probe-once");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE nt (id int PRIMARY KEY, c0 numeric(6,2))").ok("create");
+    let probes = |a: &mut Wire| -> i64 {
+        let r = a.q("SELECT turso_branch_probes()").ok("probes");
+        r.rows[0][0].as_deref().expect("the probe count is never NULL").parse().unwrap()
+    };
+    let before = probes(&mut a);
+    let sql = "UPDATE nt SET c0 = 1.5 * 2 WHERE id = 2";
+    for _ in 0..3 {
+        a.q(sql).ok("simple");
+        let r = a.x(sql, &[]);
+        assert!(r.error.is_none(), "extended: {:?}", r.error);
+    }
+    let after = probes(&mut a);
+    assert_eq!(after - before, 1, "probe statements for six Executes of one statement text: PG-equivalent once");
+}
+
 /// numfuzz seed 8183 at f1dc48429 (SILENT; PG 18.6's answer recorded by the fuzzer on eceubuntu2, artie
 /// numfuzz-f1dc48429-s8021-8220, 5f7c6e8c89): a constant expression assigned to a numeric(p, s) column past it is 22003
 /// 'numeric field overflow' even when no row matches, as the planner folds it; it answered UPDATE 0. The in-range control
