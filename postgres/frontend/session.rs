@@ -2464,27 +2464,67 @@ type LiteralAssignments = (
 
 /// The integer value of a constant expression PostgreSQL's planner folds: integer literals, a
 /// decimal literal cast to an integer (rounded half away from zero, as numeric's cast rounds it),
-/// integer or numeric casts of those, unary minus and + - *, in i128. None for anything else,
-/// including a decimal that is not cast to an integer, a division, or an i128 overflow.
-fn fold_integer(node: &turso_pg_parser::pg_query::protobuf::Node) -> Option<i128> {
+/// integer or numeric casts of those, abs, floor, ceil, round and trunc of one, unary minus and
+/// + - *, in i128. Err for a numeric(p, s) cast inside that the value overflows (22003 'numeric
+/// field overflow', as the planner's fold refuses it; numfuzz seed 7472). Ok(None) for anything
+/// else, including a decimal that is not cast to an integer, a division, or an i128 overflow.
+fn fold_integer(node: &turso_pg_parser::pg_query::protobuf::Node) -> std::result::Result<Option<i128>, SqlErrorMessage> {
     use turso_pg_parser::pg_query::protobuf::{a_const::Val, node::Node};
-    match node.node.as_ref()? {
-        Node::AConst(c) if !c.isnull => match c.val.as_ref()? {
-            Val::Ival(i) => Some(i128::from(i.ival)),
-            Val::Fval(f) => f.fval.parse::<i128>().ok(),
+    let Some(n) = node.node.as_ref() else { return Ok(None) };
+    Ok(match n {
+        Node::AConst(c) if !c.isnull => match c.val.as_ref() {
+            Some(Val::Ival(i)) => Some(i128::from(i.ival)),
+            Some(Val::Fval(f)) => f.fval.parse::<i128>().ok(),
             _ => None,
         },
         Node::TypeCast(c) => {
-            let target = c.type_name.as_ref().filter(|t| t.array_bounds.is_empty() && t.typmods.is_empty())?.names.last()?;
-            let integer = matches!(&target.node, Some(Node::String(s)) if matches!(s.sval.as_str(), "int2" | "int4" | "int8"));
-            let numeric = matches!(&target.node, Some(Node::String(s)) if s.sval == "numeric");
-            let arg = c.arg.as_deref()?;
-            match arg.node.as_ref()? {
-                Node::AConst(k) if integer => match k.val.as_ref()? {
-                    Val::Fval(f) => crate::functions::round_decimal(&f.fval),
-                    _ => fold_integer(arg),
+            let Some(t) = c.type_name.as_ref().filter(|t| t.array_bounds.is_empty()) else { return Ok(None) };
+            let name = match t.names.last().and_then(|n| n.node.as_ref()) {
+                Some(Node::String(s)) => s.sval.as_str(),
+                _ => return Ok(None),
+            };
+            let Some(arg) = c.arg.as_deref() else { return Ok(None) };
+            let typmods: Option<Vec<i32>> = t
+                .typmods
+                .iter()
+                .map(|m| match m.node.as_ref() {
+                    Some(Node::AConst(a)) => match a.val.as_ref() {
+                        Some(Val::Ival(v)) => Some(v.ival),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .collect();
+            match (name, typmods.as_deref()) {
+                ("int2" | "int4" | "int8", Some([])) => match arg.node.as_ref() {
+                    Some(Node::AConst(k)) => match k.val.as_ref() {
+                        Some(Val::Fval(f)) => crate::functions::round_decimal(&f.fval),
+                        _ => fold_integer(arg)?,
+                    },
+                    _ => fold_integer(arg)?,
                 },
-                _ if integer || numeric => fold_integer(arg),
+                ("numeric", Some([])) => fold_integer(arg)?,
+                ("numeric", Some([p, rest @ ..])) => match fold_integer(arg)? {
+                    Some(v) => {
+                        let scale = rest.first().copied().unwrap_or(0);
+                        if crate::functions::numeric_overflows(&v.to_string(), *p, scale) == Some(true) {
+                            return Err(SqlErrorMessage::classified(SqlErrorKind::NumericValueOutOfRange, "numeric field overflow"));
+                        }
+                        Some(v)
+                    }
+                    None => None,
+                },
+                _ => None,
+            }
+        }
+        Node::FuncCall(f) if f.args.len() == 1 && f.agg_order.is_empty() && !f.agg_star && f.over.is_none() => {
+            let name = f.funcname.last().and_then(|n| match &n.node {
+                Some(Node::String(s)) => Some(s.sval.as_str()),
+                _ => None,
+            });
+            match name {
+                Some("abs") => fold_integer(&f.args[0])?.and_then(|v| v.checked_abs()),
+                Some("floor" | "ceil" | "ceiling" | "round" | "trunc") => fold_integer(&f.args[0])?,
                 _ => None,
             }
         }
@@ -2492,17 +2532,23 @@ fn fold_integer(node: &turso_pg_parser::pg_query::protobuf::Node) -> Option<i128
             let op = e.name.iter().find_map(|n| match &n.node {
                 Some(Node::String(s)) => Some(s.sval.as_str()),
                 _ => None,
-            })?;
+            });
+            let side = |x: Option<&turso_pg_parser::pg_query::protobuf::Node>| -> std::result::Result<Option<i128>, SqlErrorMessage> {
+                match x {
+                    Some(x) => fold_integer(x),
+                    None => Ok(None),
+                }
+            };
             match (e.lexpr.as_deref(), op) {
-                (None, "-") => fold_integer(e.rexpr.as_deref()?)?.checked_neg(),
-                (Some(l), "+") => fold_integer(l)?.checked_add(fold_integer(e.rexpr.as_deref()?)?),
-                (Some(l), "-") => fold_integer(l)?.checked_sub(fold_integer(e.rexpr.as_deref()?)?),
-                (Some(l), "*") => fold_integer(l)?.checked_mul(fold_integer(e.rexpr.as_deref()?)?),
+                (None, Some("-")) => side(e.rexpr.as_deref())?.and_then(|v| v.checked_neg()),
+                (Some(l), Some("+")) => fold_integer(l)?.zip(side(e.rexpr.as_deref())?).and_then(|(a, b)| a.checked_add(b)),
+                (Some(l), Some("-")) => fold_integer(l)?.zip(side(e.rexpr.as_deref())?).and_then(|(a, b)| a.checked_sub(b)),
+                (Some(l), Some("*")) => fold_integer(l)?.zip(side(e.rexpr.as_deref())?).and_then(|(a, b)| a.checked_mul(b)),
                 _ => None,
             }
         }
         _ => None,
-    }
+    })
 }
 
 /// The location of an assigned value that is an expression: an operator, a function call, a cast
@@ -3153,7 +3199,7 @@ fn literal_assignments(
         // A constant expression past the column is refused here, even when no row matches, as
         // PostgreSQL folds it before any row is read (rec57; numfuzz seeds 6673, 6700: UPDATE 0).
         if !matches!(value.node.as_ref(), Some(Node::AConst(_))) {
-            if let Some(v) = fold_integer(value) {
+            if let Some(v) = fold_integer(value)? {
                 if let Some(bits) = column_type(column).map(|t| integer_bits(&t)).filter(|b| *b > 0) {
                     let limit = 1i128 << (bits - 1);
                     if v < -limit || v >= limit {
