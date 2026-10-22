@@ -811,6 +811,34 @@ pub(crate) fn numeric_overflows(text: &str, precision: i32, scale: i32) -> Optio
     Some(rounded > i64::from(precision))
 }
 
+/// A constant's value rounded half away from zero to `scale` places, then to an integer, as a cast
+/// to numeric(p, s) then the assignment to an integer column round it (1.45 at scale 1 is 1.5,
+/// then 2; recorded, rec32-cast-constant-assign, artie c2fe0580f5). None past 30 places or for a
+/// spelling [`round_decimal`] does not read.
+pub(crate) fn round_decimal_at(text: &str, scale: i32) -> Option<i128> {
+    if !(-30..=30).contains(&scale) {
+        return None;
+    }
+    let t = text.trim();
+    let (mantissa, exponent) = match t.find(['e', 'E']) {
+        Some(p) => (&t[..p], t[p + 1..].parse::<i64>().ok()?),
+        None => (t, 0),
+    };
+    // The value times 10^scale, rounded: then back by 10^scale, rounded again.
+    let scaled = round_decimal(&format!("{mantissa}e{}", exponent + i64::from(scale)))?;
+    if scaled.abs() == i128::MAX {
+        // Past 30 digits at this scale: judged only when the integer part alone is past every
+        // integer type.
+        return round_decimal(text).filter(|v| v.abs() >= 1i128 << 63).map(|_| i128::MAX);
+    }
+    if scale <= 0 {
+        return scaled.checked_mul(10i128.pow(scale.unsigned_abs())).or(Some(i128::MAX));
+    }
+    let unit = 10i128.pow(scale as u32);
+    let (q, r) = (scaled / unit, scaled % unit);
+    Some(if r.abs() * 2 >= unit { q + r.signum() } else { q })
+}
+
 /// int2in/int4in/int8in's refusal of `input`, if any, with PostgreSQL's message.
 fn pg_int_input_error(input: &str, bits: u32, name: &str) -> Option<(String, SqlErrorKind)> {
     match pg_strtoint(input, bits) {
