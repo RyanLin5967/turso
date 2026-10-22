@@ -257,6 +257,8 @@ pub struct PostgreSQLTranslator {
     /// cast's location) and operands of || (by the operand's)
     /// ([`PostgreSQLTranslator::with_float_texts`]).
     float_texts: Option<std::collections::HashMap<i32, u32>>,
+    /// The % over a numeric, by their parse locations ([`PostgreSQLTranslator::with_numeric_mods`]).
+    numeric_mods: Option<std::collections::HashSet<i32>>,
     /// The string and numeric literals (by their parse locations) the caller read as an integer
     /// column's assignment reads them ([`PostgreSQLTranslator::with_integer_literals`]): written as
     /// the value as a number, which the engine's integer column and a domain over one take ('0x1F'
@@ -529,6 +531,14 @@ impl PostgreSQLTranslator {
             within_group: vec![],
             filter_over: ast::FunctionTail { filter_clause: None, over_clause: None },
         }))
+    }
+
+    /// Computes each listed % as PostgreSQL's numeric remainder through pg_numeric_mod (a fraction,
+    /// the dividend's sign, 22012 for a zero divisor), where the engine's % reads both sides as
+    /// integers (numfuzz seeds 4703, 5316; recorded, rec52-numeric-modulo).
+    pub fn with_numeric_mods(mut self, mods: std::collections::HashSet<i32>) -> Self {
+        self.numeric_mods = Some(mods);
+        self
     }
 
     pub fn with_integer_cast_rounding(mut self, casts: std::collections::HashMap<i32, u32>) -> Self {
@@ -5160,6 +5170,16 @@ impl PostgreSQLTranslator {
             }
         };
 
+        if op_name == "%" && self.numeric_mods.as_ref().is_some_and(|m| m.contains(&a_expr.location)) {
+            return Ok(ast::Expr::FunctionCall {
+                name: pg_name("pg_numeric_mod"),
+                distinctness: None,
+                args: vec![left, right],
+                order_by: vec![],
+                within_group: vec![],
+                filter_over: ast::FunctionTail { filter_clause: None, over_clause: None },
+            });
+        }
         Ok(ast::Expr::Binary(nested(left, Some(&binary_op)), binary_op, nested_at(right, Some(&binary_op), true, 11)))
     }
 

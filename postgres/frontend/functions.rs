@@ -29,7 +29,7 @@ pub(crate) fn resolve_scalar(name: &str, arg_count: usize) -> bool {
         "to_char" | "pg_input_is_valid" | "booleq" | "boolne" | "col_description" | "bpchareq"
         | "encode" | "bpcharlt" | "pg_text_int" | "pg_assign_int" => &[2],
         "pg_round_even" => &[1],
-        "pg_float_text" => &[2],
+        "pg_float_text" | "pg_numeric_mod" => &[2],
         "version" | "current_database" | "current_schema" | "pg_backend_pid" => &[0],
         "now" | "transaction_timestamp" | "statement_timestamp" => &[0],
         "make_date" => &[3],
@@ -97,6 +97,39 @@ pub(crate) fn exec_scalar(conn: &Connection, name: &str, args: &[Value]) -> Resu
             Some(Value::Null) | None => Value::Null,
             Some(other) => Value::build_text(other.to_string()),
         }),
+        // PostgreSQL's numeric remainder (numeric_mod): the remainder of the dividend by the
+        // divisor truncated toward zero, so its sign is the dividend's, and 22012 for a zero
+        // divisor. Written by the translator for a % over a numeric (its with_numeric_mods). Each
+        // value is read as the decimal its shortest text spells, which is exact for the numerics
+        // of at most 15 significant digits held here (PGDIV-NUMERIC-LITERAL-WIDE refuses wider),
+        // and the remainder is computed exactly on those decimals.
+        "pg_numeric_mod" => {
+            let decimal = |v: &Value| -> Option<String> {
+                match v {
+                    Value::Numeric(turso_core::Numeric::Integer(i)) => Some(i.to_string()),
+                    Value::Numeric(turso_core::Numeric::Float(f)) => Some(format!("{}", f64::from(*f))),
+                    Value::Text(t) => Some(t.as_str().trim().to_string()),
+                    _ => None,
+                }
+            };
+            let (Some(a), Some(b)) = (args.first(), args.get(1)) else { return Ok(Value::Null) };
+            if matches!(a, Value::Null) || matches!(b, Value::Null) {
+                return Ok(Value::Null);
+            }
+            // A value it cannot read as a decimal is refused, never answered as NULL.
+            let (Some(x), Some(y)) = (decimal(a), decimal(b)) else {
+                return Err(LimboError::Constraint(SqlErrorMessage::classified(SqlErrorKind::FeatureNotSupported, "numeric % over this value is not supported")));
+            };
+            match numeric_remainder(&x, &y) {
+                Some(Ok(r)) => Ok(r.parse::<f64>().map(Value::from_f64).unwrap_or(Value::Null)),
+                Some(Err(())) => Err(LimboError::Constraint(SqlErrorMessage::classified(SqlErrorKind::DivisionByZero, "division by zero"))),
+                None => Ok(match (x.parse::<f64>(), y.parse::<f64>()) {
+                    (Ok(_), Ok(d)) if d == 0.0 => return Err(LimboError::Constraint(SqlErrorMessage::classified(SqlErrorKind::DivisionByZero, "division by zero"))),
+                    (Ok(n), Ok(d)) => Value::from_f64(n % d),
+                    _ => Value::Null,
+                }),
+            }
+        }
         "pg_text_int" => match args.first() {
             Some(Value::Text(t)) => match validate_pg_input(t.as_str(), &text_arg(1)) {
                 Some((message, kind)) => Err(LimboError::Constraint(SqlErrorMessage::classified(kind, message))),
@@ -699,6 +732,38 @@ fn pg_get_indexdef(conn: &Connection, target_oid: i64) -> Option<String> {
 /// it reaches 10^(precision - scale), a negative scale or one past the precision included, as
 /// apply_typmod judges it (recorded, rec31-constant-numeric-cast, artie 8ceb58f30a). None for a
 /// spelling it does not read (a 0x prefix, an underscore), which the caller leaves alone.
+/// The remainder of decimal `x` by decimal `y`, each a plain decimal's text (an optional sign,
+/// digits and one point), computed exactly as scaled integers: Some(Ok(text)), Some(Err(())) for a
+/// zero divisor, None for a spelling it does not read or past an i128 ([`pg_numeric_mod`]'s float
+/// fallback then answers).
+fn numeric_remainder(x: &str, y: &str) -> Option<Result<String, ()>> {
+    let read = |t: &str| -> Option<(i128, u32)> {
+        let (negative, body) = match t.strip_prefix('-') {
+            Some(rest) => (true, rest),
+            None => (false, t.strip_prefix('+').unwrap_or(t)),
+        };
+        let (whole, fraction) = body.split_once('.').unwrap_or((body, ""));
+        if (whole.is_empty() && fraction.is_empty()) || !whole.bytes().chain(fraction.bytes()).all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let digits = format!("{whole}{fraction}");
+        let magnitude: i128 = if digits.is_empty() { 0 } else { digits.parse().ok()? };
+        Some((if negative { -magnitude } else { magnitude }, fraction.len() as u32))
+    };
+    let ((a, sa), (b, sb)) = (read(x)?, read(y)?);
+    if b == 0 {
+        return Some(Err(()));
+    }
+    let scale = sa.max(sb);
+    let a = a.checked_mul(10i128.checked_pow(scale - sa)?)?;
+    let b = b.checked_mul(10i128.checked_pow(scale - sb)?)?;
+    let r = a % b;
+    let unit = 10i128.checked_pow(scale)?;
+    let sign = if r < 0 { "-" } else { "" };
+    let (q, f) = (r.abs() / unit, r.abs() % unit);
+    Some(Ok(if scale == 0 { format!("{sign}{q}") } else { format!("{sign}{q}.{f:0width$}", width = scale as usize) }))
+}
+
 pub(crate) fn numeric_overflows(text: &str, precision: i32, scale: i32) -> Option<bool> {
     let t = text.trim();
     let unsigned = t.strip_prefix(['-', '+']).unwrap_or(t);

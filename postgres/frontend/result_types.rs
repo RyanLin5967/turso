@@ -673,6 +673,11 @@ pub struct Walked {
     /// translator writes it as float4out or float8out does, where the engine's CAST wrote 15
     /// significant digits (numfuzz seeds 4681, 4784; recorded, rec51-float-text-cast).
     pub float_texts: std::collections::BTreeMap<i32, u32>,
+    /// Each % whose operands resolve to numeric's operator, by its parse location, so the translator
+    /// computes PostgreSQL's remainder (a fraction, the dividend's sign; 22012 for a zero divisor)
+    /// where the engine's % reads both sides as integers (numfuzz seeds 4703, 5316; recorded,
+    /// rec52-numeric-modulo).
+    pub numeric_mods: std::collections::BTreeSet<i32>,
     /// A plain SELECT's result columns' types, in order, as the walk read them (empty for any other
     /// statement): [`aggregate_types`] takes the aggregates' from these.
     pub columns: Vec<Option<u32>>,
@@ -887,6 +892,7 @@ fn parameter_types_with(
         operand_params: Default::default(),
         integer_casts: Default::default(),
         float_texts: Default::default(),
+        numeric_mods: Default::default(),
         column_assignments: Vec::new(),
     };
     let mut columns = Vec::new();
@@ -911,6 +917,7 @@ fn parameter_types_with(
     let column_assignments = std::mem::take(&mut infer.column_assignments);
     let integer_casts = infer.integer_casts.take();
     let float_texts = infer.float_texts.take();
+    let numeric_mods = infer.numeric_mods.take();
     Ok(Walked {
         params: infer.types,
         untyped,
@@ -920,6 +927,7 @@ fn parameter_types_with(
         column_assignments,
         integer_casts,
         float_texts,
+        numeric_mods,
         columns,
         assignments: infer.assignments,
     })
@@ -1028,6 +1036,8 @@ struct Infer<'a> {
     /// Each real or float8 value written as text: a cast to a string type (by the cast's location)
     /// or an operand of || (by the operand's), with its type ([`Walked::float_texts`]).
     float_texts: std::rc::Rc<std::cell::RefCell<std::collections::BTreeMap<i32, u32>>>,
+    /// Each % over a numeric, by its location ([`Walked::numeric_mods`]).
+    numeric_mods: std::rc::Rc<std::cell::RefCell<std::collections::BTreeSet<i32>>>,
     /// Each bare $n assigned to a column, in the order PostgreSQL analyses them: ($n, the column's
     /// name, its type) ([`Walked::column_assignments`]).
     column_assignments: Vec<(u32, String, u32)>,
@@ -1756,6 +1766,7 @@ impl Infer<'_> {
             operand_params: Default::default(),
             integer_casts: self.integer_casts.clone(),
             float_texts: self.float_texts.clone(),
+            numeric_mods: self.numeric_mods.clone(),
             column_assignments: Vec::new(),
         };
         let columns = walk.select(query, &Vec::new());
@@ -2279,6 +2290,9 @@ impl Infer<'_> {
                     Some(Node::String(s)) => Some(s.sval.as_str()),
                     _ => None,
                 });
+                if matches!(kind, AExprKind::AexprOp) && op == Some("%") {
+                    self.type_of(node, scope);
+                }
                 if matches!(kind, AExprKind::AexprOp) && op == Some("||") {
                     for side in [l, r] {
                         let ty = self.type_of(side, scope);
@@ -3020,6 +3034,9 @@ impl Infer<'_> {
                 let param = |x: Option<&PgNode>| {
                     matches!(x.and_then(|x| x.node.as_ref()), Some(Node::ParamRef(_)))
                 };
+                if op == Some("%") && matches!(l.zip(r).map(|(a, b)| arithmetic("%", a, b)), Some(Arithmetic::Type(NUMERIC))) && e.location >= 0 {
+                    self.numeric_mods.borrow_mut().insert(e.location);
+                }
                 match (l, r) {
                     (Some(a), Some(b)) => match arithmetic(op.unwrap_or(""), a, b) {
                         // An interval result (timestamp - timestamp): the engine has no interval
@@ -3128,6 +3145,7 @@ impl Infer<'_> {
             operand_params: self.operand_params.clone(),
             integer_casts: self.integer_casts.clone(),
             float_texts: self.float_texts.clone(),
+            numeric_mods: self.numeric_mods.clone(),
             column_assignments: Vec::new(),
         };
         let level = walk.from_items(&s.from_clause, scope);
