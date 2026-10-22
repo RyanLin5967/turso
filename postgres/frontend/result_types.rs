@@ -796,6 +796,12 @@ pub struct StatementTypes {
     /// planner folds each such part on its own (`SELECT encode('abc', 'nosuch'), now()` sends only
     /// its 22023; wire-rev-5cdb70e58 MED-1). None when there is no such part.
     pub fold_probe: Option<String>,
+    /// An INSERT's or UPDATE's constant expressions assigned to numeric(p, s) columns (not bare
+    /// constants, which are judged at prepare), each as pg_assign_numeric_value(value, p, s), as one
+    /// SELECT (PostgreSQL text), run before the statement: PostgreSQL's planner folds such a value
+    /// and refuses one past the column even when no row matches (numfuzz seed 8183: UPDATE 0).
+    /// None when there is none.
+    pub assign_probe: Option<String>,
     /// For each result column of a plain SELECT, the parameter number when the column is a bare
     /// `$n`: the server announces such a column as that parameter's type, declared or inferred,
     /// as PostgreSQL does (it was text; the PG 18 differential's finding (c)). Empty when the

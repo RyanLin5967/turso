@@ -2263,6 +2263,7 @@ fn prepare_statement_parsed(
         types.param_targets = crate::result_types::param_targets(&parse_result);
         types.folds_at_plan = folds_at_plan(&parse_result);
         types.fold_probe = if types.folds_at_plan { None } else { fold_probe(&parse_result) };
+        types.assign_probe = assignment_probe(pg_conn, &parse_result);
         // A table's width, for a `*` beside a typed column, from the in-memory schema alone.
         let tables = |schema: &str, table: &str| resident_relation_columns(pg_conn, schema, table);
         let fixed = crate::result_types::expression_types(&parse_result, &tables);
@@ -3132,6 +3133,31 @@ fn assignment_table(pg_conn: &PgConnectionInner, relation: &turso_pg_parser::pg_
     }
 }
 
+/// A numeric(p, s) column's precision and scale (s is 0 for numeric(p)); None for any other column,
+/// bare numeric included.
+fn numeric_typmod(c: &turso_core::schema::Column) -> Option<(i32, i32)> {
+    use turso_parser::ast::{Expr, Literal, UnaryOperator};
+    let ty = c.ty_str.trim();
+    if c.array_dimensions() != 0 || !(ty.eq_ignore_ascii_case("NUMERIC") || ty.eq_ignore_ascii_case("DECIMAL")) {
+        return None;
+    }
+    let param = |e: &Expr| -> Option<i32> {
+        match e {
+            Expr::Literal(Literal::Numeric(n)) => n.parse().ok(),
+            Expr::Unary(UnaryOperator::Negative, inner) => match inner.as_ref() {
+                Expr::Literal(Literal::Numeric(n)) => n.parse::<i32>().ok().map(|v| -v),
+                _ => None,
+            },
+            _ => None,
+        }
+    };
+    match c.ty_params.as_slice() {
+        [p] => Some((param(p)?, 0)),
+        [p, s] => Some((param(p)?, param(s)?)),
+        _ => None,
+    }
+}
+
 #[allow(clippy::type_complexity)]
 fn literal_assignments(
     pg_conn: &PgConnectionInner,
@@ -3212,28 +3238,6 @@ fn literal_assignments(
         })
     };
     // A numeric(p, s) column's modifiers, from its type's parameters, read without allocating.
-    let numeric_typmod = |c: &turso_core::schema::Column| -> Option<(i32, i32)> {
-        use turso_parser::ast::{Expr, Literal, UnaryOperator};
-        let ty = c.ty_str.trim();
-        if c.array_dimensions() != 0 || !(ty.eq_ignore_ascii_case("NUMERIC") || ty.eq_ignore_ascii_case("DECIMAL")) {
-            return None;
-        }
-        let param = |e: &Expr| -> Option<i32> {
-            match e {
-                Expr::Literal(Literal::Numeric(n)) => n.parse().ok(),
-                Expr::Unary(UnaryOperator::Negative, inner) => match inner.as_ref() {
-                    Expr::Literal(Literal::Numeric(n)) => n.parse::<i32>().ok().map(|v| -v),
-                    _ => None,
-                },
-                _ => None,
-            }
-        };
-        match c.ty_params.as_slice() {
-            [p] => Some((param(p)?, 0)),
-            [p, s] => Some((param(p)?, param(s)?)),
-            _ => None,
-        }
-    };
     let numeric_column = |column: &str| table.get_column(column).and_then(|(_, c)| numeric_typmod(c));
     // An int4 constant can fail only a smallint or a numeric(p, s) column.
     let has_narrow = table
@@ -6763,6 +6767,114 @@ fn not_immutable(n: &turso_pg_parser::pg_query::NodeRef) -> bool {
 }
 
 
+/// Whether `node` is immutable and constant all the way down: literals, and calls, operators, casts
+/// and the conditional forms over them; anything else (a column, a parameter, a subquery, a node
+/// this reads no further) is not.
+fn immutable_constant(node: &turso_pg_parser::pg_query::protobuf::Node) -> bool {
+    use turso_pg_parser::pg_query::protobuf::{node::Node, Node as PgNode};
+    let Some(n) = node.node.as_ref() else { return false };
+    let all = |v: &[PgNode]| v.iter().all(immutable_constant);
+    match n {
+        Node::AConst(_) => true,
+        Node::FuncCall(f) => {
+            f.over.is_none() && f.agg_filter.is_none() && !f.agg_star && !calls_non_immutable(f) && all(&f.args)
+        }
+        Node::AExpr(e) => e.lexpr.as_deref().is_none_or(immutable_constant) && e.rexpr.as_deref().is_none_or(immutable_constant),
+        Node::TypeCast(c) => {
+            !not_immutable(&turso_pg_parser::pg_query::NodeRef::TypeCast(c.as_ref())) && c.arg.as_deref().is_some_and(immutable_constant)
+        }
+        // A form whose arguments PostgreSQL simplifies only up to a constant that decides it
+        // (AND false, OR true, coalesce's first non-null constant, a CASE's constant WHEN) is
+        // never probed whole: fold_probe's collect descends it by those rules (wire-rev-351702a43 MED-4).
+        Node::BoolExpr(_) | Node::CoalesceExpr(_) | Node::CaseExpr(_) => false,
+        Node::MinMaxExpr(m) => all(&m.args),
+        Node::NullTest(t) => t.arg.as_deref().is_some_and(immutable_constant),
+        _ => false,
+    }
+}
+
+/// [`crate::StatementTypes::assign_probe`]: each constant expression an INSERT (its VALUES rows,
+/// or a SELECT's targets) or UPDATE assigns to a numeric(p, s) column, as
+/// pg_assign_numeric_value(value, p, s), in one SELECT; None when there is none. A bare constant
+/// is judged at prepare (literal_assignments) and left out. Built from a parsed template, never
+/// from nodes made from defaults, whose enum fields libpg_query's deparser asserts on.
+fn assignment_probe(pg_conn: &PgConnectionInner, parse: &turso_pg_parser::pg_query::ParseResult) -> Option<String> {
+    use turso_pg_parser::pg_query::protobuf::{a_const::Val, node::Node, Node as PgNode};
+    let [raw] = parse.protobuf.stmts.as_slice() else { return None };
+    let stmt = raw.stmt.as_ref()?.node.as_ref()?;
+    let relation = match stmt {
+        Node::UpdateStmt(u) => u.relation.as_ref()?,
+        Node::InsertStmt(i) => i.relation.as_ref()?,
+        _ => return None,
+    };
+    let table = assignment_table(pg_conn, relation)?;
+    let target_name = |t: &PgNode| match t.node.as_ref() {
+        Some(Node::ResTarget(r)) if r.indirection.is_empty() => Some(r.name.clone()),
+        _ => None,
+    };
+    let mut pairs: Vec<(String, &PgNode)> = Vec::new();
+    match stmt {
+        Node::UpdateStmt(u) => {
+            for t in &u.target_list {
+                if let (Some(name), Some(Node::ResTarget(r))) = (target_name(t), t.node.as_ref()) {
+                    if let Some(v) = r.val.as_deref() {
+                        pairs.push((name, v));
+                    }
+                }
+            }
+        }
+        Node::InsertStmt(i) => {
+            let Some(Node::SelectStmt(select)) = i.select_stmt.as_deref().and_then(|s| s.node.as_ref()) else { return None };
+            if select.larg.is_some() {
+                return None;
+            }
+            let names: Vec<String> = if i.cols.is_empty() {
+                table.columns().iter().filter_map(|c| c.name.clone()).collect()
+            } else {
+                i.cols.iter().filter_map(target_name).collect()
+            };
+            for row in &select.values_lists {
+                if let Some(Node::List(l)) = row.node.as_ref() {
+                    pairs.extend(names.iter().cloned().zip(l.items.iter()));
+                }
+            }
+            for (name, t) in names.iter().zip(&select.target_list) {
+                if let Some(Node::ResTarget(r)) = t.node.as_ref() {
+                    if let Some(v) = r.val.as_deref() {
+                        pairs.push((name.clone(), v));
+                    }
+                }
+            }
+        }
+        _ => return None,
+    }
+    let mut template = turso_pg_parser::pg_query::parse("SELECT pg_assign_numeric_value(0, 1, 0)").ok()?.protobuf;
+    let Some(Node::SelectStmt(probe)) = template.stmts.first_mut()?.stmt.as_mut()?.node.as_mut() else { return None };
+    let Some(Node::ResTarget(first)) = probe.target_list.first()?.node.clone() else { return None };
+    let mut targets = Vec::new();
+    for (name, value) in pairs {
+        if matches!(value.node.as_ref(), Some(Node::AConst(_))) || !immutable_constant(value) {
+            continue;
+        }
+        let Some((precision, scale)) = table.get_column(&name).and_then(|(_, c)| numeric_typmod(c)) else { continue };
+        let mut target = first.clone();
+        let Some(Node::FuncCall(call)) = target.val.as_deref_mut().and_then(|v| v.node.as_mut()) else { return None };
+        let [arg, p, s] = call.args.as_mut_slice() else { return None };
+        *arg = value.clone();
+        for (node, v) in [(p, precision), (s, scale)] {
+            let Some(Node::AConst(c)) = node.node.as_mut() else { return None };
+            let Some(Val::Ival(i)) = c.val.as_mut() else { return None };
+            i.ival = v;
+        }
+        targets.push(PgNode { node: Some(Node::ResTarget(target)) });
+    }
+    if targets.is_empty() {
+        return None;
+    }
+    probe.target_list = targets;
+    Node::SelectStmt(probe.clone()).deparse().ok()
+}
+
 /// [`crate::StatementTypes::fold_probe`]: the immutable constant parts of a no-FROM SELECT's
 /// targets and WHERE, each a maximal subtree with no stable or volatile part and no column, as one
 /// SELECT; None for any other statement or when there is none. A bare constant cannot raise and is
@@ -6778,36 +6890,12 @@ fn fold_probe(parse: &turso_pg_parser::pg_query::ParseResult) -> Option<String> 
     if !select.from_clause.is_empty() || select.op() != SetOperation::SetopNone || !select.values_lists.is_empty() {
         return None;
     }
-    // Immutable and constant all the way down: literals, and calls, operators, casts and the
-    // conditional forms over them; anything else (a column, a parameter, a subquery, a node this
-    // reads no further) is not.
-    fn pure(node: &PgNode) -> bool {
-        let Some(n) = node.node.as_ref() else { return false };
-        let all = |v: &[PgNode]| v.iter().all(pure);
-        match n {
-            Node::AConst(_) => true,
-            Node::FuncCall(f) => {
-                f.over.is_none() && f.agg_filter.is_none() && !f.agg_star && !calls_non_immutable(f) && all(&f.args)
-            }
-            Node::AExpr(e) => e.lexpr.as_deref().is_none_or(pure) && e.rexpr.as_deref().is_none_or(pure),
-            Node::TypeCast(c) => {
-                !not_immutable(&turso_pg_parser::pg_query::NodeRef::TypeCast(c.as_ref())) && c.arg.as_deref().is_some_and(pure)
-            }
-            // A form whose arguments PostgreSQL simplifies only up to a constant that decides it
-            // (AND false, OR true, coalesce's first non-null constant, a CASE's constant WHEN) is
-            // never probed whole: [`collect`] descends it by those rules (wire-rev-351702a43 MED-4).
-            Node::BoolExpr(_) | Node::CoalesceExpr(_) | Node::CaseExpr(_) => false,
-            Node::MinMaxExpr(m) => all(&m.args),
-            Node::NullTest(t) => t.arg.as_deref().is_some_and(pure),
-            _ => false,
-        }
-    }
     fn collect(node: &PgNode, out: &mut Vec<PgNode>) {
         let Some(n) = node.node.as_ref() else { return };
         if matches!(n, Node::AConst(_)) {
             return;
         }
-        if pure(node) {
+        if immutable_constant(node) {
             out.push(node.clone());
             return;
         }

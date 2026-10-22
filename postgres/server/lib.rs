@@ -3103,7 +3103,11 @@ impl Session {
         // RowDescription, as PostgreSQL's planner folds each on its own (StatementTypes::fold_probe;
         // wire-rev-5cdb70e58 MED-1). A probe the frontend cannot prepare is skipped: only a value
         // its parts raise counts.
-        let folded_error = match types.fold_probe.as_deref().filter(|_| query) {
+        // An INSERT's or UPDATE's constant expressions to numeric(p, s) columns are judged the
+        // same way, before the statement, so one past its column is refused with no row
+        // (StatementTypes::assign_probe; numfuzz seed 8183).
+        let probe = types.fold_probe.as_deref().filter(|_| query).or(types.assign_probe.as_deref());
+        let folded_error = match probe {
             Some(probe) => match conn.prepare_typed(probe) {
                 Ok((mut folded, _)) => folded.run_ignore_rows().err(),
                 Err(_) => None,
