@@ -3782,6 +3782,11 @@ impl PostgreSQLTranslator {
                 }
             }
             Some(pg_query::protobuf::node::Node::TypeCast(type_cast)) => {
+                // A cast of a constant the caller read as an integer column's assignment reads it
+                // ([`PostgreSQLTranslator::with_integer_literals`]): its value ('2.5'::numeric is 3).
+                if let Some(v) = self.integer_literals.as_ref().and_then(|m| m.get(&type_cast.location)) {
+                    return Ok(ast::Expr::Literal(sql_string(&v.to_string())));
+                }
                 // An explicit cast to varchar(n) cuts its value to n characters, as PostgreSQL's
                 // explicit-cast length coercion does: the cast without its length, then the cut
                 // (wire-rev-351702a43 MED-5: $1::varchar(10) stored the whole text).

@@ -2584,6 +2584,46 @@ fn literal_assignments(
             _ => None,
         }
     };
+    // A cast to numeric (with its typmods) or an integer type of a constant: the type, the
+    // modifiers and the constant's spelling. NaN and Infinity are left to the engine.
+    let constant_cast = |c: &turso_pg_parser::pg_query::protobuf::TypeCast| -> Option<(&'static str, Vec<i32>, String)> {
+        let t = c.type_name.as_ref().filter(|t| t.array_bounds.is_empty())?;
+        let target = match t.names.last().and_then(|n| n.node.as_ref())? {
+            Node::String(s) => match s.sval.as_str() {
+                "numeric" => "numeric",
+                "int2" => "int2",
+                "int4" => "int4",
+                "int8" => "int8",
+                _ => return None,
+            },
+            _ => return None,
+        };
+        let typmods = t
+            .typmods
+            .iter()
+            .map(|m| match m.node.as_ref() {
+                Some(Node::AConst(a)) => match a.val.as_ref() {
+                    Some(Val::Ival(v)) => Some(v.ival),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect::<Option<Vec<i32>>>()?;
+        let text = match c.arg.as_deref().and_then(|a| a.node.as_ref()) {
+            Some(Node::AConst(a)) if !a.isnull => match a.val.as_ref() {
+                Some(Val::Ival(i)) => i.ival.to_string(),
+                Some(Val::Fval(f)) => f.fval.clone(),
+                Some(Val::Sval(s)) => s.sval.clone(),
+                _ => return None,
+            },
+            _ => return None,
+        };
+        let word = text.trim().trim_start_matches(['-', '+']);
+        if ["nan", "infinity", "inf"].iter().any(|w| word.eq_ignore_ascii_case(w)) {
+            return None;
+        }
+        Some((target, typmods, text))
+    };
     let mut coerce = |column: &str, value: &PgNode| -> Result<(), SqlErrorMessage> {
         match value.node.as_ref() {
             Some(Node::AConst(c)) if !c.isnull => {
@@ -2626,6 +2666,64 @@ fn literal_assignments(
                         }
                     }
                 }
+            }
+            Some(Node::TypeCast(c)) if constant_cast(c).is_some() => {
+                let bits = column_type(column).map_or(0, integer_bits);
+                let Some((target, typmods, text)) = constant_cast(c).filter(|_| bits > 0) else { return Ok(()) };
+                let width = |name: &str| match name {
+                    "int2" => Some((16, "smallint")),
+                    "int4" => Some((32, "integer")),
+                    "int8" => Some((64, "bigint")),
+                    _ => None,
+                };
+                let out_of_range = |name: &str| SqlErrorMessage::classified(SqlErrorKind::NumericValueOutOfRange, format!("{name} out of range"));
+                // The cast's own value first, as the planner folds the inner cast first.
+                let value = if target == "numeric" {
+                    // A bare numeric keeps every digit, so only a typmod rounds before the column.
+                    let scale = match typmods.as_slice() {
+                        [_, scale] => *scale,
+                        _ => 0,
+                    };
+                    if let Some(precision) = typmods.first() {
+                        if crate::functions::numeric_overflows(&text, *precision, scale) == Some(true) {
+                            return Err(SqlErrorMessage::classified(SqlErrorKind::NumericValueOutOfRange, "numeric field overflow"));
+                        }
+                    }
+                    let rounded = if typmods.is_empty() {
+                        crate::functions::round_decimal(&text)
+                    } else {
+                        crate::functions::round_decimal_at(&text, scale)
+                    };
+                    match rounded {
+                        Some(v) => v,
+                        None => return Ok(()),
+                    }
+                } else {
+                    let Some((cast_bits, cast_name)) = width(target) else { return Ok(()) };
+                    if let Some((message, kind)) = crate::functions::validate_pg_input(&text, cast_name) {
+                        return Err(SqlErrorMessage::classified(kind, message));
+                    }
+                    let Some(v) = (match crate::functions::pg_strtoint(&text, 64) {
+                        crate::functions::PgInt::Value(v) => Some(i128::from(v)),
+                        _ => crate::functions::round_decimal(&text),
+                    }) else {
+                        return Ok(());
+                    };
+                    let limit = 1i128 << (cast_bits - 1);
+                    if v < -limit || v >= limit {
+                        return Err(out_of_range(cast_name));
+                    }
+                    v
+                };
+                let limit = 1i128 << (bits - 1);
+                if value < -limit || value >= limit {
+                    return Err(out_of_range(match bits {
+                        16 => "smallint",
+                        32 => "integer",
+                        _ => "bigint",
+                    }));
+                }
+                rewrites.insert(c.location, value as i64);
             }
             Some(Node::TypeCast(c)) => {
                 if let Some(from) = string_cast(c) {
