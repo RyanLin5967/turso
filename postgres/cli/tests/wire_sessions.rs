@@ -18039,6 +18039,28 @@ fn a_from_subquery_alias_column_list_names_its_columns() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// numfuzz seed 8183 at f1dc48429 (SILENT; PG 18.6's answer recorded by the fuzzer on eceubuntu2, artie
+/// numfuzz-f1dc48429-s8021-8220, 5f7c6e8c89): a constant expression assigned to a numeric(p, s) column past it is 22003
+/// 'numeric field overflow' even when no row matches, as the planner folds it; it answered UPDATE 0. The in-range control
+/// (1.5 * 2, UPDATE 0) follows PG's semantics and is not separately recorded.
+#[test]
+fn a_constant_expression_past_a_numeric_column_is_refused_with_no_row() {
+    let dir = Scratch::new("numeric-fold-no-row");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE nt (id int PRIMARY KEY, c0 numeric(6,2), c1 numeric)").ok("create");
+    let mut wrong = Vec::new();
+    let r = a.q("UPDATE nt SET c0 = (-((7.49045e1 % 32767)) - 8704161102667590) WHERE id = 2");
+    if !r.error.as_ref().is_some_and(|e| e.code == "22003" && e.message == "numeric field overflow") {
+        wrong.push(format!("8183: PG 22003 \"numeric field overflow\"; got {:?} {:?}", r.tags, r.error));
+    }
+    let r = a.q("UPDATE nt SET c0 = 1.5 * 2 WHERE id = 2");
+    if r.error.is_some() || r.tags != vec!["UPDATE 0".to_string()] {
+        wrong.push(format!("in range: PG UPDATE 0; got {:?} {:?}", r.tags, r.error));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// numfuzz seeds 8054 and 8137 at f1dc48429 (SILENT; PG 18.6's answers recorded by the fuzzer on eceubuntu2, artie
 /// numfuzz-f1dc48429-s8021-8220, 5f7c6e8c89): integer + integer is computed in int4, so 2147483647 + 15 is 22003 'integer
 /// out of range', and the planner folds a constant one even over an empty table. The engine's i64 answered SELECT 0 over
