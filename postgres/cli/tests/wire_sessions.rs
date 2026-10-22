@@ -12422,7 +12422,19 @@ replays_postgresql!(
     pg18_wirefuzz_an_expression_cast_to_an_integer_rounds_replays_as_postgresql_answered,
     "pg18-wirefuzz-an_expression_cast_to_an_integer_rounds.out",
     [
-        (3, "PGDIV-INT-CAST-TRUNCATES value [wire]: SILENT: (f * 1)::int and (f + 0)::int8 over 1.5 and 2.75 answer 1, 1 and 2, 2 (the engine's CAST truncates) where PG rounds to 2, 2 and 3, 3"),
+    ]
+);
+// numfuzz seed 3504 (artie c098a7ed4d): an expression cast to an integer rounds as its operand's type's cast rounds
+// (de900873a). A bare numeric column is stored and announced float8 here, so an expression over one rounds half to
+// even as a float8 does, where PG's numeric rounds half away from zero (registered from rec50, artie 0de472ed9d).
+replays_postgresql!(
+    pg18_wirefuzz_an_expression_cast_to_an_integer_rounds_as_its_type_rounds_replays_as_postgresql_answered,
+    "pg18-wirefuzz-an_expression_cast_to_an_integer_rounds_as_its_type_rounds.out",
+    [
+        (5, "PGDIV-INT-CAST-TRUNCATES value [wire]: SILENT: (n * 1)::int and (n + 0)::int8 over a bare numeric 2.5 and -2.5 answer 2 and -2 (half to even, as the float8 the column is stored and announced as) where PG's numeric rounds to 3 and -3"),
+        (6, "PGDIV-INT-CAST-TRUNCATES value [wire]: SILENT: WHERE (n * 1)::int = 3 over a bare numeric 2.5 finds no row (2 here) where PG finds it"),
+        (9, "PGDIV-INT-CAST-TRUNCATES value [wire]: SILENT: a view's (n * 1)::int over a bare numeric rounds half to even (2, -2) where PG answers 3, -3"),
+        (10, "PGDIV-INT-CAST-TRUNCATES value [wire]: SILENT: (abs(n) * 1)::int over a bare numeric -2.5 answers 2 where PG answers 3"),
     ]
 );
 // wire-rev-7128c6f73 MED-4 and MED-5: a column cast to an integer is the engine's truncating CAST (a literal is rounded

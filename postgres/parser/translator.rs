@@ -4137,8 +4137,8 @@ impl PostgreSQLTranslator {
                 // A decimal literal cast to an integer type is rounded half away from zero, as
                 // PostgreSQL's numeric-to-int conversion rounds it (1.5::int2 is 2); the engine's
                 // CAST truncates (wire-rev-7128c6f73 MED-4). Rounded here, where the literal is
-                // still a decimal. BLIND SPOT: a column or expression of a numeric or float type
-                // cast to an integer is the engine's CAST and truncates (PGDIV-INT-CAST-TRUNCATES).
+                // still a decimal. A column or parameter is rounded below, and a compound expression
+                // by its walked type ([`PostgreSQLTranslator::with_integer_cast_rounding`]).
                 if let (Some(pg_query::protobuf::node::Node::AConst(c)), Some(t)) =
                     (arg.node.as_ref(), type_cast.type_name.as_ref())
                 {
@@ -4166,8 +4166,8 @@ impl PostgreSQLTranslator {
                 // does: a numeric (the engine's numeric decodes to text) half away from zero
                 // (numeric_int4), a float half to even (dtoi4's rint); the engine's CAST truncates
                 // (wire-rev-7128c6f73 MED-4). Integers and other text keep the engine's CAST. Only
-                // a column or a parameter, which can be read several times; BLIND SPOT: any other
-                // expression cast to an integer still truncates (PGDIV-INT-CAST-TRUNCATES).
+                // a column or a parameter, which can be read several times; a compound expression is
+                // rounded once by its walked type ([`PostgreSQLTranslator::with_integer_cast_rounding`]).
                 if let Some(t) = type_cast.type_name.as_ref() {
                     let integer = t.array_bounds.is_empty()
                         && t.names.last().is_some_and(|n| {
