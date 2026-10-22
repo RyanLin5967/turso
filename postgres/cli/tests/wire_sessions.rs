@@ -17797,6 +17797,61 @@ fn a_float_numeric_or_boolean_column_reads_its_literal_as_its_input_routine_does
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// The lead's ruling (LEAD-RULINGS 9d87841628, 1): a hexadecimal, octal or binary constant and a negated cast constant
+/// assigned to an integer column are range-checked and rounded as any constant is, even when no row matches, and a
+/// prefix minus over an untyped literal is 42725. Expected answers: PG 18.6, recorded (artie a85d2e2a20,
+/// rec43-negated-hex-assign/pg18-wirefuzz-a_negated_or_hexadecimal_constant_assigned_to_an_integer_column_is_range_checked.out).
+#[test]
+fn a_negated_or_hexadecimal_constant_assigned_to_an_integer_column_is_range_checked() {
+    let dir = Scratch::new("negated-hex-assign");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let ddl = "CREATE TABLE nh (id int PRIMARY KEY, a smallint, b int, c bigint)";
+    a.q(ddl).ok(ddl);
+    let mut wrong = Vec::new();
+    for (sql, code, message) in [
+        ("INSERT INTO nh (id, b) VALUES (1, 0x80000000)", "22003", "integer out of range"),
+        ("INSERT INTO nh (id, c) VALUES (1, 0xFFFFFFFFFFFFFFFF)", "22003", "bigint out of range"),
+        ("INSERT INTO nh (id, a) VALUES (1, 0x8000)", "22003", "smallint out of range"),
+        ("INSERT INTO nh (id, b) VALUES (1, -0x80000000)", "", ""),
+        ("INSERT INTO nh (id, c) VALUES (2, 0x7FFFFFFFFFFFFFFF)", "", ""),
+        ("INSERT INTO nh (id, b) VALUES (3, 0b1111111111111111111111111111111)", "", ""),
+        ("INSERT INTO nh (id, b) VALUES (4, 0o20000000000)", "22003", "integer out of range"),
+        ("INSERT INTO nh (id, b) VALUES (4, - 3000000000::bigint)", "22003", "integer out of range"),
+        ("INSERT INTO nh (id, b) VALUES (4, - 2.5::numeric)", "", ""),
+        ("INSERT INTO nh (id, a) VALUES (5, -(40000))", "22003", "smallint out of range"),
+        ("INSERT INTO nh (id, b) VALUES (5, - '5')", "42725", "operator is not unique: - unknown"),
+        ("INSERT INTO nh (id, b) VALUES (6, 0x_FF)", "", ""),
+        ("UPDATE nh SET b = - 3000000000::bigint WHERE id = 1000", "22003", "integer out of range"),
+        ("UPDATE nh SET c = 0x10000000000000000 WHERE id = 1000", "22003", "bigint out of range"),
+    ] {
+        let r = a.q(sql);
+        let fine = if code.is_empty() {
+            r.error.is_none()
+        } else {
+            r.error.as_ref().is_some_and(|e| e.code == code && e.message == message)
+        };
+        if !fine {
+            wrong.push(format!("{sql}: PG {code:?} {message:?}; got {:?} {:?}", r.tags, r.error));
+        }
+    }
+    let r = a.q("SELECT id, a, b, c FROM nh ORDER BY id");
+    let want: Vec<Vec<Option<String>>> = [
+        ["1", "", "-2147483648", ""],
+        ["2", "", "", "9223372036854775807"],
+        ["3", "", "2147483647", ""],
+        ["4", "", "-3", ""],
+        ["6", "", "255", ""],
+    ]
+    .iter()
+    .map(|row| row.iter().map(|v| (!v.is_empty()).then(|| v.to_string())).collect())
+    .collect();
+    if r.error.is_some() || r.rows != want {
+        wrong.push(format!("SELECT: PG {want:?}; got {:?} {:?}", r.rows, r.error));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// The lead's ruling (LEAD-RULINGS 9d87841628), the condition on dd348f3dd: 'NaN' into a double precision or real column
 /// (PostgreSQL stores NaN; the engine's REAL stores none) is refused loudly, never stored as NULL, 0 or a number, on
 /// every assignment path, and an existing row keeps its value.
