@@ -5885,6 +5885,11 @@ fn check_assignments(
     for (source, target) in assignments {
         let target = *target;
         let owned: String;
+        // The parameter's own type, for an integer column's cast ([`integer_assignment_refusal`]).
+        let param_type = match source {
+            AssignSource::Param(n) => usize::try_from(*n).ok().and_then(|n| n.checked_sub(1)).and_then(|i| types.get(i)),
+            AssignSource::Expr(_) => None,
+        };
         let text: &str = match source {
             AssignSource::Param(n) => {
                 let Some(text) = usize::try_from(*n).ok().and_then(|n| n.checked_sub(1)).and_then(sent) else {
@@ -5943,12 +5948,58 @@ fn check_assignments(
                 .then(|| (SqlErrorKind::StringDataRightTruncation, format!("value too long for type character({len})"))),
             AssignTarget::Numeric(precision, scale) => numeric_overflows(&text, precision, scale)
                 .then(|| (SqlErrorKind::NumericValueOutOfRange, "numeric field overflow".to_string())),
+            AssignTarget::Integer(bits) => integer_assignment_refusal(text, bits, param_type),
         };
         if let Some((kind, message)) = refusal {
             return Err(PgWireError::UserError(error(kind, message)));
         }
     }
     Ok(())
+}
+
+/// A bound value's refusal by the assignment cast to an integer column of `bits`, as PostgreSQL's
+/// custom plan casts it at Bind (recorded, rec56-bound-value-int-assign; numfuzz seed 4871: a
+/// declared numeric past int4 was stored in an integer column). Only a parameter of a wider type is
+/// judged: numeric, float4, float8 or a wider integer. One the column's own input routine reads (an
+/// undeclared parameter, typed by its column) is judged by that routine, and an expression's value
+/// is judged at Execute (pg_assign_int_value). A numeric or integer rounds half away from zero, a
+/// float half to even; past the column it is 22003 '<type> out of range'; a numeric NaN or infinity
+/// is 0A000 'cannot convert ... to <type>', a float one 22003. The value itself is never changed.
+fn integer_assignment_refusal(text: &str, bits: u32, param_type: Option<&Type>) -> Option<(SqlErrorKind, String)> {
+    let name = match bits {
+        16 => "smallint",
+        32 => "integer",
+        _ => "bigint",
+    };
+    // A parameter of the column's width or narrower is read by its own input routine.
+    let float = match param_type {
+        Some(t) if *t == Type::FLOAT4 || *t == Type::FLOAT8 => true,
+        Some(t) if *t == Type::NUMERIC => false,
+        Some(t) if *t == Type::INT8 && bits < 64 => false,
+        Some(t) if *t == Type::INT4 && bits < 32 => false,
+        _ => return None,
+    };
+    let out_of_range = || Some((SqlErrorKind::NumericValueOutOfRange, format!("{name} out of range")));
+    let t = text.trim();
+    let word = t.trim_start_matches(['-', '+']);
+    if word.eq_ignore_ascii_case("nan") || word.eq_ignore_ascii_case("infinity") || word.eq_ignore_ascii_case("inf") {
+        if float {
+            return out_of_range();
+        }
+        let what = if word.eq_ignore_ascii_case("nan") { "NaN" } else { "infinity" };
+        return Some((SqlErrorKind::FeatureNotSupported, format!("cannot convert {what} to {name}")));
+    }
+    let limit = 1i128 << (bits - 1);
+    let value = if float {
+        let f = t.parse::<f64>().ok()?.round_ties_even();
+        if f.abs() >= 2f64.powi(127) {
+            return out_of_range();
+        }
+        f as i128
+    } else {
+        turso_pg_parser::pg_input::round_decimal(t)?
+    };
+    (value < -limit || value >= limit).then(|| (SqlErrorKind::NumericValueOutOfRange, format!("{name} out of range")))
 }
 
 /// The elements of a PostgreSQL array literal (`{a,"b c",NULL,{d}}`), nested arrays flattened, a

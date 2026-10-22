@@ -710,6 +710,11 @@ pub enum AssignTarget {
     /// varchar(n)[]: each element past n characters, unless the excess is spaces, 22001
     /// (wire-rev-cfdebc06d LOW-7).
     VarCharArray(u32),
+    /// smallint (16), integer (32) or bigint (64): a value of a wider parameter type (numeric,
+    /// float, a wider integer) past the column once rounded as the assignment cast rounds it,
+    /// 22003 '<type> out of range'; NaN and infinity as PostgreSQL refuses them (numfuzz seed
+    /// 4871; recorded, rec56-bound-value-int-assign).
+    Integer(u32),
 }
 
 #[derive(Debug, Clone, Default)]
@@ -3330,7 +3335,7 @@ fn declared_target(schema: &Schema, relname: &str, column: &str) -> Option<Assig
 
 /// A column's [`AssignTarget`]: the engine's varchar(n) (the translator's VARCHAR(n)), the wire's
 /// bpchar(n) (CHAR(n), catalog.rs's BPCHAR_TYPE_SQL) or the engine's numeric(p, s), each with
-/// integer-literal parameters; None for any other column.
+/// integer-literal parameters, or an integer column; None for any other column.
 fn assign_target(col: &Column) -> Option<AssignTarget> {
     let array = col.array_dimensions() > 0;
     let int = |e: &turso_parser::ast::Expr| -> Option<i64> {
@@ -3352,6 +3357,12 @@ fn assign_target(col: &Column) -> Option<AssignTarget> {
         ("varchar", [n]) => u32::try_from(*n).ok().map(AssignTarget::VarChar),
         ("bpchar", [n]) => u32::try_from(*n).ok().map(AssignTarget::BpChar),
         ("numeric", [p, s]) => Some(AssignTarget::Numeric(u32::try_from(*p).ok()?, i32::try_from(*s).ok()?)),
+        (_, []) => match sqlite_type_to_pg_oid(&col.ty_str) {
+            21 => Some(AssignTarget::Integer(16)),
+            23 => Some(AssignTarget::Integer(32)),
+            20 => Some(AssignTarget::Integer(64)),
+            _ => None,
+        },
         _ => None,
     }
 }
