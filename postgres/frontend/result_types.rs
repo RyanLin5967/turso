@@ -1071,6 +1071,12 @@ pub fn integer_cast_of_compound(c: &turso_pg_parser::pg_query::protobuf::TypeCas
         }
 }
 
+/// Whether `arg` is a cast to numeric, which the walk types float8 when it has a typmod (it is
+/// computed as a REAL) and PostgreSQL reads as a numeric.
+fn numeric_cast(arg: &PgNode) -> bool {
+    matches!(arg.node.as_ref(), Some(Node::TypeCast(inner)) if inner.type_name.as_ref().and_then(|t| t.names.last()).is_some_and(|n| matches!(&n.node, Some(Node::String(s)) if s.sval == "numeric")))
+}
+
 /// Whether `c` casts to text, varchar, bpchar or name ([`Walked::float_texts`]).
 fn string_cast(c: &turso_pg_parser::pg_query::protobuf::TypeCast) -> bool {
     c.type_name.as_ref().filter(|t| t.array_bounds.is_empty()).and_then(|t| t.names.last()).is_some_and(|n| {
@@ -2734,8 +2740,7 @@ impl Infer<'_> {
         if !integer_cast_of_compound(c, arg) {
             return;
         }
-        let numeric_cast = matches!(arg.node.as_ref(), Some(Node::TypeCast(inner)) if inner.type_name.as_ref().and_then(|t| t.names.last()).is_some_and(|n| matches!(&n.node, Some(Node::String(s)) if s.sval == "numeric")));
-        let ty = if numeric_cast { Some(NUMERIC) } else { ty };
+        let ty = if numeric_cast(arg) { Some(NUMERIC) } else { ty };
         if let Some(ty @ (NUMERIC | FLOAT8 | FLOAT4)) = ty {
             self.integer_casts.borrow_mut().insert(c.location, ty);
         }
@@ -2880,7 +2885,13 @@ impl Infer<'_> {
                         | "log10" | "power" | "pow",
                         t,
                     ) if (matches!(category(t), Some(('S', _))) && !untyped_literal(call.args.first()))
-                        || (matches!(name.as_str(), "round" | "trunc") && call.args.len() == 2 && matches!(t, FLOAT4 | FLOAT8)) =>
+                        || (matches!(name.as_str(), "round" | "trunc")
+                            && call.args.len() == 2
+                            && matches!(t, FLOAT4 | FLOAT8)
+                            // A cast to numeric(p, s) is typed float8 here (computed as a REAL) and
+                            // is a numeric to PostgreSQL, which resolves trunc((c)::numeric(6,2), 2)
+                            // (numfuzz seed 8462 at f1dc48429, recorded rec60-loud-classes).
+                            && !call.args.first().is_some_and(numeric_cast)) =>
                     {
                         let types: Vec<&str> = call
                             .args

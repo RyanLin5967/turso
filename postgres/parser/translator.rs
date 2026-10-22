@@ -5631,6 +5631,9 @@ impl PostgreSQLTranslator {
         // take — so the rewrite is purely a name change.
         let func_name = match func_name.as_str() {
             "position" => "strpos".to_string(),
+            // trunc with a scale is PostgreSQL's numeric one, truncated on the value's decimal
+            // digits by the frontend's pg_trunc_scale: the engine's trunc takes one argument.
+            "trunc" if args.len() == 2 => "pg_trunc_scale".to_string(),
             _ => func_name,
         };
 

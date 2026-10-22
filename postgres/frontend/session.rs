@@ -737,7 +737,14 @@ fn refuse_long_decimals(
     // seed 622 at 45de98440). One within it is exempt: literal_assignments reads it exactly and the
     // translator writes its value, never a float (the lead's ruling LEAD-RULINGS 82dcec6b66, for
     // integer columns on its paths alone; recorded, rec34-long-decimal-integer, artie afd9557309).
-    let (integer, _, _, _, _) = literal_assignments(pg_conn, parse).map_err(LimboError::InvalidArgument)?;
+    // An assignment literal_assignments refuses is left to its second call, in session_translation,
+    // which runs after the typing walk: PostgreSQL's parse analysis refuses an operator with no
+    // candidate (- text, 42883) before any assigned constant is judged (numfuzz seed 8483 at
+    // f1dc48429, recorded rec61-loud-classes-exact), and that call still refuses the statement before
+    // the engine reads a long literal, so seed 622's 22003 stands.
+    let Ok((integer, _, _, _, _)) = literal_assignments(pg_conn, parse) else {
+        return Ok(());
+    };
     let (default_values, deferred_defaults) = default_coercions(parse).map_err(LimboError::InvalidArgument)?;
     let mut exempt = float_target_literals(pg_conn, parse);
     exempt.extend(integer.keys().chain(default_values.keys()).chain(deferred_defaults.keys()).filter_map(|l| usize::try_from(*l).ok()));
