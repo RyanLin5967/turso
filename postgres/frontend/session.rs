@@ -3064,6 +3064,18 @@ fn literal_assignments(
                         _ => None,
                     }
                 }
+                // numeric Infinity is past every numeric(p, s) ('Infinity'::numeric; numfuzz
+                // seeds 4029, 4207; recorded, rec49-numeric-infinity-wide). constant_cast leaves NaN
+                // and Infinity to the integer columns' 0A000; NaN fits a numeric(p, s).
+                Some(Node::TypeCast(c))
+                    if c.type_name.as_ref().and_then(|t| t.names.last()).is_some_and(|n| matches!(&n.node, Some(Node::String(s)) if s.sval == "numeric"))
+                        && matches!(c.arg.as_deref().and_then(|a| a.node.as_ref()), Some(Node::AConst(k)) if matches!(k.val.as_ref(), Some(Val::Sval(t)) if {
+                            let word = t.sval.trim().trim_start_matches(['-', '+']);
+                            word.eq_ignore_ascii_case("infinity") || word.eq_ignore_ascii_case("inf")
+                        })) =>
+                {
+                    return Err(SqlErrorMessage::classified(SqlErrorKind::NumericValueOutOfRange, "numeric field overflow"));
+                }
                 Some(Node::TypeCast(c)) => match constant_cast(c) {
                     Some(("numeric", typmods, text)) => {
                         if let Some(p) = typmods.first() {
