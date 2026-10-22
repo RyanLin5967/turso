@@ -31,6 +31,7 @@ pub(crate) fn resolve_scalar(name: &str, arg_count: usize) -> bool {
         "pg_get_expr" => &[2, 3],
         "to_char" | "pg_input_is_valid" | "booleq" | "boolne" | "col_description" | "bpchareq"
         | "encode" | "bpcharlt" | "pg_text_int" | "pg_assign_int" => &[2],
+        "pg_round_even" => &[1],
         "version" | "current_database" | "current_schema" | "pg_backend_pid" => &[0],
         "now" | "transaction_timestamp" | "statement_timestamp" => &[0],
         "make_date" => &[3],
@@ -77,6 +78,14 @@ pub(crate) fn exec_scalar(conn: &Connection, name: &str, args: &[Value]) -> Resu
         // A text column's value cast to an integer type, read as int2in/int4in/int8in read it:
         // 22P02 for anything but an integer, 22003 past the type (wire-rev-1de981755-numeric MED-1).
         // Any other value passes to the cast unchanged.
+        // A float's cast to an integer type rounds half to even (rint), as float8 and float4's
+        // casts do; written by the translator for a compound float operand (its
+        // with_integer_cast_rounding). Any other value passes unchanged.
+        "pg_round_even" => Ok(match args.first() {
+            Some(Value::Numeric(turso_core::Numeric::Float(f))) => Value::from_f64(f64::from(*f).round_ties_even()),
+            Some(other) => other.clone(),
+            None => Value::Null,
+        }),
         "pg_text_int" => match args.first() {
             Some(Value::Text(t)) => match validate_pg_input(t.as_str(), &text_arg(1)) {
                 Some((message, kind)) => Err(LimboError::Constraint(SqlErrorMessage::classified(kind, message))),

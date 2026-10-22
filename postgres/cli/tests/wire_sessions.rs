@@ -12534,7 +12534,19 @@ replays_postgresql!(
     pg18_wirefuzz_an_expression_cast_to_an_integer_rounds_replays_as_postgresql_answered,
     "pg18-wirefuzz-an_expression_cast_to_an_integer_rounds.out",
     [
-        (3, "PGDIV-INT-CAST-TRUNCATES value [wire]: SILENT: (f * 1)::int and (f + 0)::int8 over 1.5 and 2.75 answer 1, 1 and 2, 2 (the engine's CAST truncates) where PG rounds to 2, 2 and 3, 3; the int8 column is also announced 23 (PGDIV-INT8-CAST-TYPE)"),
+    ]
+);
+// numfuzz seed 3504 (artie c098a7ed4d): an expression cast to an integer rounds as its operand's type's cast rounds
+// (de900873a). A bare numeric column is stored and announced float8 here, so an expression over one rounds half to
+// even as a float8 does, where PG's numeric rounds half away from zero (registered from rec50, artie 0de472ed9d).
+replays_postgresql!(
+    pg18_wirefuzz_an_expression_cast_to_an_integer_rounds_as_its_type_rounds_replays_as_postgresql_answered,
+    "pg18-wirefuzz-an_expression_cast_to_an_integer_rounds_as_its_type_rounds.out",
+    [
+        (5, "PGDIV-INT-CAST-TRUNCATES value [wire]: SILENT: (n * 1)::int and (n + 0)::int8 over a bare numeric 2.5 and -2.5 answer 2 and -2 (half to even, as the float8 the column is stored and announced as) where PG's numeric rounds to 3 and -3"),
+        (6, "PGDIV-INT-CAST-TRUNCATES value [wire]: SILENT: WHERE (n * 1)::int = 3 over a bare numeric 2.5 finds no row (2 here) where PG finds it"),
+        (9, "PGDIV-INT-CAST-TRUNCATES value [wire]: SILENT: a view's (n * 1)::int over a bare numeric rounds half to even (2, -2) where PG answers 3, -3"),
+        (10, "PGDIV-INT-CAST-TRUNCATES value [wire]: SILENT: (abs(n) * 1)::int over a bare numeric -2.5 answers 2 where PG answers 3"),
     ]
 );
 // wire-rev-7128c6f73 MED-4 and MED-5: a column cast to an integer is the engine's truncating CAST (a literal is rounded
@@ -12543,7 +12555,6 @@ replays_postgresql!(
     pg18_wirefuzz_casts_to_integers_and_date_arithmetic_over_casts_replays_as_postgresql_answered,
     "pg18-wirefuzz-casts_to_integers_and_date_arithmetic_over_casts.out",
     [
-        (3, "PGDIV-INT8-CAST-TYPE type [wire]: a column cast to int8 is announced int4 (23) where PG announces 20; the values agree (the engine's INTEGER is typed 23)"),
         (5, "PGDIV-DATE-ARITHMETIC value [engine]: SILENT: a date column minus a date cast answers 0 for 19 (the engine's plain '-' over two texts; fixed in the engine at 771f44872, not yet on this line)"),
         (6, "PGDIV-DATE-ARITHMETIC value [engine]: SILENT: a date cast plus 1 answers 2027 for 2026-10-21 (fixed in the engine at 771f44872, not yet on this line)"),
     ]
@@ -17902,6 +17913,211 @@ fn a_float_numeric_or_boolean_column_reads_its_literal_as_its_input_routine_does
     .collect();
     if r.error.is_some() || r.rows != want {
         wrong.push(format!("SELECT: PG {want:?}; got {:?} {:?}", r.rows, r.error));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// numfuzz seed 3504 at d5600475b (artie c098a7ed4d), PGDIV-INT-CAST-TRUNCATES: an expression cast to an integer type
+/// rounds as its type's cast rounds, in a target list, a WHERE and a view: a numeric half away from zero, a float8 or
+/// real half to even, where the engine's CAST truncated (-((-('1.5'::numeric))::bigint) answered 1 for PG's 2).
+/// The numeric column is numeric(10, 2): a bare numeric column is stored and announced float8 here (the bare-NUMERIC
+/// divergence), so it rounds as a float8. Expected answers: PG 18.6, recorded (artie 9b5648cdfd,
+/// rec50b-expression-int-cast-typmod/pg18-wirefuzz-an_expression_cast_to_an_integer_rounds_as_its_type_rounds.out; the
+/// same answers as with a bare numeric, rec50, artie 0de472ed9d).
+#[test]
+fn an_expression_cast_to_an_integer_rounds_as_its_type_rounds() {
+    let dir = Scratch::new("expression-int-cast");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in [
+        "CREATE TABLE ec (id int PRIMARY KEY, n numeric(10,2), f float8, r real)",
+        "INSERT INTO ec VALUES (1, 2.5, 2.5, 2.5), (2, -2.5, -2.5, -2.5), (3, 1.5, 1.5, 1.5), (4, 0.5, 0.5, 0.5)",
+        "CREATE VIEW ecv AS SELECT id, (n * 1)::int AS ni, (f / 1)::int AS fi FROM ec",
+    ] {
+        a.q(sql).ok(sql);
+    }
+    let rows = |rows: &[&[&str]]| -> Vec<Vec<Option<String>>> { rows.iter().map(|r| r.iter().map(|v| Some(v.to_string())).collect()).collect() };
+    let mut wrong = Vec::new();
+    for (sql, want) in [
+        ("SELECT -((-('1.5'::numeric))::bigint) AS v", rows(&[&["2"]])),
+        (
+            "SELECT (('2.5'::numeric) + 0)::int AS a, ((2.5)::float8 + 0)::int AS b, ((3.5)::float8 * 1)::int AS c, (-(2.5::float8) * 1)::int AS d",
+            rows(&[&["3", "2", "4", "-2"]]),
+        ),
+        (
+            "SELECT id, (n * 1)::int AS ni, (f * 1)::int AS fi, (r + 0)::int AS ri, (n + 0)::int8 AS n8, (f + 0)::smallint AS f2 FROM ec ORDER BY id",
+            rows(&[&["1", "3", "2", "2", "3", "2"], &["2", "-3", "-2", "-2", "-3", "-2"], &["3", "2", "2", "2", "2", "2"], &["4", "1", "0", "0", "1", "0"]]),
+        ),
+        ("SELECT id FROM ec WHERE (n * 1)::int = 3 ORDER BY id", rows(&[&["1"]])),
+        ("SELECT id FROM ec WHERE (f * 1)::int = 2 ORDER BY id", rows(&[&["1"], &["3"]])),
+        ("SELECT id, ni, fi FROM ecv ORDER BY id", rows(&[&["1", "3", "2"], &["2", "-3", "-2"], &["3", "2", "2"], &["4", "1", "0"]])),
+        ("SELECT (abs(n) * 1)::int AS v FROM ec WHERE id = 2", rows(&[&["3"]])),
+    ] {
+        let r = a.q(sql);
+        if r.error.is_some() || r.rows != want {
+            wrong.push(format!("{sql}: PG {want:?}; got {:?} {:?}", r.rows, r.error));
+        }
+    }
+    let r = a.q("SELECT (round(f, 1) + 0)::int FROM ec WHERE id = 1");
+    if !r.error.as_ref().is_some_and(|e| e.code == "42883" && e.message == "function round(double precision, integer) does not exist") {
+        wrong.push(format!("round(f, 1): PG 42883; got {:?} {:?}", r.rows, r.error));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// numfuzz seeds 4029, 4207, 4074 and 4252 (artie d101e52932, f7f5e008d0): numeric Infinity assigned to a numeric(p, s)
+/// column is 22003 'numeric field overflow' on every assignment path, even when no row matches (it was stored), and an
+/// integer of more than 15 significant digits written as text and read as a numeric is refused 0A000 as the same
+/// digits written as a literal are (the interim refusal, PGDIV-NUMERIC-LITERAL-WIDE; LEAD-RULINGS 7ba23121db), where it
+/// answered a float (-6.0204742850066944e+16). PG's answers, recorded (artie f83e43df9b,
+/// rec49-numeric-infinity-wide/pg18-wirefuzz-a_numeric_infinity_or_a_wide_integer_text_answers_as_postgresql_does.out),
+/// for everything but the wide texts, which PG holds exactly.
+#[test]
+fn numeric_infinity_into_a_typmod_column_and_a_wide_integer_text_are_refused() {
+    let dir = Scratch::new("numeric-infinity-wide");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in ["CREATE TABLE ni (id int PRIMARY KEY, n numeric(10,2), m numeric, k numeric(5))", "INSERT INTO ni (id, n) VALUES (1, 1.5)"] {
+        a.q(sql).ok(sql);
+    }
+    let mut wrong = Vec::new();
+    for sql in [
+        "UPDATE ni SET n = 'Infinity'::numeric WHERE id = 1",
+        "UPDATE ni SET n = 'Infinity'::numeric WHERE id = 1000",
+        "UPDATE ni SET n = '-Infinity' WHERE id = 1",
+        "INSERT INTO ni (id, n) VALUES (2, 'Infinity')",
+        "INSERT INTO ni (id, k) VALUES (2, 'inf'::numeric)",
+        "INSERT INTO ni (id, n) VALUES (1, 0) ON CONFLICT (id) DO UPDATE SET n = 'Infinity'::numeric",
+    ] {
+        let r = a.q(sql);
+        if !r.error.as_ref().is_some_and(|e| e.code == "22003" && e.message == "numeric field overflow") {
+            wrong.push(format!("{sql}: PG 22003 'numeric field overflow'; got {:?} {:?}", r.tags, r.error));
+        }
+    }
+    let r = a.q("SELECT id, n FROM ni ORDER BY id");
+    if r.error.is_some() || r.rows != vec![vec![Some("1".to_string()), Some("1.50".to_string())]] {
+        wrong.push(format!("SELECT id, n: PG [[1, 1.50]]; got {:?} {:?}", r.rows, r.error));
+    }
+    for sql in [
+        "SELECT '-60204742850066943'::numeric + 0 AS v",
+        "SELECT '-458593628112012096'::numeric AS v",
+        "SELECT CAST('9007199254740993' AS numeric) AS v",
+        "SELECT NUMERIC '9007199254740993' AS v",
+    ] {
+        let r = a.q(sql);
+        if r.error.as_ref().map(|e| e.code.as_str()) != Some("0A000") {
+            wrong.push(format!("{sql}: refused 0A000 (PG holds it exactly; the engine's float8 does not); got {:?} {:?} {:?}", r.tags, r.rows, r.error));
+        }
+    }
+    let r = a.q("SELECT '123456789012345'::numeric * 2 AS v");
+    if r.error.is_some() || r.rows != vec![vec![Some("246913578024690".to_string())]] {
+        wrong.push(format!("15 digits: PG [[246913578024690]]; got {:?} {:?}", r.rows, r.error));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// numfuzz seed 3269 at d5600475b (artie 5be9a9ed6b): a view's and a CHECK constraint's expressions keep their operands'
+/// nesting as written, before and after a restart: a - (b - c) is not a - b - c, a / (b / c) not a / b / c, -(a - b)
+/// not -a - b. A view read answered -5826 for PG's 5828: the stored text dropped the parentheses the parse tree
+/// implies. Expected answers: PG 18.6, recorded (artie a7962e881d,
+/// rec48-stored-expression-nesting/pg18-wirefuzz-a_stored_expression_keeps_its_nesting.out).
+#[test]
+fn a_stored_expression_keeps_its_operands_nesting() {
+    let dir = Scratch::new("stored-nesting");
+    let views = "SELECT id, s, q, m, n, r, x, l, g, u, w FROM pv ORDER BY id";
+    let want_views: Vec<Vec<Option<String>>> =
+        vec![["1", "6", "5", "-2", "-2", "1", "40", "-2", "1.5", "yyz", "14"].iter().map(|v| Some(v.to_string())).collect()];
+    let mut wrong = Vec::new();
+    {
+        let server = Server::start(&dir.db(), &[]);
+        let mut a = server.connect();
+        for sql in [
+            "CREATE TABLE p (id int PRIMARY KEY, a int, b int, c int, f float8, t text, CHECK (a - (b - c) >= 0))",
+            "CREATE VIEW pv AS SELECT id, a - (b - c) AS s, a / (b / c) AS q, a - (b + c) AS m, -(a - b) AS n, a % (b % c + 3) AS r, a * (b - c) AS x, (a - b) - c AS l, f - (f - 1.5) AS g, t || (t || 'z') AS u, a - -(b - c) AS w FROM p",
+            "CREATE VIEW pw AS SELECT id FROM p WHERE a - (b - c) = 6 AND NOT (a < b OR c > b)",
+            "INSERT INTO p (id, a, b, c, f, t) VALUES (1, 10, 8, 4, 2.5, 'y')",
+        ] {
+            a.q(sql).ok(sql);
+        }
+        let r = a.q("INSERT INTO p (id, a, b, c, f, t) VALUES (2, 1, 8, 4, 0.5, 'q')");
+        if r.error.as_ref().map(|e| e.code.as_str()) != Some("23514") {
+            wrong.push(format!("row 2: PG 23514; got {:?} {:?}", r.tags, r.error));
+        }
+        let r = a.q(views);
+        if r.error.is_some() || r.rows != want_views {
+            wrong.push(format!("before restart, {views}: PG {want_views:?}; got {:?} {:?}", r.rows, r.error));
+        }
+        drop(a);
+        server.kill();
+    }
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let r = a.q(views);
+    if r.error.is_some() || r.rows != want_views {
+        wrong.push(format!("after restart, {views}: PG {want_views:?}; got {:?} {:?}", r.rows, r.error));
+    }
+    let r = a.q("SELECT id FROM pw ORDER BY id");
+    if r.error.is_some() || r.rows != vec![vec![Some("1".to_string())]] {
+        wrong.push(format!("after restart, pw: PG [[1]]; got {:?} {:?}", r.rows, r.error));
+    }
+    // a - (b - c) is 2 here, a - b - c is -10: PG's CHECK admits the row.
+    let r = a.q("INSERT INTO p (id, a, b, c, f, t) VALUES (3, 5, 9, 6, 1, 'k')");
+    if r.error.is_some() {
+        wrong.push(format!("after restart, row 3: PG INSERT 0 1; got {:?} {:?}", r.tags, r.error));
+    }
+    let r = a.q("SELECT id FROM p ORDER BY id");
+    if r.rows != vec![vec![Some("1".to_string())], vec![Some("3".to_string())]] {
+        wrong.push(format!("after restart, ids: PG [[1], [3]]; got {:?} {:?}", r.rows, r.error));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// numfuzz seed 2952 at d5600475b (artie 5b9cc1446d): a text value cast to smallint, integer or bigint is read by
+/// int2in/int4in/int8in, whatever produced the text (a column, a function, a cast of another type): a spelling the
+/// routine refuses ('Infinity', '1.5', '', 'abc') is 22P02 and one past the type 22003, never a number; a 0x prefix,
+/// underscores and blanks are read as the routine reads them. ('Infinity'::numeric)::text::bigint answered
+/// 9223372036854775807. Expected answers: PG 18.6, recorded (artie 8d1dd2d784,
+/// rec47-text-int-cast/pg18-wirefuzz-a_text_value_cast_to_an_integer_type_is_read_by_its_input_routine.out).
+#[test]
+fn a_text_value_cast_to_an_integer_type_is_read_by_its_input_routine() {
+    let dir = Scratch::new("text-int-cast");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in [
+        "CREATE TABLE tc (id int PRIMARY KEY, s text, v varchar(20))",
+        "INSERT INTO tc VALUES (1, 'Infinity', ' 42 '), (2, '0x1F', '1_000'), (3, '1.5', '-0'), (4, '99999999999', 'abc'), (5, '', '7')",
+    ] {
+        a.q(sql).ok(sql);
+    }
+    let mut wrong = Vec::new();
+    for (sql, want) in [
+        ("SELECT (('Infinity'::numeric)::text)::bigint AS v", Err(("22P02", r#"invalid input syntax for type bigint: "Infinity""#))),
+        ("SELECT ((('Infinity'::numeric)::text)::bigint + 9223372036854775807) AS v", Err(("22P02", r#"invalid input syntax for type bigint: "Infinity""#))),
+        ("SELECT s::bigint FROM tc WHERE id = 1", Err(("22P02", r#"invalid input syntax for type bigint: "Infinity""#))),
+        ("SELECT s::int FROM tc WHERE id = 2", Ok(vec!["31"])),
+        ("SELECT s::int FROM tc WHERE id = 3", Err(("22P02", r#"invalid input syntax for type integer: "1.5""#))),
+        ("SELECT s::int FROM tc WHERE id = 4", Err(("22003", r#"value "99999999999" is out of range for type integer"#))),
+        ("SELECT s::bigint FROM tc WHERE id = 4", Ok(vec!["99999999999"])),
+        ("SELECT s::smallint FROM tc WHERE id = 5", Err(("22P02", r#"invalid input syntax for type smallint: """#))),
+        ("SELECT v::int FROM tc WHERE id = 1", Ok(vec!["42"])),
+        ("SELECT v::int FROM tc WHERE id = 2", Ok(vec!["1000"])),
+        ("SELECT v::int FROM tc WHERE id = 3", Ok(vec!["0"])),
+        ("SELECT v::int FROM tc WHERE id = 4", Err(("22P02", r#"invalid input syntax for type integer: "abc""#))),
+        ("SELECT CAST(v AS bigint) FROM tc WHERE id = 5", Ok(vec!["7"])),
+        ("SELECT (upper('12'))::int AS v", Ok(vec!["12"])),
+        ("SELECT ('1' || '2')::int AS v", Ok(vec!["12"])),
+        ("SELECT (lower(' 0X10 '))::int AS v", Ok(vec!["16"])),
+        ("SELECT id, s::int FROM tc WHERE id IN (2, 3) ORDER BY id", Err(("22P02", r#"invalid input syntax for type integer: "1.5""#))),
+        ("SELECT sum(v::int) FROM tc WHERE id IN (1, 2, 5)", Ok(vec!["1049"])),
+    ] {
+        let r = a.q(sql);
+        let fine = match &want {
+            Ok(values) => r.error.is_none() && r.rows.iter().map(|row| row.last().cloned().flatten().unwrap_or_default()).collect::<Vec<_>>() == *values,
+            Err((code, message)) => r.error.as_ref().is_some_and(|e| e.code == *code && e.message == *message),
+        };
+        if !fine {
+            wrong.push(format!("{sql}: PG {want:?}; got {:?} {:?} {:?}", r.tags, r.rows, r.error));
+        }
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
 }

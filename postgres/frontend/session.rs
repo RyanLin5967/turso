@@ -2174,36 +2174,9 @@ fn prepare_statement_parsed(
             // A parameter compared with something no context types is refused (42P18) by the
             // server, which alone reads the types the client declared (wire review 8 item 7,
             // review 11 item 1).
-            let search_path = written_search_path(pg_conn);
-            // Which attached schema holds a name, probed only when the walk resolves an
-            // unqualified name through one, once per (schema, name) per statement (wire review 17
-            // item 3).
-            let names = pg_conn.conn.attached_database_names();
-            let probed = std::cell::RefCell::new(std::collections::HashMap::new());
-            let holds = |schema: &str, name: &str| {
-                let key = (schema.to_ascii_lowercase(), name.to_ascii_lowercase());
-                if let Some(held) = probed.borrow().get(&key) {
-                    return *held;
-                }
-                let held = get_table_columns(&pg_conn.conn, name, Some(schema))
-                    .is_ok_and(|columns| !columns.is_empty());
-                probed.borrow_mut().insert(key, held);
-                held
-            };
-            let attached = crate::result_types::Attached {
-                names: &names,
-                holds: &holds,
-            };
             // A column reference naming no FROM entry is refused here, 42P01 (wire review 17
             // item 5).
-            let walked = crate::result_types::parameter_types(
-                &parse_result,
-                &schema,
-                &search_path,
-                &pg_conn.view_cache,
-                &attached,
-            )
-            .map_err(LimboError::InvalidArgument)?;
+            let walked = walk_statement(pg_conn, &schema, &parse_result).map_err(LimboError::InvalidArgument)?;
             types.params = walked.params;
             types.untyped = walked.untyped;
             types.inconsistent = walked.inconsistent;
@@ -2326,6 +2299,51 @@ fn prepare_statement_parsed(
     noop_statement(&pg_conn.conn).map(Some)
 }
 
+/// The result-type walk of a statement ([`crate::result_types::parameter_types`]) over this
+/// session's search path and attached schemas. Which attached schema holds a name is probed only
+/// when the walk resolves an unqualified name through one, once per (schema, name) per statement
+/// (wire review 17 item 3).
+fn walk_statement(
+    pg_conn: &PgConnectionInner,
+    schema: &std::sync::Arc<turso_core::schema::Schema>,
+    parse: &turso_pg_parser::pg_query::ParseResult,
+) -> std::result::Result<crate::result_types::Walked, SqlErrorMessage> {
+    let search_path = written_search_path(pg_conn);
+    let names = pg_conn.conn.attached_database_names();
+    let probed = std::cell::RefCell::new(std::collections::HashMap::new());
+    let holds = |schema: &str, name: &str| {
+        let key = (schema.to_ascii_lowercase(), name.to_ascii_lowercase());
+        if let Some(held) = probed.borrow().get(&key) {
+            return *held;
+        }
+        let held = get_table_columns(&pg_conn.conn, name, Some(schema)).is_ok_and(|columns| !columns.is_empty());
+        probed.borrow_mut().insert(key, held);
+        held
+    };
+    let attached = crate::result_types::Attached { names: &names, holds: &holds };
+    crate::result_types::parameter_types(parse, schema, &search_path, &pg_conn.view_cache, &attached)
+}
+
+/// The parse locations of the casts to an integer type of a compound numeric, float8 or real
+/// expression, with the operand's type, for the translator to round as PostgreSQL's cast does
+/// ([`crate::result_types::Walked::integer_casts`]). Read from the parse and the schema alone, so
+/// the engine's re-prepare translates alike; the walk runs only for a statement holding such a cast.
+fn integer_cast_rounding(
+    pg_conn: &PgConnectionInner,
+    parse: &turso_pg_parser::pg_query::ParseResult,
+) -> std::result::Result<std::collections::HashMap<i32, u32>, SqlErrorMessage> {
+    use turso_pg_parser::pg_query::NodeRef;
+    let any = parse.protobuf.nodes().iter().any(|(n, ..)| match n {
+        NodeRef::TypeCast(c) => c.arg.as_deref().is_some_and(|arg| crate::result_types::integer_cast_of_compound(c, arg)),
+        _ => false,
+    });
+    if !any {
+        return Ok(std::collections::HashMap::new());
+    }
+    let schema = pg_conn.conn.current_schema();
+    Ok(walk_statement(pg_conn, &schema, parse)?.integer_casts.into_iter().collect())
+}
+
 /// THE translation of a statement, for the session's prepare and for the engine's re-prepare of it
 /// alike (ONE TRANSLATION PATH, the wire line review M1-M4: the re-prepare translated with a plain
 /// translator, so a DELETE ... USING lost its column lookup, a domain cast its CHECK, and
@@ -2378,6 +2396,9 @@ pub(crate) fn session_translation(
     // (wire-rev-1de981755-numeric MED-1); judged from the parse and the schema alone, so the engine's
     // re-prepare translates it alike.
     let text_casts = text_integer_casts(pg_conn, sql, parse_result);
+    // Each cast to an integer type of a compound numeric or float expression rounds as its type's
+    // cast does (PGDIV-INT-CAST-TRUNCATES; numfuzz seed 3504): the engine's CAST truncates.
+    let rounding = integer_cast_rounding(pg_conn, parse_result).map_err(LimboError::InvalidArgument)?;
     // Each value assigned to a column is coerced as parse analysis coerces it, here so the
     // re-prepare judges it alike; a literal an integer column reads is written as its value.
     let (integer_literals, text_literals, float_literals) = literal_assignments(pg_conn, parse_result).map_err(LimboError::InvalidArgument)?;
@@ -2389,6 +2410,7 @@ pub(crate) fn session_translation(
     let translator = || {
         let t = translator();
         let t = if text_casts.is_empty() { t } else { t.with_text_integer_casts(text_casts.clone()) };
+        let t = if rounding.is_empty() { t } else { t.with_integer_cast_rounding(rounding.clone()) };
         let t = if text_literals.is_empty() { t } else { t.with_text_literals(text_literals.clone()) };
         let t = if float_literals.is_empty() { t } else { t.with_float_literals(float_literals.clone()) };
         if integer_literals.is_empty() { t } else { t.with_integer_literals(integer_literals.clone()) }
@@ -2451,6 +2473,75 @@ pub(crate) fn session_translation(
     Ok(translated)
 }
 
+/// The relation a value's column reference reads, with the names it is known by ([`string_type`]).
+type StringSource = Option<(std::sync::Arc<turso_core::schema::BTreeTable>, String, String)>;
+
+/// The string type a value has when it is one PostgreSQL types as a string whatever its
+/// arguments (rec44): a text function's result, a || with a string side, a string cast, or a
+/// column of the source relation declared text, varchar or char. None for anything else,
+/// which the engine judges (an untyped literal is read as the column's input).
+fn string_type(node: &turso_pg_parser::pg_query::protobuf::Node, source: &StringSource) -> Option<u32> {
+    use turso_pg_parser::pg_query::protobuf::node::Node;
+    const TEXT_FUNCTIONS: &[&str] = &[
+        "upper", "lower", "concat", "concat_ws", "substr", "substring", "trim", "btrim", "ltrim", "rtrim", "replace",
+        "repeat", "lpad", "rpad", "left", "right", "md5", "to_char", "format", "initcap", "reverse", "chr", "quote_ident",
+        "quote_literal", "quote_nullable", "translate", "split_part", "regexp_replace", "to_hex",
+    ];
+    match node.node.as_ref()? {
+        Node::FuncCall(f) => {
+            let name = f.funcname.last().and_then(|n| match &n.node {
+                Some(Node::String(s)) => Some(s.sval.as_str()),
+                _ => None,
+            })?;
+            TEXT_FUNCTIONS.contains(&name).then_some(25)
+        }
+        Node::AExpr(e) if matches!(e.name.as_slice(), [n] if matches!(&n.node, Some(Node::String(s)) if s.sval == "||")) => {
+            let side = |x: Option<&turso_pg_parser::pg_query::protobuf::Node>| {
+                x.is_some_and(|x| matches!(x.node.as_ref(), Some(Node::AConst(c)) if matches!(c.val, Some(turso_pg_parser::pg_query::protobuf::a_const::Val::Sval(_)))) || string_type(x, source).is_some())
+            };
+            (side(e.lexpr.as_deref()) || side(e.rexpr.as_deref())).then_some(25)
+        }
+        Node::TypeCast(c) => match c.type_name.as_ref()?.names.last()?.node.as_ref()? {
+            Node::String(s) if c.type_name.as_ref()?.array_bounds.is_empty() => match s.sval.as_str() {
+                "text" => Some(25),
+                "varchar" => Some(1043),
+                "bpchar" => Some(1042),
+                "name" => Some(19),
+                _ => None,
+            },
+            _ => None,
+        },
+        Node::ColumnRef(r) => {
+            let (table, name, alias) = source.as_ref()?;
+            let fields: Vec<&str> = r
+                .fields
+                .iter()
+                .map(|f| match &f.node {
+                    Some(Node::String(s)) => Some(s.sval.as_str()),
+                    _ => None,
+                })
+                .collect::<Option<Vec<_>>>()?;
+            let column = match fields.as_slice() {
+                [c] => *c,
+                [q, c] if q.eq_ignore_ascii_case(alias) || q.eq_ignore_ascii_case(name) => *c,
+                _ => return None,
+            };
+            let (_, col) = table.get_column(column).filter(|(_, c)| c.array_dimensions() == 0)?;
+            let base = col.ty_str.split('(').next().unwrap_or("").trim();
+            if base.eq_ignore_ascii_case("TEXT") {
+                Some(25)
+            } else if base.eq_ignore_ascii_case("VARCHAR") || base.eq_ignore_ascii_case("CHARACTER VARYING") {
+                Some(1043)
+            } else if base.eq_ignore_ascii_case("BPCHAR") || base.eq_ignore_ascii_case("CHAR") {
+                Some(1042)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
 /// The parse locations of the casts to an integer type (int2, int4, int8 and their names) whose
 /// operand is a column the statement's relations declare text, varchar, char or name: a bare name
 /// that every relation of the statement holding it declares so, or `alias.column` of one. Read from
@@ -2478,7 +2569,14 @@ fn text_integer_casts(
                     Some(Node::String(s)) => Some(s.sval.to_ascii_lowercase()),
                     _ => None,
                 })?;
-                let Some(Node::ColumnRef(r)) = c.arg.as_deref().and_then(|a| a.node.as_ref()) else { return None };
+                let arg = c.arg.as_deref()?;
+                // An operand PostgreSQL types as a string by its shape (a string cast, a text
+                // function's result, a || of strings): read alike (numfuzz seed 2952 at d5600475b:
+                // ('Infinity'::numeric)::text::bigint answered 9223372036854775807).
+                if integer(&to) && !matches!(arg.node.as_ref(), Some(Node::ColumnRef(_))) && string_type(arg, &None).is_some() {
+                    return Some((c.location, Vec::new()));
+                }
+                let Some(Node::ColumnRef(r)) = arg.node.as_ref() else { return None };
                 let fields: Vec<String> = r
                     .fields
                     .iter()
@@ -2510,6 +2608,10 @@ fn text_integer_casts(
         .collect();
     let text = |ty: &str| matches!(crate::catalog::sqlite_type_to_pg_oid(ty), 25 | 1043 | 1042 | 19);
     for (location, fields) in casts {
+        if fields.is_empty() {
+            out.insert(location);
+            continue;
+        }
         let declared: Vec<bool> = match fields.as_slice() {
             [column] => relations
                 .iter()
@@ -2891,7 +2993,7 @@ fn literal_assignments(
     let mut setop_rewrites: Vec<(i32, i64)> = Vec::new();
     // The relation a value's column reference reads, with the names it is known by: an UPDATE's
     // target (with no FROM), an INSERT ... SELECT's one FROM table; none for VALUES.
-    let source: Option<(std::sync::Arc<turso_core::schema::BTreeTable>, String, String)> = match stmt {
+    let source: StringSource = match stmt {
         Node::UpdateStmt(u) if u.from_clause.is_empty() => {
             let alias = u.relation.as_ref().and_then(|r| r.alias.as_ref()).map(|a| a.aliasname.clone()).unwrap_or_else(|| relation.relname.clone());
             Some((table.clone(), relation.relname.clone(), alias))
@@ -2911,71 +3013,6 @@ fn literal_assignments(
         },
         _ => None,
     };
-    // The string type a value has when it is one PostgreSQL types as a string whatever its
-    // arguments (rec44): a text function's result, a || with a string side, a string cast, or a
-    // column of the source relation declared text, varchar or char. None for anything else,
-    // which the engine judges (an untyped literal is read as the column's input).
-    fn string_type(node: &PgNode, source: &Option<(std::sync::Arc<turso_core::schema::BTreeTable>, String, String)>) -> Option<u32> {
-        use turso_pg_parser::pg_query::protobuf::node::Node;
-        const TEXT_FUNCTIONS: &[&str] = &[
-            "upper", "lower", "concat", "concat_ws", "substr", "substring", "trim", "btrim", "ltrim", "rtrim", "replace",
-            "repeat", "lpad", "rpad", "left", "right", "md5", "to_char", "format", "initcap", "reverse", "chr", "quote_ident",
-            "quote_literal", "quote_nullable", "translate", "split_part", "regexp_replace", "to_hex",
-        ];
-        match node.node.as_ref()? {
-            Node::FuncCall(f) => {
-                let name = f.funcname.last().and_then(|n| match &n.node {
-                    Some(Node::String(s)) => Some(s.sval.as_str()),
-                    _ => None,
-                })?;
-                TEXT_FUNCTIONS.contains(&name).then_some(25)
-            }
-            Node::AExpr(e) if matches!(e.name.as_slice(), [n] if matches!(&n.node, Some(Node::String(s)) if s.sval == "||")) => {
-                let side = |x: Option<&PgNode>| {
-                    x.is_some_and(|x| matches!(x.node.as_ref(), Some(Node::AConst(c)) if matches!(c.val, Some(turso_pg_parser::pg_query::protobuf::a_const::Val::Sval(_)))) || string_type(x, source).is_some())
-                };
-                (side(e.lexpr.as_deref()) || side(e.rexpr.as_deref())).then_some(25)
-            }
-            Node::TypeCast(c) => match c.type_name.as_ref()?.names.last()?.node.as_ref()? {
-                Node::String(s) if c.type_name.as_ref()?.array_bounds.is_empty() => match s.sval.as_str() {
-                    "text" => Some(25),
-                    "varchar" => Some(1043),
-                    "bpchar" => Some(1042),
-                    "name" => Some(19),
-                    _ => None,
-                },
-                _ => None,
-            },
-            Node::ColumnRef(r) => {
-                let (table, name, alias) = source.as_ref()?;
-                let fields: Vec<&str> = r
-                    .fields
-                    .iter()
-                    .map(|f| match &f.node {
-                        Some(Node::String(s)) => Some(s.sval.as_str()),
-                        _ => None,
-                    })
-                    .collect::<Option<Vec<_>>>()?;
-                let column = match fields.as_slice() {
-                    [c] => *c,
-                    [q, c] if q.eq_ignore_ascii_case(alias) || q.eq_ignore_ascii_case(name) => *c,
-                    _ => return None,
-                };
-                let (_, col) = table.get_column(column).filter(|(_, c)| c.array_dimensions() == 0)?;
-                let base = col.ty_str.split('(').next().unwrap_or("").trim();
-                if base.eq_ignore_ascii_case("TEXT") {
-                    Some(25)
-                } else if base.eq_ignore_ascii_case("VARCHAR") || base.eq_ignore_ascii_case("CHARACTER VARYING") {
-                    Some(1043)
-                } else if base.eq_ignore_ascii_case("BPCHAR") || base.eq_ignore_ascii_case("CHAR") {
-                    Some(1042)
-                } else {
-                    None
-                }
-            }
-            _ => None,
-        }
-    }
     let mut coerce = |column: &str, value: &PgNode| -> Result<(), SqlErrorMessage> {
         // A value of a string type to a numeric or boolean column: 42804 (rec44). A bare string
         // cast is judged below, with the domain's name.
@@ -3082,6 +3119,18 @@ fn literal_assignments(
                         },
                         _ => None,
                     }
+                }
+                // numeric Infinity is past every numeric(p, s) ('Infinity'::numeric; numfuzz
+                // seeds 4029, 4207; recorded, rec49-numeric-infinity-wide). constant_cast leaves NaN
+                // and Infinity to the integer columns' 0A000; NaN fits a numeric(p, s).
+                Some(Node::TypeCast(c))
+                    if c.type_name.as_ref().and_then(|t| t.names.last()).is_some_and(|n| matches!(&n.node, Some(Node::String(s)) if s.sval == "numeric"))
+                        && matches!(c.arg.as_deref().and_then(|a| a.node.as_ref()), Some(Node::AConst(k)) if matches!(k.val.as_ref(), Some(Val::Sval(t)) if {
+                            let word = t.sval.trim().trim_start_matches(['-', '+']);
+                            word.eq_ignore_ascii_case("infinity") || word.eq_ignore_ascii_case("inf")
+                        })) =>
+                {
+                    return Err(SqlErrorMessage::classified(SqlErrorKind::NumericValueOutOfRange, "numeric field overflow"));
                 }
                 Some(Node::TypeCast(c)) => match constant_cast(c) {
                     Some(("numeric", typmods, text)) => {

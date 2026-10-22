@@ -335,7 +335,16 @@ pub fn long_decimal_literal(sql: &str, exempt: &[usize]) -> Option<String> {
                     && kinds.get(i + 1) == Some(&Token::As) && numeric_type(i + 2));
             let quoted = text(i).strip_prefix('\'').and_then(|t| t.strip_suffix('\''));
             if let Some(inner) = quoted.filter(|_| numeric) {
-                if !inner.contains('\'') && translator::decimal_past_float8(inner) {
+                // An integer text too: the engine computes a numeric cast as its REAL, so one of
+                // more than 15 digits is rounded or written with an exponent even when it fits int8
+                // ('-60204742850066943'::numeric answered -6.0204742850066944e+16; numfuzz seeds
+                // 4074, 4252 at 783dee075), where a bare integer literal is held as an INTEGER.
+                let integer_digits = {
+                    let t = inner.trim();
+                    let body: String = t.strip_prefix(['-', '+']).unwrap_or(t).chars().filter(|c| *c != '_').collect();
+                    (!body.is_empty() && body.bytes().all(|b| b.is_ascii_digit())).then(|| body.trim_start_matches('0').len())
+                };
+                if !inner.contains('\'') && (translator::decimal_past_float8(inner) || integer_digits.is_some_and(|n| n > 15)) {
                     return Some(text(i).to_string());
                 }
             }
