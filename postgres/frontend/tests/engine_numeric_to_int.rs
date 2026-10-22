@@ -124,3 +124,29 @@ fn a_float8_cast_to_an_integer_rounds_half_to_even_under_the_postgresql_dialect(
     let got = rows(&c, "SELECT 2.5::float8::int, 3.5::float8::int, (-2.5)::float8::int");
     assert_eq!(got, Ok(vec![row(&["2", "4", "-2"])]), "CLAIM: float8 to integer rounds half to even (PostgreSQL's rint)");
 }
+
+/// The typed half of item 13, green at 61d293f8b's successor: a numeric(p,s) value reaches the
+/// cast as its decimal text, which rounds half away from zero exactly (Dialect::integer_cast_rounds).
+/// A bare `numeric` or a numeric constant is still an f64 REAL in this engine (the numeric DESIGN,
+/// item 8), so it rounds as a float8 does, half to even: those cases stay in the test above.
+/// PostgreSQL 18.6 recorded (same file). Kills `integer_cast_truncates`.
+#[test]
+fn a_numeric_column_cast_to_an_integer_rounds_half_away_from_zero_under_the_postgresql_dialect() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let c = conn(dir.path());
+    let mut wrong = Vec::new();
+    for sql in [
+        "CREATE TABLE n (id int PRIMARY KEY, v numeric(10,2))",
+        "INSERT INTO n VALUES (1, 2.50), (2, -2.50), (3, 7.49), (4, 7.50)",
+    ] {
+        if let Err(e) = c.execute(sql) {
+            wrong.push(format!("setup {sql}: {e}"));
+        }
+    }
+    let want = vec![row(&["1", "3", "3", "3"]), row(&["2", "-3", "-3", "-3"]), row(&["3", "7", "7", "7"]), row(&["4", "8", "8", "8"])];
+    match rows(&c, "SELECT id, v::int, v::int2, v::int8 FROM n ORDER BY id") {
+        Ok(got) if got == want => {}
+        other => wrong.push(format!("v::int, v::int2, v::int8: {other:?}, PostgreSQL {want:?}")),
+    }
+    assert!(wrong.is_empty(), "CLAIM: a numeric(p,s) column casts to an integer half away from zero: {wrong:#?}");
+}
