@@ -17736,6 +17736,47 @@ fn a_constant_cast_past_numeric_p_s_is_22003_with_no_row() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// The lead's ruling (LEAD-RULINGS 3abd61b6d3 (b)), literal_assignments' table: an assignment is judged against the
+/// table the name resolves to, the search path's: with search_path s, public, 'x' into t.b is s.t's text column and is
+/// stored, where literal_assignments judged public.t's int column and refused it 22P02. Expected answers: PG 18.6,
+/// recorded (artie 8d9065d8e9, rec38-search-path-assign/pg18-wirefuzz-an_assignment_is_judged_against_the_table_the_name_resolves_to.out).
+#[test]
+fn an_assignment_is_judged_against_the_table_the_name_resolves_to() {
+    let dir = Scratch::new("search-path-assign");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in [
+        "CREATE SCHEMA s",
+        "CREATE TABLE t (id int PRIMARY KEY, b int)",
+        "CREATE TABLE s.t (id int PRIMARY KEY, b text)",
+        "SET search_path = s, public",
+    ] {
+        a.q(sql).ok(sql);
+    }
+    let mut wrong = Vec::new();
+    for sql in ["INSERT INTO t (id, b) VALUES (1, 'x')", "INSERT INTO t (id, b) VALUES (2, 'x'::text)", "UPDATE t SET b = 'y' WHERE id = 1"] {
+        let r = a.q(sql);
+        if r.error.is_some() {
+            wrong.push(format!("{sql}: PG answers it; got {:?}", r.error));
+        }
+    }
+    let r = a.q("SELECT id, b FROM s.t ORDER BY id");
+    let want = vec![vec![Some("1".to_string()), Some("y".to_string())], vec![Some("2".to_string()), Some("x".to_string())]];
+    if r.error.is_some() || r.rows != want {
+        wrong.push(format!("s.t: PG {want:?}; got {:?} {:?}", r.rows, r.error));
+    }
+    a.q("SET search_path = public").ok("set");
+    let r = a.q("INSERT INTO t (id, b) VALUES (1, 'x')");
+    if !r.error.as_ref().is_some_and(|e| e.code == "22P02" && e.message == r#"invalid input syntax for type integer: "x""#) {
+        wrong.push(format!("public.t: PG 22P02; got {:?} {:?}", r.tags, r.error));
+    }
+    let r = a.q("SELECT count(*) FROM public.t");
+    if r.rows != vec![vec![Some("0".to_string())]] {
+        wrong.push(format!("public.t holds {:?}, PG 0", r.rows));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// The lead's ruling (LEAD-RULINGS 3abd61b6d3 (a); 5d2f9d25f's stated blind spot; numfuzz seeds 53 at e4882aaed and 603
 /// at 5d2f9d25f): a CREATE VIEW whose query has a function or operator with no candidate is 42883 as the query alone is,
 /// and the view is not created; each was created. Expected answers: PG 18.6, recorded (artie 73c95898ea,
