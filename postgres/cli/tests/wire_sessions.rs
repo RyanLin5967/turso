@@ -18207,6 +18207,41 @@ fn a_cast_of_a_cast_rounds_and_a_constant_expression_assigned_is_folded() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// The constant-fold blind spot (the lead's order, LEAD-RULINGS f1dc48429 queue item 3): a division or a modulo of
+/// integer constants assigned to an integer column is folded as PostgreSQL's planner folds it, so a value past the
+/// column is 22003 and a zero divisor 22012 even when no row matches (the Execute check sees no row). int4div and
+/// int4mod truncate toward zero: -65537 / 2 is -32768, which fits a smallint, and -65539 / 2 is -32769, which does
+/// not. EXPECTED ANSWERS NOT YET RECORDED: they follow PG 18.6's int4div, int4mod and int4-to-int2 assignment, and
+/// the scenario is banked for recording (artie rec62-fold-division-PENDING).
+#[test]
+fn a_constant_division_assigned_is_folded() {
+    let dir = Scratch::new("fold-division");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE fd (id int PRIMARY KEY, s smallint, i int)").ok("create");
+    let mut wrong = Vec::new();
+    for (sql, code, message) in [
+        ("UPDATE fd SET s = 100000 / 2 WHERE id = 1", "22003", "smallint out of range"),
+        ("UPDATE fd SET s = 1 / 0 WHERE id = 1", "22012", "division by zero"),
+        ("UPDATE fd SET s = 200000 % 100001 WHERE id = 1", "22003", "smallint out of range"),
+        ("UPDATE fd SET s = 5 % 0 WHERE id = 1", "22012", "division by zero"),
+        ("INSERT INTO fd (id, s) SELECT 2, 100000 / 2 WHERE false", "22003", "smallint out of range"),
+        ("UPDATE fd SET s = -65539 / 2 WHERE id = 1", "22003", "smallint out of range"),
+    ] {
+        let r = a.q(sql);
+        if !r.error.as_ref().is_some_and(|e| e.code == code && e.message == message) {
+            wrong.push(format!("{sql}: PG {code} {message:?}; got {:?} {:?}", r.tags, r.error));
+        }
+    }
+    for sql in ["UPDATE fd SET s = 7 / 2 WHERE id = 1", "UPDATE fd SET s = -65537 / 2 WHERE id = 1"] {
+        let r = a.q(sql);
+        if r.error.is_some() || r.tags != vec!["UPDATE 0".to_string()] {
+            wrong.push(format!("{sql}: PG UPDATE 0; got {:?} {:?}", r.tags, r.error));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// numfuzz seed 4871 at 783dee075 (artie 4f001ce3aa): a value bound to an integer column is cast as PostgreSQL's
 /// custom plan casts it at Bind, even when no row matches: a declared numeric, float8 or wider integer past the column is
 /// 22003 '<type> out of range', a numeric NaN 0A000, a float infinity 22003, and an undeclared one past the column is
