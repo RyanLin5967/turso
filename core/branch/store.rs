@@ -239,6 +239,12 @@ pub(crate) struct BranchStore {
     /// Threads of fuzzy checkpoints started (F-FZ): joined by `compact_now`, by `Drop`, and once
     /// more than `FLIGHTS_KEPT` accumulate (the oldest is long past its install).
     flights: Mutex<Vec<crate::thread::JoinHandle<()>>>,
+    /// Links adversary L4: the upgrade's fill thread (`run_links_fill`), joined with the flights.
+    links_fill: Mutex<Option<crate::thread::JoinHandle<()>>>,
+
+    /// h1-rev-72bfb0127 LOW-3: fill threads a later spawn superseded (each ends before its next batch),
+    /// joined with the flights too, so none outlives the store.
+    links_fill_old: Mutex<Vec<crate::thread::JoinHandle<()>>>,
     /// The confirmation writer (`run_confirm_writer`; review 6 #1) and the process that started it
     /// (a fork(2) child has no such thread to join): `None` for a volatile or trunk-only store, and
     /// if it could not be started (the close then writes the last word).
@@ -314,8 +320,11 @@ pub(crate) struct BranchStore {
     drain_parent: crate::sync::OnceLock<crate::sync::Weak<Group>>,
     /// The store's class, fixed at open (`Off` when volatile), readable without the mutex.
     class: SyncClass,
-    /// Test hook: while it holds `HOLD_TRUNK_DECIDED`, a trunk commit waits inside its commit gate
-    /// (see `pause_at`), so a test can act on the store with the gate open.
+    /// Test hook (see `pause_at`): the stage it holds pauses the operation that reaches it, so a test
+    /// can act on the store meanwhile. `HOLD_TRUNK_DECIDED` (a trunk commit inside its commit gate),
+    /// `HOLD_TRUNK_BARRIER_DONE`, `HOLD_FORK_REGISTERING`, `HOLD_LOCKED_FLUSH`,
+    /// `HOLD_RELEASE_BUFFERED`, `HOLD_SCHEMA_PUBLISH`, `HOLD_DROP_LOOKED_UP` and
+    /// `HOLD_CONNECT_LOOKED_UP` (engine review 20 LOW 30: the doc named only the first).
     #[cfg(test)]
     pub(crate) trunk_commit_hold: Arc<AtomicU8>,
     /// Test hook: the publication wait in milliseconds, in place of `PUBLISH_WAIT` (0: unset).
@@ -379,6 +388,8 @@ pub(crate) struct BranchStore {
 ///   (nothing more is written, the next open recovers from disk), and the slots such operations
 ///   freed are never returned, because no flight will ever cover them.
 pub(crate) struct Group {
+    /// Catalog WAL truncations that returned busy (links adversary 3 L3; observing only).
+    wal_truncate_busy: AtomicU64,
     state: std::sync::Mutex<GroupState>,
     cv: std::sync::Condvar,
     /// Wakes the background writer (`run_confirm_writer`): a landing that left a confirmation to
@@ -391,6 +402,12 @@ pub(crate) struct Group {
     durable_now: [AtomicU64; 3],
     /// The store's fail-stop flag, shared with its journal (`StoreInner::fail_stop`).
     failed: Arc<AtomicBool>,
+    /// The confirmation last WRITTEN (`Confirm::key`, 0 for none; raised by `fetch_max`, as keys
+    /// order as `supersedes` does), only once its write returned (lead ruling f329b0d2a8: it was
+    /// raised as the word was taken, so a failed write counted as done). An offer that supersedes
+    /// neither it nor `GroupState::confirm_taken` is refused (`offer_confirm`; DECISIONS
+    /// ba515419c3). Atomic, so the write path takes no lock for it.
+    confirm_done: AtomicU64,
     /// Observation only (review 6 #1): confirmation words written into the log's header, and those
     /// whose write failed; counted without the group's lock (engine review 8 #11).
     confirms_written: AtomicU64,
@@ -438,6 +455,12 @@ pub(crate) struct Group {
     confirm_last_landed: std::sync::atomic::AtomicU32,
     #[cfg(test)]
     confirm_last_landed_writes: AtomicU64,
+    /// Test builds (fastest-budgets, DECISIONS 994f7d41e0's instrument): every word the background
+    /// writer wrote, as (when it took the word, how long since the flight it confirms landed with
+    /// it), pushed after the write, off the group's lock, so a cell can tell a word written in a
+    /// quiet gap of the flights from one written while they overlapped.
+    #[cfg(test)]
+    confirm_word_log: std::sync::Mutex<Vec<(Instant, Duration)>>,
 }
 
 /// `Group::upgrade_due` while the upgrade it named is being led.
@@ -472,10 +495,25 @@ const COMPACT_RUNNING: u8 = 2;
 #[cfg(test)]
 pub(crate) const HOLD_COMPACT_DUE: u8 = 16;
 
-/// Test hook stage (`Group::confirm_hold`): the background compaction holds the store mutex and
-/// has not yet compacted (DECISIONS c9c821dd8d).
+/// Test hook stage (`Group::confirm_hold`): the background compaction has taken what it syncs
+/// and written its marker, and syncs nothing yet; it holds no lock (DECISIONS bd0d845f97).
 #[cfg(test)]
-pub(crate) const HOLD_COMPACT_LOCKED: u8 = 17;
+pub(crate) const HOLD_COMPACT_TAKEN: u8 = 17;
+
+/// `HOLD_COMPACT_TAKEN`'s name at c9c821dd8d, when the stage was inside the store mutex (the
+/// bd0d845f97 red names it).
+#[cfg(test)]
+pub(crate) const HOLD_COMPACT_LOCKED: u8 = HOLD_COMPACT_TAKEN;
+
+/// Test hook stage (`Group::confirm_hold`): the background compaction's cut copies what is left of
+/// the log under the store mutex, counted (`compaction_waits`; DECISIONS bd0d845f97).
+#[cfg(test)]
+pub(crate) const HOLD_COMPACT_TAIL: u8 = 18;
+
+/// Test hook stage (`Group::confirm_hold`): the background compaction's cut is prepared off the
+/// mutex and has not been caught up or installed (DECISIONS bd0d845f97).
+#[cfg(test)]
+pub(crate) const HOLD_COMPACT_PREPARED: u8 = 19;
 
 #[derive(Default)]
 struct GroupState {
@@ -540,6 +578,10 @@ struct GroupState {
     confirm: Option<(Instant, Confirm)>,
     /// The store is closing: the confirmation writer stops (the close writes what is left).
     confirm_stop: bool,
+    /// The confirmation the writer or the close last took to write (`Confirm::key`, 0 for none):
+    /// an offer of it while its write runs is refused too, or it would be written twice
+    /// (DECISIONS ba515419c3). A taken word is written, or its failure fail-stops the store.
+    confirm_taken: u64,
     /// Test builds (engine review 9 #8): syncs of any file a fuzzy checkpoint's thread issued
     /// settling its capture, from the start of its wait for what the capture covers to the end of
     /// that step (`run_flight`).
@@ -590,6 +632,7 @@ fn class_index(class: SyncClass) -> usize {
 impl Group {
     fn new(durable: u64, failed: Arc<AtomicBool>) -> Self {
         Self {
+            wal_truncate_busy: AtomicU64::new(0),
             state: std::sync::Mutex::new(GroupState {
                 durable: [durable; 3],
                 ..GroupState::default()
@@ -598,6 +641,7 @@ impl Group {
             confirm_cv: std::sync::Condvar::new(),
             durable_now: [AtomicU64::new(durable), AtomicU64::new(durable), AtomicU64::new(durable)],
             failed,
+            confirm_done: AtomicU64::new(0),
             confirms_written: AtomicU64::new(0),
             confirm_failures: AtomicU64::new(0),
             upgrade_due: AtomicU64::new(0),
@@ -613,6 +657,8 @@ impl Group {
             confirm_last_landed: std::sync::atomic::AtomicU32::new(0),
             #[cfg(test)]
             confirm_last_landed_writes: AtomicU64::new(0),
+            #[cfg(test)]
+            confirm_word_log: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -783,6 +829,14 @@ impl Group {
         if g.confirm.as_ref().is_some_and(|(_, held)| !confirm.supersedes(held)) {
             return Some(confirm);
         }
+        // Nor one the writer already took to write, held or not (DECISIONS ba515419c3): a re-offer
+        // of the same flight's word, as proved as it was (a held-free upgrade's landing with no
+        // flight since; a proved ordered flight upgraded), was queued again once the slot was empty
+        // and written a second time. Mutant `reoffer_written_word` (test builds only): queued.
+        let floor = self.confirm_done.load(Ordering::Acquire).max(g.confirm_taken);
+        if !confirm.supersedes_key(floor) && !fe_mutant("reoffer_written_word") {
+            return Some(confirm);
+        }
         // The writer sleeps without a deadline while it holds nothing it may write: woken when that
         // changes.
         let wake = confirm.proved() && g.confirm.as_ref().is_none_or(|(_, c)| !c.proved());
@@ -948,12 +1002,23 @@ impl Group {
         self.confirm_cv.notify_all();
         // The writer may be waiting for a flight on the group's condition variable.
         self.cv.notify_all();
-        g.confirm.take().map(|(_, c)| c)
+        let left = g.confirm.take().map(|(_, c)| c);
+        if let Some(c) = left.as_ref() {
+            g.confirm_taken = g.confirm_taken.max(c.key());
+        }
+        left
     }
 
-    /// Write `confirm`'s word, counted, holding no lock; a failure changes no flight's outcome
-    /// (review 6 #1). Mutant `confirm_error_fails_flight` (test builds only): it fail-stops the store.
+    /// Write `confirm`'s word, counted, holding no lock. Written, it is recorded done
+    /// (`confirm_done`). A failure FAIL-STOPS the store (lead ruling f329b0d2a8, reversing review
+    /// 6 #1's "a failure changes no flight's outcome"), the rule of a failed WAL sync: the word is
+    /// what lets recovery tell damage from a lost write, and nothing names the one that failed.
+    /// Mutants (test builds only): `confirm_done_at_take`, recorded done before the write, as
+    /// before; `confirm_error_goes_on`, a failure only counted, as review 6 #1 had it.
     fn write_confirm(&self, confirm: &Confirm, at_close: bool) {
+        if fe_mutant("confirm_done_at_take") {
+            self.confirm_done.fetch_max(confirm.key(), Ordering::AcqRel);
+        }
         let written = if at_close { confirm.write_at_close() } else { confirm.write() };
         // Counted without the group's lock (engine review 8 #11).
         match written {
@@ -962,12 +1027,13 @@ impl Group {
                 if confirm.word_for_test() == self.confirm_last_landed.load(Ordering::Relaxed) {
                     self.confirm_last_landed_writes.fetch_add(1, Ordering::Relaxed);
                 }
+                self.confirm_done.fetch_max(confirm.key(), Ordering::AcqRel);
                 self.confirms_written.fetch_add(1, Ordering::Relaxed);
             }
             Err(e) => {
                 self.confirm_failures.fetch_add(1, Ordering::Relaxed);
-                tracing::warn!("branch log: a flight's confirmation word was not written: {e}");
-                if fe_mutant("confirm_error_fails_flight") {
+                tracing::error!("branch log: a flight's confirmation word was not written; the store fail-stops: {e}");
+                if !fe_mutant("confirm_error_goes_on") {
                     let mut g = self.lock();
                     self.fail(&mut g);
                 }
@@ -1118,6 +1184,9 @@ fn run_confirm_writer(group: Arc<Group>, store: Arc<StoreMutex>) {
             continue;
         }
         let (_, confirm) = g.confirm.take().expect("checked above");
+        g.confirm_taken = g.confirm_taken.max(confirm.key());
+        #[cfg(test)]
+        let took = (Instant::now(), idle);
         // The word names a flight whose sync has returned, and on unix every replacement of the
         // log is a rename, so a word written while a flight or a rewrite runs reaches the old file
         // at most: the writer takes no flight slot, so no create waits on it, and it wakes no one
@@ -1135,8 +1204,72 @@ fn run_confirm_writer(group: Arc<Group>, store: Arc<StoreMutex>) {
             pause_at(Some(&group.confirm_hold), HOLD_CONFIRM_WRITE);
             group.write_confirm(&confirm, false);
         }
+        // Mutant `confirm_word_log_off` (test builds only): the word goes unlogged (the instrument's
+        // fire-check: confirm_load must refuse the cell).
+        #[cfg(test)]
+        if !fe_mutant("confirm_word_log_off") {
+            group.confirm_word_log.lock().unwrap_or_else(|e| e.into_inner()).push(took);
+        }
         drop(confirm);
         g = group.lock();
+    }
+}
+
+/// Catch-up passes of a background compaction's cut before it copies what is left under the store
+/// mutex (`BranchStore::cut_in_background`; DECISIONS bd0d845f97).
+const COMPACT_CATCH_UPS: usize = 3;
+
+/// Test builds: no catch-up pass, so the cut always takes the counted tail path (the plant of
+/// `compaction_waits`).
+#[cfg(test)]
+pub(crate) static COMPACT_CATCH_UPS_OFF: AtomicBool = AtomicBool::new(false);
+
+/// Test builds: a background compaction stops once its snapshot is installed and synced, before
+/// it cuts the log, as a crash there would leave it (DECISIONS bd0d845f97's recovery rule).
+#[cfg(test)]
+pub(crate) static COMPACT_STOP_BEFORE_CUT: AtomicBool = AtomicBool::new(false);
+
+/// Test builds: no catch-up pass, nothing else changed: what flights wrote after the prep reaches
+/// the last pass, under the mutex.
+#[cfg(test)]
+pub(crate) static COMPACT_NO_CATCH_UP: AtomicBool = AtomicBool::new(false);
+
+fn compact_no_catch_up() -> bool {
+    #[cfg(test)]
+    {
+        COMPACT_NO_CATCH_UP.load(Ordering::Acquire) || COMPACT_CATCH_UPS_OFF.load(Ordering::Acquire)
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
+fn compact_catch_ups_off() -> bool {
+    #[cfg(test)]
+    {
+        COMPACT_CATCH_UPS_OFF.load(Ordering::Acquire)
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
+/// A background compaction's mutex hold that may sync, counted (`StoreMutex::compacting` odd)
+/// from before it locks to after it unlocks.
+struct Compacting<'a>(&'a StoreMutex);
+
+impl<'a> Compacting<'a> {
+    fn begin(store: &'a StoreMutex) -> Self {
+        store.compacting.fetch_add(1, Ordering::AcqRel);
+        Self(store)
+    }
+}
+
+impl Drop for Compacting<'_> {
+    fn drop(&mut self) {
+        self.0.compacting.fetch_add(1, Ordering::AcqRel);
     }
 }
 
@@ -1266,14 +1399,16 @@ thread_local! {
 /// instrument — a flush inside the store mutex stalls every operation behind it).
 struct StoreMutex {
     inner: Mutex<StoreInner>,
-    /// Odd while the background writer's compaction holds, or is about to take, this mutex
-    /// (`BranchStore::lead_compaction`; DECISIONS c9c821dd8d): set before it locks and cleared after
-    /// it unlocks, so every operation that waited behind its syncs found it odd as it arrived.
+    /// Odd while the background compaction holds, or is about to take, this mutex for a step that
+    /// may sync under it (DECISIONS c9c821dd8d, bd0d845f97: only its cut's last pass, `Compacting`,
+    /// and the whole compaction under mutant `compaction_syncs_under_mutex`): set before it locks
+    /// and cleared after it unlocks, so every operation that waited behind such a sync found it odd
+    /// as it arrived.
     compacting: AtomicU64,
     /// Lock acquisitions that arrived while `compacting` was odd: operations that waited behind a
-    /// background compaction's syncs (an exception counter, `BranchStore::exception_counters`). One
-    /// that arrived in the margins (before the writer locked, or after it unlocked) and did not wait
-    /// is counted too: an overcount, never a miss.
+    /// background compaction's sync under the mutex (an exception counter,
+    /// `BranchStore::exception_counters`). One that arrived in the margins (before the writer
+    /// locked, or after it unlocked) and did not wait is counted too: an overcount, never a miss.
     compaction_waits: AtomicU64,
 }
 
@@ -1328,6 +1463,63 @@ impl Drop for StoreGuard<'_> {
     }
 }
 
+/// LEAP L4 slice 4's name mirror (`NameIndex::catalog`): every name in the catalog's `branch_name`,
+/// with its branch, interned compactly (`name_mirror`).
+pub(crate) use super::name_mirror::NameMirror;
+use super::name_mirror::Refused;
+
+/// A mirror of a scan's `(name, id)` pairs, hashed with `hasher` (consumed: the scan's `Arc`s are
+/// freed here). `None`: refused (`name_mirror::MAX_PROBE`).
+pub(crate) fn name_mirror_from_pairs(
+    pairs: Vec<(Arc<str>, u64)>,
+    hasher: std::collections::hash_map::RandomState,
+) -> Option<NameMirror> {
+    NameMirror::from_pairs(hasher, pairs.iter().map(|(name, id)| (&**name, *id))).ok()
+}
+
+/// The arena slots a catalog store's log tail touched: each one's state after the tail (`now`: in
+/// use) and at its first touch (`first`: in use), which LEAP L4 2b reads as its state at the
+/// checkpoint the tail follows; and the slots first touched in use AFTER a parked Commit (C-R),
+/// whose state that does not settle (`after_park`): a parked Commit frees its pages' old slots
+/// only when its branch is loaded, so a slot it freed in the live process and a later record
+/// reused reads, at the open, as first touched in use, though it was in use at the checkpoint
+/// (the oracle's seed 1 at step 61, slot 13). Those are asked.
+#[derive(Default)]
+struct Touched {
+    now: HashMap<Slot, bool>,
+    first: HashMap<Slot, bool>,
+    after_park: HashSet<Slot>,
+    parked: bool,
+}
+
+impl Touched {
+    fn set(&mut self, slot: Slot, used: bool) {
+        self.now.insert(slot, used);
+        if let std::collections::hash_map::Entry::Vacant(e) = self.first.entry(slot) {
+            e.insert(used);
+            if used && self.parked {
+                self.after_park.insert(slot);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Review L4 M1 (test builds): `l4_facts_check_for_test` on this thread also checks the facts a
+    /// checkpoint in flight keeps the store from using (checks (4) and (5)), against the catalog
+    /// connection, which reads the snapshot the capture pinned.
+    pub(crate) static CHECK_FACTS_IN_FLIGHT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// LEAP L4 2b's oracle (test builds): an open on this thread also asks the catalog's free table
+    /// for every touched slot whose checkpoint state it inferred from the log, and records the
+    /// first disagreement (`CatState::free_inference_mismatch`).
+    pub(crate) static CHECK_FREE_INFERENCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 #[cfg(test)]
 thread_local! {
     /// How many store-mutex guards this thread holds (test builds).
@@ -1366,6 +1558,40 @@ thread_local! {
     /// commit's WAL flush, for a checkpoint's install, for a trunk commit's publication (test
     /// builds; review 7 #7 as the flagged-edit judge asked: a wait is counted, not timed).
     static THREAD_WAITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The back-pressure waits this thread made on the install of a fuzzy checkpoint whose write filled
+    /// links (h1gap-rev-c HIGH-2's cause-tagged counter, ruling 4412c8a62b). h1-rev-72bfb0127 MED-1: the
+    /// tag is the work observed, not a predicate: the rows the write's `upgrade_links_batch` calls filled
+    /// (`CatalogCounters::rows_filled`, moved inside the writer's hold), recorded per install
+    /// (`FILLED_INSTALLS`) and read by the waiter once the install it waited for is done.
+    static THREAD_FILL_WAITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Test builds (h1-rev-72bfb0127 MED-1): the fuzzy installs whose checkpoint write filled links, as
+/// `(the store's install counter's address, its count after that install)`.
+#[cfg(test)]
+static FILLED_INSTALLS: std::sync::Mutex<Vec<(usize, u64)>> = std::sync::Mutex::new(Vec::new());
+
+/// See `THREAD_FILL_WAITS`.
+#[cfg(test)]
+pub(crate) fn thread_fill_waits() -> u64 {
+    THREAD_FILL_WAITS.with(std::cell::Cell::get)
+}
+
+/// Test builds (H1 no-cut diagnostic, observing only): per outcome, the fuzzy `maybe_compact` calls that
+/// wanted a compaction: 0 the fill gate held them past the hard limit, 1 held them below it, then 2 + each
+/// `FlightStart` (Started, NotCatalog, InFlight, Parked, Truncating, Poisoned, Refused, Filling, Failed).
+#[cfg(test)]
+pub(crate) static CKPT_OUTCOMES: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
+
+#[cfg(test)]
+fn note_ckpt_outcome(at: usize) {
+    if let Some(c) = CKPT_OUTCOMES.get(at) {
+        c.fetch_add(1, Ordering::AcqRel);
+    }
 }
 
 /// One wait (`THREAD_WAITS`).
@@ -1676,6 +1902,41 @@ struct CatState {
     /// containment: a known version holding the fork epoch asked about is the answer, since one
     /// page's versions are disjoint (C-P).
     trunk_cache: HashMap<u32, BTreeMap<u64, Retained>>,
+    /// LEAP L4 (fastest-budgets, 2026-10-15): trunk pages whose every catalog version is in memory,
+    /// in `trunk_cache`, in the lineage or reaped (`trunk_gone`), so a predecessor the memory does
+    /// not hold is not in the catalog either and `trunk_version_at` asks it nothing. A page joins
+    /// when its probe (`trunk_written_known`) finds no catalog version; it stays exact because every
+    /// version a checkpoint writes moves from the lineage to `trunk_cache` at its install, and it is
+    /// cleared with the cache. Oracle: `l4_facts_check_for_test`.
+    trunk_complete: HashSet<u32>,
+    /// Every trunk page is complete (`trunk_complete`): a catalog this process created, which held
+    /// no trunk version when it was made. Cleared with the cache.
+    trunk_all_complete: bool,
+    /// Trims of `trunk_cache` past the resident cap, which clear the complete marks (instrument).
+    trunk_trims: u64,
+    /// Slice 3's facts used while a checkpoint was in flight (only under mutant
+    /// `l4_child_facts_in_flight`; instrument).
+    facts_used_in_flight: u64,
+    /// Test builds (review L4 M1): see `CatState::assert_facts_in_flight`.
+    #[cfg(test)]
+    in_flight_fact_checks: u64,
+    /// LEAP L4 slice 3, while no checkpoint is in the air (`flight`): the fork epoch of the
+    /// trunk's newest child row in the catalog (`Some(None)`: none), and whether the catalog holds
+    /// any trunk version; `None` unknown (asked once, then kept). Each changes only when a checkpoint
+    /// commits, and its install sets both from what its writer read in that transaction. A delete
+    /// of a trunk child forked after the newest row then asks the catalog nothing for its
+    /// neighbours, and none for the trunk's catalog garbage when there is no trunk version.
+    trunk_child_max: Option<Option<u64>>,
+    trunk_versions: Option<bool>,
+    /// The count of rows released while held open, from a format 19/20 meta row at the open
+    /// (LEAP L4), for that open's `close_held` only (taken there); `None` otherwise.
+    held_released_at_open: Option<u64>,
+    /// LEAP L4 2b's oracle (test builds, `CHECK_FREE_INFERENCE`): the touched slots whose checkpoint
+    /// state the open inferred, and the first that disagreed with the catalog's free table.
+    #[cfg(test)]
+    free_inferred_at_open: u64,
+    #[cfg(test)]
+    free_inference_mismatch: Option<String>,
     /// Catalog trunk versions reaped since the last checkpoint, as (page, born): skipped by every
     /// catalog read and deleted by the next checkpoint (C-P).
     trunk_gone: HashSet<(u32, u64)>,
@@ -1709,6 +1970,35 @@ struct CatState {
     /// A checkpoint has captured and not yet installed: the catalog connection holds a pinned
     /// read snapshot, the catalog free table is not refilled from, and no checkpoint starts.
     flight: bool,
+    /// Links adversary L4 (the upgrade in bounded batches): the fill thread (`run_links_fill`) is
+    /// linking a 17-20 catalog's rows, a batch per transaction on the writer, with this mutex free
+    /// between batches; no checkpoint starts meanwhile, so no row changes under it.
+    filling: bool,
+    /// The last key the fill linked (`None`: none yet). Rows up to it are true as of the last
+    /// batch's commit.
+    links_cursor: Option<(u64, u64)>,
+    /// Every row is linked and no checkpoint has committed since: the next checkpoint flips the meta
+    /// row, relinking only around its own changes. Not kept across opens: the next open's fill reads
+    /// the committed cursor (`link_fill`), resumes it when no checkpoint of any build has committed since
+    /// (its generation), and otherwise fills again from the first row (h1gap-rev-c LOW-1).
+    links_prefilled: bool,
+    /// Link fill threads this store started (observing only; links adversary 3 L2).
+    links_fill_starts: u64,
+    /// A fill batch committed on this catalog, so its link columns and the cursor's table exist. Set
+    /// by the fill thread the moment a batch commits, WITHOUT the store mutex (links H1 reopened: a
+    /// committed batch recorded only under the mutex was starved of it by a foreground that takes it
+    /// on every operation, and past the hard limit the gate went on waiting for columns that existed).
+    links_columns_made: Arc<AtomicBool>,
+    /// The fill's HORIZON (amendments 32/33: under sustained creates the fill never completed, each cycle's
+    /// deferral ending on its log bound with one batch filled, while the catalog grew a cycle's creates): the
+    /// last children-index key when this process's first fill began, after its columns exist. Every row created
+    /// past it is this build's, written by a checkpoint once the link columns exist, so that checkpoint relinks
+    /// it and its neighbours (the non-flip relink); the fill need not visit it. `None` until the first fill reads it.
+    links_horizon: Option<Option<(u64, u64)>>,
+    /// The fill was stopped (`BranchStore::stop_links_fill`, at close), read by the fill thread
+    /// WITHOUT the store mutex before its column-only transaction (lead ruling LOW 4): a stopped fill
+    /// makes no columns. A new token per spawn (l4-rev-h1 LOW-3), so an older fill keeps its own.
+    links_fill_stop: Arc<AtomicBool>,
     /// Checkpoint and settle counters (observing only).
     ckpt: CkptCounters,
     /// The part of `trunk_probes`/`trunk_rows` made by `trunk_written_known`'s once-per-page probe
@@ -1897,6 +2187,15 @@ pub(crate) static NAME_SCAN_FAILS: std::sync::atomic::AtomicBool = std::sync::at
 pub(crate) static NAME_SCAN_HOLD: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 
+#[cfg(test)]
+thread_local! {
+    /// Test builds (review L4 M1): a name filter builder STARTED on this thread waits, after its
+    /// scan and before its install, while this holds 1 (it stores `1 | HOLD_ARRIVED` on arrival;
+    /// the test stores 0 to release it). Per opening thread, so no other test's builder waits.
+    pub(crate) static NAME_INSTALL_HOLD: std::cell::RefCell<Option<Arc<std::sync::atomic::AtomicU8>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// The name filter's builder waits at `NAME_SCAN_HOLD` (test builds only).
 fn pause_name_scan() {
     #[cfg(test)]
@@ -1974,6 +2273,34 @@ fn fuzzy_checkpoints() -> bool {
 }
 
 impl CatState {
+    /// Review L4 M1, the construction argument for slice 3's `!flight` guards, checked where the
+    /// facts are used (test builds, with `CHECK_FACTS_IN_FLIGHT` set on the thread). Inside a flight
+    /// the facts cannot be stale against `catalog`: (1) they change only at an install (which ends
+    /// the flight in the same mutex hold: `checkpoint_install` clears them, then sets them from its
+    /// writer's transaction) or at these use sites when unknown; (2) `catalog` reads the snapshot
+    /// the capture pinned (`begin_read_snapshot`, ended at the install), and writes nothing in a
+    /// flight, so what it answers cannot move until the install either; (3) out of a flight the
+    /// oracle's check (4) holds them equal to their queries, so they are equal at the capture. So
+    /// a fact used in a flight answers what the guarded path's own catalog query answers, and the
+    /// guard changes no decision: mutant `l4_child_facts_in_flight` is equivalent. This asserts
+    /// (1)-(3)'s conclusion at the use site itself.
+    #[cfg(test)]
+    fn assert_facts_in_flight(&mut self) -> Result<()> {
+        if !self.flight || !CHECK_FACTS_IN_FLIGHT.with(std::cell::Cell::get) {
+            return Ok(());
+        }
+        self.in_flight_fact_checks += 1;
+        if let Some(known) = self.trunk_child_max {
+            let asked = self.catalog.children_below(0, u64::MAX, 1)?.first().copied();
+            assert_eq!(known, asked, "in a flight, the trunk's newest catalog child is known stale");
+        }
+        if let Some(known) = self.trunk_versions {
+            let asked = !self.catalog.trunk_born_range(None, u64::MAX, 1)?.is_empty();
+            assert_eq!(known, asked, "in a flight, whether the catalog holds a trunk version is known stale");
+        }
+        Ok(())
+    }
+
     fn new(catalog: Catalog, sync: SyncClass, generation: u64) -> Result<Self> {
         let writer = Arc::new(Mutex::new(catalog.writer(sync)?));
         Ok(Self {
@@ -1981,12 +2308,35 @@ impl CatState {
             generation,
             next_generation: generation + 1,
             flight: false,
+            filling: false,
+            links_cursor: None,
+            links_prefilled: false,
+            links_fill_starts: 0,
+            // l4-rev-h1 MED-3: a catalog reopened with its columns already made starts recorded.
+            links_columns_made: Arc::new(AtomicBool::new(catalog.links())),
+            links_horizon: None,
+            links_fill_stop: Arc::new(AtomicBool::new(false)),
             ckpt: CkptCounters::default(),
             catalog,
             dirty: HashMap::new(),
             removed: HashSet::new(),
             trunk_known: HashSet::new(),
             trunk_cache: HashMap::new(),
+            trunk_complete: HashSet::new(),
+            trunk_trims: 0,
+            facts_used_in_flight: 0,
+            #[cfg(test)]
+            in_flight_fact_checks: 0,
+            // Mutant `l4_all_complete_at_open` (test builds only): every page taken as complete in
+            // a reopened catalog that holds trunk versions (the oracle's plant at a reopen).
+            trunk_all_complete: fe_mutant("l4_all_complete_at_open"),
+            held_released_at_open: None,
+            #[cfg(test)]
+            free_inferred_at_open: 0,
+            #[cfg(test)]
+            free_inference_mismatch: None,
+            trunk_child_max: None,
+            trunk_versions: None,
             trunk_gone: HashSet::new(),
             lease_floor: None,
             lease_cursor: None,
@@ -2256,6 +2606,10 @@ struct BranchState {
     /// write the store holds in memory: nothing reads the branch again in this process (lead
     /// review 1 item 11). Only ever set on a fail-stopped store.
     in_doubt: bool,
+    /// LEAP L4 (the MCTS deletes): this branch's catalog row's links (its nearest catalog
+    /// siblings, its newest catalog child) as of the last installed checkpoint; `None` unknown (a
+    /// branch created since, or read from a catalog not yet upgraded).
+    links: Option<super::catalog::Links>,
 }
 
 /// Named server branches' names (fastest-engine M1 item 4), under the store mutex. An eager store
@@ -2272,11 +2626,30 @@ struct BranchState {
 struct NameIndex {
     map: HashMap<Arc<str>, BranchId>,
     filter: NameFilter,
+    /// LEAP L4 slice 4, a catalog store: an exact mirror of the catalog's `branch_name` table as of
+    /// its last committed checkpoint, built off the mutex after open with the name filter
+    /// (`start_name_filter`) and kept by every install, which applies the names the checkpoint
+    /// wrote and deleted. Under the overlays (`map`, `gone`) it answers a lookup the catalog would,
+    /// asking nothing; `None` until built (the catalog answers). Oracle: `l4_facts_check_for_test`.
+    catalog: Option<Arc<NameMirror>>,
+    /// The name the last lookup found, with its branch, so that branch's load reads no name (names
+    /// and ids are each unique, and an id's name never changes).
+    last_found: Option<(BranchId, Arc<str>)>,
     fresh: HashMap<Arc<str>, BranchId>,
     /// Each released name, with the release count at its release: an install drops it only if no
     /// later release of the same name moved it.
     gone: HashMap<Arc<str>, u64>,
     releases: u64,
+    /// Mirrors built and discarded, a checkpoint having committed while their scan ran (review L4
+    /// L1): the mirror then stays unbuilt and the catalog answers lookups (instrument).
+    mirror_misses: u64,
+    /// Mirrors dropped because a table would have needed a probe past `name_mirror::MAX_PROBE`
+    /// (the mirror adversary's MED-1; instrument).
+    mirror_refusals: u64,
+    /// Test builds: the most bytes the name mirror's part of one install allocated (under the store
+    /// mutex), since the last read (`take_mirror_install_bytes_for_test`).
+    #[cfg(test)]
+    mirror_install_bytes_max: u64,
 }
 
 /// A catalog store's name filter (lead review 1 item 2): a keyed hash of every name the store ever
@@ -2454,6 +2827,14 @@ impl BranchState {
 #[derive(Default)]
 struct ChildIndex {
     map: BTreeMap<(u64, u64), BranchId>,
+    /// Keys a splice re-keyed away (`relink`: the child's catalog row still names the spliced-out
+    /// parent until the next checkpoint rewrites it), relinked around by that checkpoint's writer
+    /// (`Captured::child_moved`).
+    moved: Vec<(u64, u64)>,
+    /// Keys a splice gave a child since the last checkpoint (`relink`): the catalog still holds
+    /// the spliced-out parent's row there, so the child's catalog neighbours are not its parent's
+    /// newest child; its delete asks the catalog.
+    relinked: HashSet<(u64, u64)>,
     /// (parent, fork epoch) -> (nearest live sibling below, above) when it was removed. Ordered, so
     /// that a spliced-out parent's links are one range (`relink`).
     removed: BTreeMap<(u64, u64), (Option<u64>, Option<u64>)>,
@@ -2473,6 +2854,8 @@ impl ChildIndex {
         parent: BranchId,
         f: u64,
         catalog: bool,
+        newest: Option<Option<u64>>,
+        known: Option<(Option<u64>, Option<u64>)>,
     ) -> Result<(bool, Option<u64>, Option<u64>)> {
         let listed = self.map.remove(&(parent.0, f)).is_some();
         if !catalog {
@@ -2484,8 +2867,44 @@ impl ChildIndex {
         }
         // Mark it removed before looking for its neighbours, so neither lookup returns it.
         let fresh = self.removed.insert((parent.0, f), (None, None)).is_none();
-        let lo = self.below(cat.as_deref_mut(), parent, f)?;
-        let hi = self.above(cat, parent, f)?;
+        // A spliced child's key goes with it: no capture can name it again, so no install would
+        // clear it (links adversary L1). Its delete already asked the catalog (the caller's `known`).
+        self.relinked.remove(&(parent.0, f));
+        // LEAP L4 slice 3: when every catalog child of `parent` is older than `f` (`newest`, the
+        // newest one's epoch, exact), the catalog's nearest below is that one and none is above:
+        // both are answered without asking. Else asked, as before.
+        // LEAP L4 (the MCTS deletes): the catalog's nearest rows below and above `f`, known (the
+        // removed child's links, or its parent's newest child), resolved through the removal
+        // links exactly as a row the catalog returned would be.
+        if let Some((row_lo, row_hi)) = known {
+            let p = parent.0;
+            let mem_lo = self.map.range((p, 0)..(p, f)).next_back().map(|(&(_, e), _)| e);
+            let lo = mem_lo.max(self.resolve(p, row_lo, true));
+            let mem_hi = self.map.range((p, f.saturating_add(1))..=(p, u64::MAX)).next().map(|(&(_, e), _)| e);
+            let hi = match (mem_hi, self.resolve(p, row_hi, false)) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
+            // Test builds, with `links_crosscheck::ON` (links adversary M1): the known answer
+            // against the catalog query path it replaces, on the same state.
+            #[cfg(test)]
+            if links_crosscheck::on() {
+                if let Some(c) = cat.as_deref_mut() {
+                    let q_lo = self.below(Some(c), parent, f)?;
+                    let q_hi = self.above(cat.as_deref_mut(), parent, f)?;
+                    links_crosscheck::note(p, f, (lo, hi), (q_lo, q_hi), (row_lo, row_hi));
+                }
+            }
+            self.removed.insert((p, f), (lo, hi));
+            return Ok((listed || fresh, lo, hi));
+        }
+        let (lo, hi) = match newest {
+            Some(n) if n.is_none_or(|n| n < f) => {
+                let mem = self.map.range((parent.0, 0)..(parent.0, f)).next_back().map(|(&(_, e), _)| e);
+                (mem.max(self.resolve(parent.0, n, true)), self.above(None, parent, f)?)
+            }
+            _ => (self.below(cat.as_deref_mut(), parent, f)?, self.above(cat, parent, f)?),
+        };
         self.removed.insert((parent.0, f), (lo, hi));
         Ok((listed || fresh, lo, hi))
     }
@@ -2565,8 +2984,14 @@ impl ChildIndex {
     /// The zombie's key is REPLACED, never removed, so no removal link names a key a live child
     /// holds; the zombie's own links (children of it removed since the last checkpoint) go with it,
     /// since no query names it as a parent again.
-    fn relink(&mut self, zombie: BranchId, f: u64, parent: BranchId, zf: u64, child: BranchId) {
+    /// `catalog`: a catalog store, whose next checkpoint consumes the splice records (`moved`,
+    /// `relinked`); no other store keeps them, since nothing would drain them (links adversary L1).
+    fn relink(&mut self, zombie: BranchId, f: u64, parent: BranchId, zf: u64, child: BranchId, catalog: bool) {
         self.map.remove(&(zombie.0, f));
+        if catalog {
+            self.moved.push((zombie.0, f));
+            self.relinked.insert((parent.0, zf));
+        }
         self.map.insert((parent.0, zf), child);
         let links: Vec<(u64, u64)> = self
             .removed
@@ -2797,6 +3222,7 @@ fn capture_rows(branches: &BranchTable<BranchState>, dirty: &HashMap<BranchId, u
                 .collect(),
             retained: st.lineage.retained_list(),
             name: None,
+            links: None,
         }, what))
         .collect();
     #[cfg(test)]
@@ -2832,6 +3258,8 @@ enum FlightStart {
     Poisoned,
     /// A splice-arm store takes no fuzzy checkpoint (G-b).
     Refused,
+    /// The upgrade's link fill runs (links adversary L4): none starts until it ends.
+    Filling,
     /// The settle, the capture or the thread's spawn failed.
     Failed,
 }
@@ -2850,11 +3278,16 @@ struct Captured {
     trunk_new: Vec<(u32, u64, u64, Slot, u32)>,
     trunk_gone: Vec<(u32, u64)>,
     free_cursor: Option<Slot>,
+    /// The catalog held no free slot above `free_cursor` at the capture (`CatState::free_exhausted`):
+    /// once this commits, its free table is exactly the slots it writes (LEAP L4).
+    free_exhausted: bool,
     taken: Vec<Slot>,
     /// An empty store's page-size restart (`checkpoint_catalog_as`, review 6 #4): the arena is
     /// replaced by an empty one once this commits, so the free table is cleared (every row deleted)
     /// and none is written; `free_cursor`, `taken` and the lists are empty.
     fresh_arena: bool,
+    /// Links adversary L4: the fill linked every row before this capture (`CatState::links_prefilled`).
+    links_prefilled: bool,
     free_list: Vec<Slot>,
     reserved: Vec<Slot>,
     /// Slots freed by early-released operations whose records were not yet durable at the
@@ -2882,6 +3315,8 @@ struct Captured {
     meta: Meta,
     /// `ChildIndex` keys (children forked, and removal links) as of the capture.
     child_keys: Vec<(u64, u64)>,
+    /// The child index's `moved` keys at the capture (see `ChildIndex::moved`).
+    child_moved: Vec<(u64, u64)>,
     child_removed: Vec<(u64, u64)>,
     /// A handle on the arena file: synced, in `arena_sync`, before the catalog names the slots.
     arena: Option<std::fs::File>,
@@ -2890,6 +3325,12 @@ struct Captured {
     /// then names created since (rows written), as swapped out of the index at the capture.
     names_gone: HashMap<Arc<str>, u64>,
     names_fresh: HashMap<Arc<str>, BranchId>,
+    /// The name mirror, when its fresh names would grow it (`NameMirror::needs_room`): the copy the
+    /// checkpoint thread makes room in, off the store mutex.
+    mirror_base: Option<Arc<NameMirror>>,
+    /// That copy with room, and the address of the mirror it was made from (`checkpoint_install`
+    /// swaps it in only over that same mirror).
+    mirror_grown: Option<(usize, std::result::Result<NameMirror, Refused>)>,
     lease_now: u64,
     fail_after_commit: bool,
     /// BranchFailpoint::CheckpointWriteFails, taken at the capture: the write fails before its
@@ -2908,9 +3349,25 @@ struct Captured {
     shape_rows_written: u64,
 }
 
+/// What a checkpoint's writer read of the catalog in its own transaction, after every row it
+/// committed (LEAP L4): its earliest lease deadline, the fork epoch of the trunk's newest child row,
+/// and whether it holds any trunk version. Exact as of that commit, so the install sets the facts
+/// from it and asks the catalog nothing.
+#[derive(Clone, Debug)]
+pub(crate) struct CkptFacts {
+    lease_min: Option<u64>,
+    trunk_child_max: Option<u64>,
+    trunk_versions: bool,
+    /// LEAP L4 (the MCTS deletes): the rows whose links this checkpoint's writer set, as it set
+    /// them, and whether it upgraded a 17-20 catalog (then every row's were set, and none listed).
+    links: Vec<super::catalog::LinkUpdate>,
+    upgraded: bool,
+}
+
 /// F-FZ phase 2: write a capture into the catalog through `catalog` (the writer connection) in ONE
-/// transaction. Holds no store lock: nothing here reads the store.
-fn checkpoint_write(catalog: &mut Catalog, cap: &Captured, hold: Option<&AtomicU8>) -> Result<()> {
+/// transaction, and return what it read there after its rows (`CkptFacts`). Holds no store lock:
+/// nothing here reads the store.
+fn checkpoint_write(catalog: &mut Catalog, cap: &Captured, hold: Option<&AtomicU8>) -> Result<CkptFacts> {
     if cap.fail_write {
         return Err(LimboError::InternalError(
             "failpoint: the catalog checkpoint's write failed before its commit".to_string(),
@@ -2941,7 +3398,7 @@ fn checkpoint_write(catalog: &mut Catalog, cap: &Captured, hold: Option<&AtomicU
     // And the commit as durable as any record it replaces (review B-F3).
     catalog.set_commit_sync(cap.arena_sync)?;
     catalog.begin()?;
-    let written = (|| -> Result<()> {
+    let written = (|| -> Result<CkptFacts> {
         for (b, what) in &cap.rows {
             if what & DIRTY_NEW != 0 {
                 catalog.put_branch(b)?;
@@ -2964,6 +3421,91 @@ fn checkpoint_write(catalog: &mut Catalog, cap: &Captured, hold: Option<&AtomicU
         }
         for &id in &cap.removed {
             catalog.delete_branch(id.0)?;
+        }
+        // LEAP L4 (the MCTS deletes; DECISIONS e977c1d010): the rows' sibling and newest-child links,
+        // in this transaction, from the rows as they now stand. A 17-20 catalog is upgraded here,
+        // once (its columns and every row's links); else only the rows around a removed, moved or
+        // new child, and their parents, are relinked. Kill point `ckpt.unlinked`: the rows of this
+        // capture removed, their siblings not yet relinked (a kill there leaves the catalog as it
+        // was, by the transaction). Mutant `l4_stale_sibling_link` (test builds only): nothing is
+        // relinked (the oracle's plant).
+        // Links adversary L4: the fill thread linked every row in bounded batches before this
+        // capture (`links_prefilled`), so this transaction only flips the meta row and relinks
+        // around its own changes (kill point `ckpt.upgrade.flip`). The capture writes this build's
+        // version only then (or over valid links), so the whole-catalog `upgrade_links` branch below is
+        // reached only under mutants (`l4_upgrade_unbatched`, `l4_flip_without_fill`'s neighbour): kept as
+        // the mutants' path, never a production one (h1-rev-72bfb0127 LOW-2).
+        let mut links = Vec::new();
+        let flip = super::journal::carries_links(cap.meta.format) && !catalog.links_valid();
+        let upgraded = flip;
+        // h1gap-rev-c HIGH-2 (lead ruling 62c11ec63d, the NON-FLIP CUT): a checkpoint whose fill is not
+        // complete keeps the store at its version (the capture chose it), and where the fill has made the
+        // link columns it relinks around its own changes as an upgraded store does, so the rows the fill
+        // already linked stay right and its cursor stays usable (carried to this generation below).
+        // h1-rev-72bfb0127 HIGH-1: only a writer that knows the links does this (this build: its format for
+        // the store's arm carries them). The older build test builds stand in for (`CREATE_LEGACY`) writes
+        // 17-20 and, like the real one, neither relinks nor carries the cursor (its checkpoint moves the
+        // generation; this build then refills from row 0). Always true outside test builds.
+        let nonflip = !super::journal::carries_links(cap.meta.format)
+            && super::journal::carries_links(super::journal::current_format_of(cap.meta.format))
+            && catalog.links();
+        // Mutant `l4_flip_without_fill` (test builds only): the capture flips with its fill incomplete and
+        // nothing links the rest (the crash red's plant).
+        if flip && !(cap.links_prefilled && catalog.links()) && !fe_mutant("l4_flip_without_fill") {
+            catalog.upgrade_links()?;
+        } else if (catalog.links_valid() || flip || nonflip) && !fe_mutant("l4_stale_sibling_link") {
+            if flip {
+                kill_point("ckpt.upgrade.flip");
+            }
+            // Mutant `l4_unlinked_committed_first` (test builds only): the removals committed before
+            // their siblings are relinked (the `ckpt.unlinked` kill test's plant, links adversary).
+            if fe_mutant("l4_unlinked_committed_first") {
+                catalog.commit()?;
+                catalog.begin()?;
+            }
+            kill_point("ckpt.unlinked");
+            let mut rows: BTreeSet<(u64, u64)> = BTreeSet::new();
+            let mut parents: BTreeSet<u64> = BTreeSet::new();
+            for &(p, f) in cap.child_removed.iter().chain(&cap.child_moved).chain(&cap.child_keys) {
+                parents.insert(p);
+                rows.insert((p, f));
+                rows.extend(catalog.children_below(p, f, 1)?.first().map(|&e| (p, e)));
+                rows.extend(catalog.children_above(p, f, 1)?.first().map(|&e| (p, e)));
+            }
+            // Test builds (h1gap-rev-c HIGH-3): rows a checkpoint relinked around its own changes.
+            #[cfg(test)]
+            CKPT_RELINKED.fetch_add((rows.len() + parents.len()) as u64, Ordering::AcqRel);
+            // Mutant `l4_nonflip_no_relink` (test builds only; h1-rev-72bfb0127 HIGH-2, its plant
+            // rev_nonflip_no_relink): a non-flip checkpoint skips its relink and still carries the cursor.
+            if !(nonflip && fe_mutant("l4_nonflip_no_relink")) {
+                for (p, f) in rows {
+                    links.extend(catalog.relink(p, f)?);
+                }
+                for p in parents {
+                    links.extend(catalog.relink_id(p)?);
+                }
+            }
+            // Mutant `l4_nonflip_fill_untagged` (test builds only; h1-rev-72bfb0127 MED-1, its plant
+            // rev_nonflip_fill_untagged): a non-flip checkpoint runs the whole fill in its own transaction
+            // by direct batches, outside `upgrade_links`.
+            if nonflip && fe_mutant("l4_nonflip_fill_untagged") {
+                let mut at = None;
+                while let Some(next) = catalog.upgrade_links_batch(at, super::catalog::UPGRADE_BATCH)? {
+                    at = Some(next);
+                }
+            }
+            if nonflip {
+                // The links are not valid yet: nothing of them is the store's to keep.
+                links.clear();
+                // The fill's cursor, if this catalog's (its generation the one this checkpoint replaces),
+                // carried to this checkpoint's generation: the rows it covers are right as of this commit.
+                let current = catalog.meta()?.map(|m| m.generation);
+                if let Some((g, at, done)) = catalog.fill_cursor()? {
+                    if Some(g) == current {
+                        catalog.put_fill_cursor(cap.meta.generation, at, done)?;
+                    }
+                }
+            }
         }
         for &(page, born) in &cap.trunk_gone {
             catalog.trunk_delete(page, born)?;
@@ -2990,9 +3532,36 @@ fn checkpoint_write(catalog: &mut Catalog, cap: &Captured, hold: Option<&AtomicU
         for &slot in cap.free_list.iter().chain(cap.reserved.iter()).chain(cap.deferred.iter()) {
             catalog.free_put(slot)?;
         }
-        catalog.put_meta(&cap.meta)
+        // LEAP L4: a format 19/20 meta row carries the earliest lease deadline and the count of
+        // rows released while held open, read in this transaction after every row it commits, so
+        // they summarize exactly those rows. Mutant `l4_stale_meta_facts` (test builds only): the
+        // facts read before the rows are written (the oracle's plant).
+        let mut meta = cap.meta;
+        let lease_min = catalog.lease_min()?;
+        // One write path (DECISIONS e977c1d010): the meta row is at this build's format, which
+        // carries the facts. Only a test's legacy store (CREATE_LEGACY, an older build's stand-in)
+        // writes one without them.
+        // h1gap-rev-c HIGH-2: a non-flip cut of a 17 store (an older build's, no facts) writes it at 17, so
+        // the facts follow the format written, in every build (before, only a test's legacy store wrote one).
+        let legacy = !super::journal::meta_carries_facts(meta.format);
+        if !legacy {
+            meta.lease_min = Some(if fe_mutant("l4_stale_meta_facts") { None } else { lease_min });
+            meta.held_released = Some(if fe_mutant("l4_stale_meta_facts") { 0 } else { catalog.released_ids()?.len() as u64 });
+        }
+        // LEAP L4 slice 3: the facts a delete of a trunk child reads instead of the catalog. Mutant
+        // `l4_stale_child_facts` (test builds only): none, whatever the rows say (the oracle's plant).
+        let stale = fe_mutant("l4_stale_child_facts");
+        let facts = CkptFacts {
+            lease_min,
+            trunk_child_max: if stale { None } else { catalog.children_below(0, u64::MAX, 1)?.first().copied() },
+            trunk_versions: !stale && !catalog.trunk_born_range(None, u64::MAX, 1)?.is_empty(),
+            links,
+            upgraded,
+        };
+        catalog.put_meta(&meta)?;
+        Ok(facts)
     })()
-    .and_then(|()| {
+    .and_then(|facts| {
         pause_at(hold, HOLD_BEFORE_COMMIT);
         // A store fail-stopped since the capture commits nothing more (review 4 #1); checked
         // last, so no failure before the commit is missed. Mutant `commit_poisoned` (test builds
@@ -3002,13 +3571,16 @@ fn checkpoint_write(catalog: &mut Catalog, cap: &Captured, hold: Option<&AtomicU
         }
         // A failed commit may or may not have reached the catalog: from here on, only a reopen
         // can tell, so the store fail-stops.
-        catalog.commit().inspect_err(|_| cap.fail_stop.store(true, Ordering::Release))
+        catalog.commit().inspect_err(|_| cap.fail_stop.store(true, Ordering::Release))?;
+        Ok(facts)
     });
     if let Err(e) = written {
         catalog.rollback();
+        // An upgrade rolled back takes its columns with it: this handle reads the table again.
+        let _ = catalog.refresh_links();
         return Err(e);
     }
-    Ok(())
+    written
 }
 
 /// F-FZ phase 4 (and the sharp path's last step): bound the catalog's WAL (fix v2, PREREG A7). A
@@ -3030,6 +3602,12 @@ fn truncate_catalog_wal(catalog: &mut Catalog, group: &Group, hold: Option<&Atom
     pause_at(hold, HOLD_AFTER_WAL_PASSIVE);
     match catalog.truncate_wal() {
         Ok(r) if r.first().copied().unwrap_or(0) != 0 => {
+            // Links adversary 3 L3: a busy truncation leaves the WAL's pages for the next one,
+            // which may backfill them under the store mutex: a counted event. Mutant
+            // `wal_truncate_busy_uncounted` (test builds only).
+            if !fe_mutant("wal_truncate_busy_uncounted") {
+                group.wal_truncate_busy.fetch_add(1, Ordering::Relaxed);
+            }
             tracing::warn!("branch catalog WAL truncation was busy: {r:?}")
         }
         Ok(_) => {}
@@ -3058,6 +3636,9 @@ fn run_flight(
 ) {
     let ns = |t: Instant| u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX);
     let t = Instant::now();
+    // Test builds (h1-rev-72bfb0127 MED-1): the rows this write's fill batches filled.
+    #[cfg(test)]
+    let mut filled = 0u64;
     // A panic in the writer must still reach the install (with an error), or `flight` would stay
     // set: no checkpoint would start again and the read snapshot would stay pinned.
     let written = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -3099,11 +3680,16 @@ fn run_flight(
             }
         }
         let mut w = writer.lock();
-        let r0 = w.counters.rows_written;
+        let (r0, f0) = (w.counters.rows_written, w.counters.rows_filled);
         let written = checkpoint_write(&mut w, &cap, Some(&*hold));
         if written.is_err() {
             w.rollback();
         }
+        #[cfg(test)]
+        {
+            filled = w.counters.rows_filled - f0;
+        }
+        let _ = f0;
         (written, w.counters.rows_written - r0)
     }))
     .unwrap_or_else(|_| {
@@ -3127,7 +3713,7 @@ fn run_flight(
     // Inside a panic guard too (review 4 #16): a panic in the cut must still reach the install, or
     // `flight` would stay set. Safe to catch: the cut leads no flight, and its gate's drop, which
     // unwinding runs, lets group flights start again. Mutant `cut_unguarded` (test builds only).
-    let cut = written.as_ref().ok().and_then(|()| {
+    let cut = written.as_ref().ok().and_then(|_| {
         if fe_mutant("cut_unguarded") {
             return begin_cut(&inner, &group, &cap);
         }
@@ -3137,6 +3723,13 @@ fn run_flight(
                 None
             })
     });
+    // The mirror adversary's class (4): room for the fresh names in the name mirror, made here, off
+    // the store mutex; `base` (the mirror it was made from) is held until after the install, so
+    // the old mirror is freed below, off the mutex too.
+    let base = cap.mirror_base.take();
+    if let Some(m) = base.as_ref() {
+        cap.mirror_grown = Some((Arc::as_ptr(m) as usize, m.with_room(cap.names_fresh.len())));
+    }
     let installed = {
         let mut guard = inner.lock();
         // The install cuts the log: no group flight may be writing it (fastest-engine M1 item 2),
@@ -3184,12 +3777,22 @@ fn run_flight(
         truncating.store(installed.is_ok(), Ordering::Release);
         over_hard.store(false, Ordering::Release);
         let (count, signal) = &*installs;
-        *count.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+        let mut c = count.lock().unwrap_or_else(|e| e.into_inner());
+        *c += 1;
+        // Recorded before the waiters can read the new count (they hold `count` to read it).
+        #[cfg(test)]
+        if filled > 0 {
+            let key = Arc::as_ptr(&installs) as *const () as usize;
+            FILLED_INSTALLS.lock().unwrap_or_else(|e| e.into_inner()).push((key, *c));
+        }
+        drop(c);
         signal.notify_all();
         installed
     };
     // Flights go on, into the new log.
     drop(cut);
+    // The mirror the install replaced, if it grew one, is freed here, off the mutex.
+    drop(base);
     // Phase 4 takes only the writer, never the store mutex again: `start_flight` may join this
     // thread while holding the store mutex. (Its time is not counted in `flight_ns`.)
     match installed {
@@ -3231,6 +3834,353 @@ impl Drop for CutGate<'_> {
     }
 }
 
+/// Links adversary L4 (lead ruling: the upgrade's fill in BOUNDED BATCHES with the store mutex free
+/// between them): link a 17-20 catalog's rows, `UPGRADE_BATCH` per transaction on the checkpoint
+/// writer, committed one by one (kill point `ckpt.upgrade.batch` after each commit), the meta row
+/// untouched: a kill between batches leaves the store at its version, with link columns its meta
+/// row says nothing about (L2: not read), which the next open's fill resumes from the committed cursor
+/// (or starts again, when a checkpoint has committed since: h1gap-rev-c LOW-1). The store mutex is taken
+/// only to read and move the cursor. No checkpoint starts while it runs (`CatState::filling`), so
+/// no row changes under it; the next one flips the meta row (`checkpoint_write`). After the last
+/// batch the catalog's WAL, which holds every batch's pages, is backfilled and truncated here, on
+/// the writer only: left to the flipping checkpoint, that work (O(rows), a pragma the probe's row
+/// count does not see) ran under the store mutex in a sharp store (red a722957c4). Mutant
+/// `l4_fill_wal_left` (test builds only): not truncated here.
+fn run_links_fill(shared: &StoreMutex, writer: &Mutex<Catalog>, group: &Group, made: &AtomicBool, stop: &AtomicBool) {
+    // Test builds (h1gap-rev-c MED-1): the fill thread panics at its start.
+    #[cfg(test)]
+    if LINKS_FILL_PANICS.load(Ordering::Acquire) {
+        panic!("test hook: the link fill thread panics");
+    }
+    // l4-rev-h1 HIGH 2 and MED-3: the link columns and the cursor's table are made FIRST, in a
+    // transaction of their own on the writer, before this thread takes the store mutex at all, and
+    // recorded lock-free: past the hard limit the gate can then let a checkpoint go on, however long
+    // the first row batch takes or however the store mutex starves this thread. A kill after it leaves
+    // the columns under the old meta row, a state the batches already leave between them (`links_valid`
+    // reads it as unfilled, and the next fill or checkpoint fills it). Mutant
+    // `l4_columns_in_first_batch` (test builds only): made inside the first row batch, as before.
+    // Test builds: `LINKS_FILL_COLUMNS_IN_BATCH` turns the column-only transaction off, so a test can
+    // reach the backstop below (the per-batch lock-free record) on its own.
+    #[cfg(test)]
+    let in_batch = LINKS_FILL_COLUMNS_IN_BATCH.load(Ordering::Acquire);
+    #[cfg(not(test))]
+    let in_batch = false;
+    // Test builds (lead ruling LOW 4 on l4-rev-h1's re-review): a fill held before its column-only
+    // transaction; `LINKS_FILL_BEFORE_COLUMNS_HELD` counts the fills that reached the hold, and this
+    // fill's place among them is `nth` (0: the first).
+    #[cfg(test)]
+    let nth = {
+        let nth = LINKS_FILL_BEFORE_COLUMNS_HELD.fetch_add(1, Ordering::AcqRel);
+        while LINKS_FILL_HOLD_BEFORE_COLUMNS.load(Ordering::Acquire) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        nth
+    };
+    // Lead ruling LOW 4: a fill stopped before it got here (a close) makes no columns; the check is
+    // lock-free, as the column-only transaction is. Mutant `l4_columns_after_stop` (test builds only):
+    // not checked, as before. NOT atomic with the commit (l4-rev-h1 LOW-2, documented, not closed): a stop
+    // that lands after this check and before the column-only commit leaves the columns committed under the
+    // old meta row, the state every fill writes anyway (17 with columns: links_valid reads it as unfilled,
+    // the next fill or checkpoint fills it; the kill test admits it with its facts, upgrade and branches
+    // checked). Making it atomic would need the store mutex here, which MED-3 keeps off this path.
+    if stop.load(Ordering::Acquire) && !fe_mutant("l4_columns_after_stop") {
+        return;
+    }
+    if !in_batch && !fe_mutant("l4_columns_in_first_batch") {
+        let mut w = writer.lock();
+        let ready = w.links()
+            || match w.begin().and_then(|()| w.make_link_columns()).and_then(|()| w.commit()) {
+                Ok(()) => {
+                    #[cfg(test)]
+                    if nth == 0 {
+                        LINKS_FILL_FIRST_MADE_COLUMNS.store(true, Ordering::Release);
+                    }
+                    // Lead ruling HIGH 1: the columns committed under the old meta row (17 with link
+                    // columns), the state a_kill_at_every_step_of_the_upgrade_leaves_the_store_17_or_21
+                    // admits only with its facts, upgrade and branches checked.
+                    kill_point("ckpt.upgrade.colonly");
+                    true
+                }
+                Err(e) => {
+                    w.rollback();
+                    let _ = w.refresh_links();
+                    tracing::warn!("branch catalog link columns not made: {e}");
+                    #[cfg(test)]
+                    {
+                        *LINKS_FILL_COLUMN_ERROR.lock().unwrap_or_else(|p| p.into_inner()) = e.to_string();
+                    }
+                    false
+                }
+            };
+        #[cfg(test)]
+        LINKS_FILL_COLUMN_TXNS[usize::from(!ready)].fetch_add(1, Ordering::AcqRel);
+        if ready {
+            made.store(true, Ordering::Release);
+        }
+    }
+    // Test builds (l4-rev-h1 MED-3): a fill held before it first takes the store mutex, as one starved
+    // of it there would be; `LINKS_FILL_ENTRY_HELD` counts the fills that reached the hold.
+    #[cfg(test)]
+    {
+        LINKS_FILL_ENTRY_HELD.fetch_add(1, Ordering::AcqRel);
+        while LINKS_FILL_HOLD_AT_ENTRY.load(Ordering::Acquire) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+    // Links adversary 3 H1: progress is monotone across opens. The cursor committed with the last
+    // batch is resumed while the catalog's generation is still the one it was filled under (no
+    // checkpoint of any build has committed since, so the rows it covers are as they were); else
+    // the fill starts again from the first row. Mutant `l4_fill_cursor_forgotten` (test builds
+    // only): always from the first row, as before.
+    let (generation, known) = match shared.lock().cat.as_ref() {
+        Some(c) if c.filling => (c.generation, c.links_horizon),
+        _ => return,
+    };
+    // The horizon: read once per process, after the columns exist (above), off the store mutex. Mutants (test
+    // builds only): `l4_fill_horizon_ignored`, the fill visits every row, as before; `l4_fill_horizon_low`, it
+    // stops after its first batch (the oracle's plant).
+    let horizon = match known {
+        Some(h) => h,
+        None => {
+            let h = match writer.lock().last_child_key() {
+                Ok(h) => h,
+                Err(e) => {
+                    tracing::warn!("branch catalog link fill horizon not read: {e}");
+                    return;
+                }
+            };
+            if let Some(c) = shared.lock().cat.as_mut() {
+                c.links_horizon.get_or_insert(h);
+            }
+            h
+        }
+    };
+    let horizon = if fe_mutant("l4_fill_horizon_ignored") {
+        None
+    } else if fe_mutant("l4_fill_horizon_low") {
+        Some((0, 0))
+    } else {
+        horizon
+    };
+    let resumed = if fe_mutant("l4_fill_cursor_forgotten") { Ok(None) } else { writer.lock().fill_cursor() };
+    match resumed {
+        // Mutant `l4_fill_generation_ignored` (test builds only; h1gap-rev-c MED-2, its REV_IGNORE_GEN): the
+        // cursor is resumed whatever checkpoint committed since, so rows changed behind it keep stale links.
+        Ok(Some((g, at, done))) if g == generation || fe_mutant("l4_fill_generation_ignored") => {
+            // A cursor exists, so the columns do: recorded before the store mutex is asked for.
+            made.store(true, Ordering::Release);
+            let mut inner = shared.lock();
+            if let Some(cat) = inner.cat.as_mut().filter(|c| c.filling) {
+                cat.links_columns_made.store(true, Ordering::Release);
+                if done {
+                    cat.links_prefilled = true;
+                    cat.filling = false;
+                    return;
+                }
+                cat.links_cursor = at;
+            }
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!("branch catalog link fill cursor not read: {e}"),
+    }
+    // Test builds (the lead's fill-LIVENESS ruling, observing): the batches this spawn committed; a spawn that
+    // ends stopped (or superseded) with none is counted in `LINKS_FILL_EMPTY_SPAWNS`.
+    #[cfg(test)]
+    let mut committed = 0u64;
+    loop {
+        // h1-rev-72bfb0127 LOW-3: whether a later spawn superseded this fill (its token is no longer the
+        // store's): such a fill carries on as the new one, sharing its cursor and writing cursors at its own
+        // stale generation.
+        let (cursor, superseded) = {
+            let inner = shared.lock();
+            match inner.cat.as_ref() {
+                Some(c) if c.filling => (c.links_cursor, !std::ptr::eq(&*c.links_fill_stop, stop)),
+                _ => {
+                    #[cfg(test)]
+                    if committed == 0 {
+                        LINKS_FILL_EMPTY_SPAWNS.fetch_add(1, Ordering::AcqRel);
+                    }
+                    return;
+                }
+            }
+        };
+        // The fix: a superseded fill ends here, before its next batch. Mutant `l4_fill_superseded_runs` (test
+        // builds only): it carries on, as before.
+        if superseded && !fe_mutant("l4_fill_superseded_runs") {
+            #[cfg(test)]
+            if committed == 0 {
+                LINKS_FILL_EMPTY_SPAWNS.fetch_add(1, Ordering::AcqRel);
+            }
+            return;
+        }
+        // Mutant `l4_fill_starved` (test builds only; the liveness ruling's starving mutant): the fill loses
+        // 50 ms before each batch, as a thread the scheduler starves under foreground load.
+        if fe_mutant("l4_fill_starved") {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // Test builds: the batches started by a superseded fill.
+        #[cfg(test)]
+        if superseded {
+            LINKS_FILL_SUPERSEDED_BATCHES.fetch_add(1, Ordering::AcqRel);
+        }
+        let _ = superseded;
+        let batch = {
+            let mut w = writer.lock();
+            #[cfg(test)]
+            let failed = LINKS_FILL_FAILS.load(Ordering::Acquire);
+            #[cfg(not(test))]
+            let failed = false;
+            let done = w
+                .begin()
+                .and_then(|()| {
+                    if failed {
+                        return Err(LimboError::InternalError("test hook: the link fill's batch failed".to_string()));
+                    }
+                    // Past the horizon the fill is done: every row there is relinked by the checkpoint that wrote it.
+                    let next = w.upgrade_links_batch(cursor, super::catalog::UPGRADE_BATCH)?.filter(|k| horizon.map_or(true, |h| *k < h));
+                    w.put_fill_cursor(generation, next.or(cursor), next.is_none())?;
+                    Ok(next)
+                })
+                .and_then(|next| {
+                w.commit()?;
+                Ok(next)
+            });
+            if done.is_err() {
+                w.rollback();
+                let _ = w.refresh_links();
+            }
+            done
+        };
+        if batch.is_ok() {
+            kill_point("ckpt.upgrade.batch");
+            #[cfg(test)]
+            {
+                committed += 1;
+            }
+        }
+        if matches!(batch, Ok(None)) && !fe_mutant("l4_fill_wal_left") {
+            truncate_catalog_wal(&mut writer.lock(), group, None);
+        }
+        // Recorded once the batch has committed (and, after the last, the WAL is truncated: l4-rev-h1
+        // LOW 4), before anything waits for the store mutex: the backstop where the columns were made
+        // in a batch (mutant `l4_columns_in_first_batch`). Mutant `l4_columns_recorded_under_mutex`
+        // (test builds only): recorded only under it, as before.
+        if batch.is_ok() && !fe_mutant("l4_columns_recorded_under_mutex") {
+            made.store(true, Ordering::Release);
+        }
+        // Test builds (links H1 reopened): a committed batch held back from the store mutex before
+        // it is recorded, as the fill was starved of it by a foreground that takes it on every
+        // operation (diagnostic 4, ecetesla1 and iccad6: the batch committed, and the gate never saw
+        // its columns).
+        #[cfg(test)]
+        if batch.is_ok() {
+            LINKS_FILL_HELD_BATCHES.fetch_add(1, Ordering::AcqRel);
+            while LINKS_FILL_HOLD_UNRECORDED.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        let mut inner = shared.lock();
+        let Some(cat) = inner.cat.as_mut() else {
+            return;
+        };
+        // h1-rev-72bfb0127 LOW-3: a fill superseded while its batch was in flight records nothing (the cursor
+        // and the store's fill state are the new fill's). Mutant `l4_fill_superseded_runs`: it records.
+        if !std::ptr::eq(&*cat.links_fill_stop, stop) && !fe_mutant("l4_fill_superseded_runs") {
+            return;
+        }
+        if batch.is_ok() {
+            cat.links_columns_made.store(true, Ordering::Release);
+        }
+        match batch {
+            Ok(Some(next)) if cat.filling => {
+                cat.links_cursor = Some(next);
+                drop(inner);
+                // Test builds: the slow fill's pause, after its batch is recorded (so the store
+                // sees the batch's columns while the fill sleeps).
+                #[cfg(test)]
+                {
+                    let ms = LINKS_FILL_PAUSE_MS.load(Ordering::Acquire);
+                    if ms > 0 {
+                        std::thread::sleep(Duration::from_millis(ms));
+                    }
+                }
+            }
+            Ok(None) if cat.filling => {
+                cat.links_prefilled = true;
+                cat.filling = false;
+                return;
+            }
+            Ok(_) => return,
+            Err(e) => {
+                // L2: a failed fill backs off a threshold's worth of log, as a failed checkpoint
+                // does (`defer_compaction`), not restarted by the next operation.
+                tracing::warn!("branch catalog link fill stopped: {e}");
+                #[cfg(test)]
+                {
+                    *LINKS_FILL_COLUMN_ERROR.lock().unwrap_or_else(|p| p.into_inner()) = format!("batch: {e}");
+                }
+                cat.filling = false;
+                if let Some(journal) = inner.journal.as_mut() {
+                    journal.defer_compaction();
+                }
+                return;
+            }
+        }
+    }
+}
+
+/// Test builds (links adversary 3; knobs, read by the fill thread): a pause after each of its
+/// batches (a slow fill, so a session can close before it ends), and a failure of its batches. Set
+/// only in a test's own child process.
+#[cfg(test)]
+pub(crate) static LINKS_FILL_PAUSE_MS: AtomicU64 = AtomicU64::new(0);
+/// Test builds (H1 no-cut diagnostic, observing only): the fill's column-only transactions that made (or found)
+/// the columns, and that failed; and the last error a fill met (its column-only transaction or a batch).
+#[cfg(test)]
+pub(crate) static LINKS_FILL_COLUMN_TXNS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+#[cfg(test)]
+pub(crate) static LINKS_FILL_COLUMN_ERROR: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+/// Test builds (the lead's fill-LIVENESS ruling): fill spawns that ended stopped or superseded having committed
+/// no batch.
+#[cfg(test)]
+pub(crate) static LINKS_FILL_EMPTY_SPAWNS: AtomicU64 = AtomicU64::new(0);
+/// Test builds (h1-rev-72bfb0127 LOW-3): fill batches started by a fill a later spawn superseded.
+#[cfg(test)]
+pub(crate) static LINKS_FILL_SUPERSEDED_BATCHES: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+pub(crate) static LINKS_FILL_FAILS: AtomicBool = AtomicBool::new(false);
+/// Test builds (links H1 reopened): while set, a committed fill batch waits before it takes the store
+/// mutex to record itself; `LINKS_FILL_HELD_BATCHES` counts the batches that reached that point.
+#[cfg(test)]
+pub(crate) static LINKS_FILL_HOLD_UNRECORDED: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+pub(crate) static LINKS_FILL_HELD_BATCHES: AtomicU64 = AtomicU64::new(0);
+/// Test builds (l4-rev-h1 MED-3): while set, a fill thread waits at its start, before it first takes
+/// the store mutex; `LINKS_FILL_ENTRY_HELD` counts the fills that reached that point.
+#[cfg(test)]
+pub(crate) static LINKS_FILL_HOLD_AT_ENTRY: AtomicBool = AtomicBool::new(false);
+/// Test builds: the fill makes its link columns inside its first row batch, as before the column-only
+/// transaction (e2a788823), so the starved-batch test reaches the per-batch record (the backstop).
+#[cfg(test)]
+pub(crate) static LINKS_FILL_COLUMNS_IN_BATCH: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+pub(crate) static LINKS_FILL_ENTRY_HELD: AtomicU64 = AtomicU64::new(0);
+/// Test builds (h1gap-rev-c HIGH-3): rows (and parents) checkpoints relinked around their own changes.
+#[cfg(test)]
+pub(crate) static CKPT_RELINKED: AtomicU64 = AtomicU64::new(0);
+/// Test builds (h1gap-rev-c MED-1): while set, a fill thread panics at its start.
+#[cfg(test)]
+pub(crate) static LINKS_FILL_PANICS: AtomicBool = AtomicBool::new(false);
+/// Test builds (lead ruling LOW 4): while set, a fill thread waits before its column-only transaction;
+/// `LINKS_FILL_BEFORE_COLUMNS_HELD` counts the fills that reached that point;
+/// `LINKS_FILL_FIRST_MADE_COLUMNS`: the first of them committed its column-only transaction.
+#[cfg(test)]
+pub(crate) static LINKS_FILL_HOLD_BEFORE_COLUMNS: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+pub(crate) static LINKS_FILL_BEFORE_COLUMNS_HELD: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+pub(crate) static LINKS_FILL_FIRST_MADE_COLUMNS: AtomicBool = AtomicBool::new(false);
+
 /// A fuzzy checkpoint's cut, after its catalog commit and before its install, holding no lock but
 /// briefly the store mutex (lead review 1 item 7, review 2 #5): wait — not holding the mutex — for
 /// no flight to be in the air; then stop group flights (`cutting`) and copy the kept part of the
@@ -3259,7 +4209,8 @@ fn begin_cut<'a>(inner: &StoreMutex, group: &'a Group, cap: &Captured) -> Option
             if guard.journal.as_ref()?.log_len() < cap.log_from {
                 return None;
             }
-            let src = match guard.journal.as_ref()?.cut_source(cap.log_from) {
+            // The new log at the version the commit just recorded (one authority).
+            let src = match guard.journal.as_ref()?.cut_source_at(cap.log_from, cap.meta.format) {
                 Ok(Some(src)) => src,
                 _ => return None,
             };
@@ -3300,17 +4251,31 @@ impl Drop for Backpressure<'_> {
         let mut n = count.lock().unwrap_or_else(|e| e.into_inner());
         let seen = *n;
         let started = Instant::now();
+        #[cfg(test)]
+        let mut waits = 0u64;
         while *n == seen && self.0.over_hard.load(Ordering::Acquire) {
             if started.elapsed() > Duration::from_secs(60) {
                 tracing::warn!("branch store back-pressure: no checkpoint install in 60 s");
                 return;
             }
             #[cfg(test)]
-            note_wait();
+            {
+                note_wait();
+                waits += 1;
+            }
             n = installed
                 .wait_timeout(n, Duration::from_millis(50))
                 .unwrap_or_else(|e| e.into_inner())
                 .0;
+        }
+        // Test builds (MED-1): the waits were on an install whose write filled links (`FILLED_INSTALLS`).
+        #[cfg(test)]
+        if waits > 0 {
+            let key = Arc::as_ptr(&self.0.installs) as *const () as usize;
+            let filled = FILLED_INSTALLS.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(k, at)| k == key && at > seen && at <= *n);
+            if filled {
+                THREAD_FILL_WAITS.with(|c| c.set(c.get() + waits));
+            }
         }
     }
 }
@@ -3550,6 +4515,8 @@ impl BranchStore {
             inner: Arc::new(StoreMutex::new(StoreInner::fresh(None, SyncClass::Off, None))),
             prewarm: PrewarmStats::default(),
             flights: Mutex::new(Vec::new()),
+            links_fill: Mutex::new(None),
+            links_fill_old: Mutex::new(Vec::new()),
             confirm_writer: Mutex::new(None),
             name_filter_build: Mutex::new(None),
             name_filter_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -3696,6 +4663,9 @@ impl BranchStore {
                 inner.splice = splice;
                 if files.exist() {
                     let t = Instant::now();
+                    // The version on disk, if this build reads it (LEAP L4: a 17/18 snapshot store
+                    // opens and stays one); else the arm's, which the scan refuses by name.
+                    let format = super::journal::on_disk_format(&files, format);
                     let scanned = Journal::scan_as(&files, sync, format)?;
                     stats.recover_ns = ns(t);
                     if let Some(mut scanned) = scanned {
@@ -3853,6 +4823,8 @@ impl BranchStore {
             inner: Arc::new(StoreMutex::new(inner)),
             prewarm: warmed,
             flights: Mutex::new(Vec::new()),
+            links_fill: Mutex::new(None),
+            links_fill_old: Mutex::new(Vec::new()),
             confirm_writer: Mutex::new(None),
             name_filter_build: Mutex::new(None),
             name_filter_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -3936,7 +4908,7 @@ impl BranchStore {
         records: &[Record],
         sync: SyncClass,
         stats: &mut BranchOpenStats,
-    ) -> Result<HashMap<Slot, bool>> {
+    ) -> Result<Touched> {
         let ns = |t: Instant| u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX);
         inner.next_id = inner.next_id.max(meta.next_id);
         inner.trunk.lineage.epoch = meta.trunk_epoch;
@@ -3955,21 +4927,30 @@ impl BranchStore {
         if let Some(g) = marked {
             cat.next_generation = cat.next_generation.max(g + 1);
         }
-        cat.lease_floor = cat.catalog.lease_min()?;
+        // LEAP L4: a format 19/20 meta row carries the catalog's earliest lease deadline, written in
+        // the transaction of the rows it summarizes; an older one is asked. Mutant
+        // `l4_lease_min_from_query` (test builds only): asked always, as before.
+        cat.lease_floor = match meta.lease_min {
+            Some(lease_min) if !fe_mutant("l4_lease_min_from_query") => lease_min,
+            _ => cat.catalog.lease_min()?,
+        };
+        cat.held_released_at_open = meta.held_released;
         inner.cat = Some(cat);
         let t = Instant::now();
-        let mut touched: HashMap<Slot, bool> = HashMap::new();
+        let mut touched = Touched::default();
+        let parked_before = inner.parked_records;
         for (pos, record) in records.iter().enumerate() {
             let pos = pos as u64;
+            touched.parked = inner.parked_records > parked_before;
             match record {
                 Record::Commit { pages, .. } => {
                     for &(_, slot, _) in pages {
-                        touched.insert(slot, true);
+                        touched.set(slot, true);
                         inner.named_at.insert(slot, pos);
                     }
                 }
                 Record::TrunkRetain { slot, .. } => {
-                    touched.insert(*slot, true);
+                    touched.set(*slot, true);
                     inner.named_at.insert(*slot, pos);
                 }
                 _ => {}
@@ -3981,7 +4962,7 @@ impl BranchStore {
             // A parked Commit applied during this record (C-R) freed its slots here, in order.
             freed.append(&mut inner.deferred_freed);
             for slot in freed {
-                touched.insert(slot, false);
+                touched.set(slot, false);
             }
         }
         stats.replay_ns = ns(t);
@@ -4039,7 +5020,15 @@ impl BranchStore {
         // none, and the catalog alone would then open in the other splice arm, or under another
         // build's format (r13-compose S-6: 5/6 composed, 7 before F7's merge, 3/4 F7-durable alone,
         // 2 the base, 0 before the key). A refused open pays no catalog prewarm.
-        let format = super::journal::format_version(inner.splice);
+        let arm = super::journal::format_version(inner.splice);
+        // The version this store reads and writes its files at: its catalog's, its arm's own or an
+        // older one (LEAP L4: a 17-20 catalog opens by the older path, and stays at it until this
+        // build's first checkpoint upgrades it: one authority), else the log's.
+        let format = match meta {
+            Some(m) if super::journal::accepts_format(m.format, arm) => m.format,
+            Some(_) => arm,
+            None => super::journal::on_disk_format(files, arm),
+        };
         if let Some(m) = meta.filter(|m| m.format != format) {
             return Err(LimboError::Corrupt(format!(
                 "branch catalog {}: format version {}; this store reads version {format}{}",
@@ -4073,7 +5062,7 @@ impl BranchStore {
         };
         stats.log_bytes = scanned.log_bytes();
         let arena_file = scanned.open_arena(meta.is_some_and(|m| m.in_use > 0 || m.states > 0))?;
-        let meta = meta.unwrap_or(Meta {
+        let meta = meta.unwrap_or_else(|| Meta {
             page_size: scanned.page_size() as u32,
             ..Meta::default()
         });
@@ -4100,7 +5089,7 @@ impl BranchStore {
             // read, as before review 5 #1.
             let named: Vec<(Slot, u32)> = check
                 .into_iter()
-                .filter(|(slot, _)| touched.get(slot) == Some(&true) || fe_mutant("check_all_named_slots"))
+                .filter(|(slot, _)| touched.now.get(slot) == Some(&true) || fe_mutant("check_all_named_slots"))
                 .collect();
             if !super::journal::slots_hold(&arena_file, page_size, &named)? {
                 scanned.drop_last_flight();
@@ -4120,7 +5109,7 @@ impl BranchStore {
         stats.released_scanned = scanned;
         freed.append(&mut inner.deferred_freed);
         for slot in freed {
-            touched.insert(slot, false);
+            touched.set(slot, false);
         }
         if inner.parked.is_empty() {
             inner.named_at = HashMap::new();
@@ -4135,8 +5124,82 @@ impl BranchStore {
         let mut free_mem = Vec::new();
         let mut taken = HashSet::new();
         let mut high_water = file_hw.max(meta.arena_hw);
-        for (&slot, &used) in &touched {
-            let was_used = slot < meta.arena_hw && !cat.catalog.free_has(slot)?;
+        // LEAP L4 2b: at formats 19/20 a touched slot's state at the checkpoint is its FIRST touch
+        // in the tail, not a free-table probe. A Commit's or a TrunkRetain's slot is fresh, taken
+        // from the free list or the reserved set, each of which the checkpoint lists free (a
+        // reservation is written free: a crash loses it), or from past the high-water mark; a slot
+        // whose first touch frees it was in use at the checkpoint; one first touched in use after a
+        // parked Commit is asked (see `Touched`). Older formats probe, as before.
+        // Mutants (test builds only): `l4_free_probe_at_open` probes always; `l4_free_first_touch_
+        // inverted` reads every first touch the wrong way round (the oracle's plant).
+        let infer = super::journal::meta_carries_facts(meta.format) && !fe_mutant("l4_free_probe_at_open");
+        let inverted = fe_mutant("l4_free_first_touch_inverted");
+        #[cfg(test)]
+        let check = infer && CHECK_FREE_INFERENCE.with(std::cell::Cell::get);
+        #[cfg(test)]
+        {
+            cat.free_inferred_at_open = 0;
+            cat.free_inference_mismatch = None;
+        }
+        // DECISIONS 81152ec501: the slots the first touch cannot settle (first used after a parked
+        // Commit) are asked together, one statement per `FREE_HAS_CHUNK`, not one each. Mutant
+        // `l4_free_probe_one_by_one` (test builds only): one probe each, as before.
+        let batched: Option<HashSet<Slot>> = if infer && !fe_mutant("l4_free_probe_one_by_one") {
+            let mut ask: Vec<Slot> = touched
+                .after_park
+                .iter()
+                .copied()
+                .filter(|&s| s < meta.arena_hw && touched.now.contains_key(&s))
+                .collect();
+            ask.sort_unstable();
+            // Probe STATEMENTS, as at 17/18 (one per chunk here): `cat_queries - free_probes` is
+            // the open's own reads (catalog_tests).
+            stats.free_probes += ask.len().div_ceil(super::catalog::FREE_HAS_CHUNK) as u64;
+            Some(cat.catalog.free_has_many(&ask)?)
+        } else {
+            None
+        };
+        for (&slot, &used) in &touched.now {
+            let below = slot < meta.arena_hw;
+            stats.touched_below_hw += u64::from(below);
+            let listed = if !below {
+                false
+            } else if let (Some(listed), true) = (batched.as_ref(), touched.after_park.contains(&slot)) {
+                let listed = listed.contains(&slot);
+                #[cfg(test)]
+                if check {
+                    cat.free_inferred_at_open += 1;
+                    let asked = cat.catalog.free_has(slot)?;
+                    if asked != listed && cat.free_inference_mismatch.is_none() {
+                        cat.free_inference_mismatch = Some(format!(
+                            "the open's batched probe read slot {slot} {} at the checkpoint, the catalog's free table says {}",
+                            if listed { "free" } else { "in use" },
+                            if asked { "free" } else { "in use" }
+                        ));
+                    }
+                }
+                listed
+            } else if infer && !touched.after_park.contains(&slot) {
+                let listed = touched.first[&slot] != inverted;
+                #[cfg(test)]
+                if check {
+                    cat.free_inferred_at_open += 1;
+                    let asked = cat.catalog.free_has(slot)?;
+                    if asked != listed && cat.free_inference_mismatch.is_none() {
+                        cat.free_inference_mismatch = Some(format!(
+                            "the open inferred slot {slot} {} at the checkpoint from its first touch (in use: {}), the catalog's free table says {}",
+                            if listed { "free" } else { "in use" },
+                            touched.first[&slot],
+                            if asked { "free" } else { "in use" }
+                        ));
+                    }
+                }
+                listed
+            } else {
+                stats.free_probes += 1;
+                cat.catalog.free_has(slot)?
+            };
+            let was_used = below && !listed;
             in_use += used as i64 - was_used as i64;
             if slot < meta.arena_hw && !was_used {
                 // The catalog lists it free; this process owns it now either way.
@@ -4154,13 +5217,13 @@ impl BranchStore {
             high_water = high_water.max(slot + 1);
         }
         for slot in meta.arena_hw..file_hw {
-            if !touched.contains_key(&slot) {
+            if !touched.now.contains_key(&slot) {
                 free_mem.push(slot);
             }
         }
-        stats.touched_slots = touched.len() as u64;
+        stats.touched_slots = touched.now.len() as u64;
         if super::arena::trace_slots() {
-            let mut t: Vec<(Slot, bool)> = touched.iter().map(|(&s, &u)| (s, u)).collect();
+            let mut t: Vec<(Slot, bool)> = touched.now.iter().map(|(&s, &u)| (s, u)).collect();
             t.sort_unstable();
             eprintln!(
                 "R11SLOT recover meta_hw={} file_hw={file_hw} meta_in_use={} touched={t:?} free_mem={free_mem:?} taken={taken:?} in_use={in_use} records={}",
@@ -5222,6 +6285,14 @@ impl BranchStore {
         if !inner.journal.as_ref().is_some_and(|j| j.wants_compaction()) {
             return;
         }
+        // Links adversary L4: a 17-20 catalog's first checkpoint waits for its rows' links, which a
+        // thread of its own fills in bounded batches (this operation only starts it). Meanwhile no
+        // checkpoint runs and the log grows, past the hard limit too: the fill is bounded work.
+        if self.links_fill_gate(inner) {
+            #[cfg(test)]
+            note_ckpt_outcome(if inner.journal.as_ref().is_some_and(Journal::past_hard_limit) { 0 } else { 1 });
+            return;
+        }
         if inner.cat.is_none() || !self.fuzzy {
             // A compaction that syncs (a D1 or D2 store's, a raised D0 store's) leaves this
             // operation's acknowledgement path (DECISIONS c9c821dd8d): a snapshot store's is owed
@@ -5263,7 +6334,11 @@ impl BranchStore {
         // cleared by the install under the same mutex, so it is never left set with no flight.
         // (During a WAL truncation no checkpoint starts and none waits: the log can pass twice the
         // threshold by what that truncation's time appends.)
-        match self.start_flight(inner) {
+        let started = self.start_flight(inner);
+        // Test builds (H1 no-cut diagnostic): what each threshold-crossing call came to.
+        #[cfg(test)]
+        note_ckpt_outcome(2 + started as usize);
+        match started {
             // A start that failed (settle, capture or spawn) backs off as a failed write does
             // (review 4 #2): not retried, under this mutex, by every operation until another
             // threshold's worth of log. Mutant `start_failure_retried` (test builds only).
@@ -5292,6 +6367,9 @@ impl BranchStore {
             None => return FlightStart::NotCatalog,
             Some(c) if c.flight => return FlightStart::InFlight,
             Some(_) => {}
+        }
+        if self.links_fill_gate(inner) {
+            return FlightStart::Filling;
         }
         if inner.poisoned() {
             return FlightStart::Poisoned;
@@ -5453,7 +6531,123 @@ impl BranchStore {
 
     /// Wait for every fuzzy checkpoint thread started so far (F-FZ). Called without the store
     /// mutex: a thread in flight takes it for its install.
+    /// Links adversary L4: whether a 17-20 catalog's first checkpoint must wait for the link fill
+    /// (it runs, or is started here). Under the store mutex; a failed start is logged and the
+    /// checkpoint then cuts at the store's current 17-20 with no flip (ruling 62c11ec63d; LOW-2). Mutant
+    /// `l4_upgrade_unbatched` (test builds only): never waits, the whole fill under the mutex.
+    fn links_fill_gate(&self, inner: &mut StoreInner) -> bool {
+        let format = super::journal::format_version(inner.splice);
+        // Links adversary 3: past the hard log limit no checkpoint waits for the fill. The fill
+        // stops after its batch, and the checkpoint cuts the log at the store's current 17-20 with no flip,
+        // relinking only around its own changes (h1gap-rev-c HIGH-2, ruling 62c11ec63d: the non-flip cut); a
+        // later checkpoint starts the fill again from its carried cursor. Mutant
+        // `l4_fill_waits_past_hard_limit` (test builds only): it waits, as before.
+        let past_hard = inner.journal.as_ref().is_some_and(Journal::past_hard_limit);
+        let Some(cat) = inner.cat.as_mut() else {
+            return false;
+        };
+        // Only once a batch has made the link columns (and the cursor's table): the checkpoint then
+        // changes no schema, which in a fuzzy flight would fail the store's pinned reads ("Database
+        // schema changed", the oracle's in-flight check, raw ls-green2_131f8832a).
+        // The lead's ruling 2026-10-21 (LEAD-RULINGS.md): the bounded deferral that stood here (0406ca35c) is
+        // REMOVED as dead code: B = 0 changed no outcome (amendments 35-37); liveness comes from the fill's
+        // horizon (`run_links_fill`).
+        if past_hard && cat.links_columns_made.load(Ordering::Acquire) && !fe_mutant("l4_fill_waits_past_hard_limit") {
+            cat.filling = false;
+            return false;
+        }
+        if cat.filling {
+            return true;
+        }
+        if cat.links_prefilled
+            || !super::journal::carries_links(format)
+            || cat.catalog.links_valid()
+            || fe_mutant("l4_upgrade_unbatched")
+        {
+            return false;
+        }
+        cat.filling = true;
+        cat.links_cursor = None;
+        // l4-rev-h1 LOW-3: a token per spawn, never one flag reset: a fill of an earlier spawn that is still
+        // finishing keeps its own (stopped) token, and a stop reaches only the fill it was meant for.
+        cat.links_fill_stop = Arc::new(AtomicBool::new(false));
+        let (shared, writer, group, made, stop) =
+            (self.inner.clone(), cat.writer.clone(), self.group.clone(), cat.links_columns_made.clone(), cat.links_fill_stop.clone());
+        let spawned = crate::thread::Builder::new()
+            .name("branch-links-fill".to_string())
+            .spawn(move || run_links_fill(&shared, &writer, &group, &made, &stop));
+        match spawned {
+            Ok(handle) => {
+                if let Some(old) = self.links_fill.lock().replace(handle) {
+                    self.links_fill_old.lock().push(old);
+                }
+                cat.links_fill_starts += 1;
+                true
+            }
+            Err(e) => {
+                tracing::warn!("branch catalog link fill not started: {e}");
+                cat.filling = false;
+                false
+            }
+        }
+    }
+
+    /// Start the link fill if a checkpoint must wait for it, and wait for it, without the store
+    /// mutex (an explicit checkpoint's caller waits; nothing on an acknowledgement path does).
+    fn finish_links_fill(&self) {
+        {
+            let mut inner = self.inner.lock();
+            self.links_fill_gate(&mut inner);
+        }
+        let fill = self.links_fill.lock().take();
+        if let Some(handle) = fill {
+            if handle.join().is_err() {
+                self.fill_panicked();
+            }
+        }
+        // L1: another caller took the join handle: wait for the fill it joins to end (bounded
+        // batches; no store mutex held between the looks). Mutant `l4_second_compaction_busy`
+        // (test builds only): no wait, as before.
+        while !fe_mutant("l4_second_compaction_busy") && self.inner.lock().cat.as_ref().is_some_and(|c| c.filling) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// The link fill stops after the batch it is in (links adversary L4), as at close.
+    fn stop_links_fill(&self) {
+        if let Some(cat) = self.inner.lock().cat.as_mut() {
+            cat.filling = false;
+            cat.links_fill_stop.store(true, Ordering::Release);
+        }
+    }
+
+    /// h1gap-rev-c MED-1: the joined fill thread panicked, so nothing cleared `filling`: the joiner clears
+    /// it, so a panic is an exit like any other (L1's wait loop and every later checkpoint go on).
+    /// Mutant `l4_fill_panic_left_filling` (test builds only): left set, as before.
+    fn fill_panicked(&self) {
+        tracing::warn!("the branch catalog's link fill thread panicked");
+        if fe_mutant("l4_fill_panic_left_filling") {
+            return;
+        }
+        if let Some(cat) = self.inner.lock().cat.as_mut() {
+            cat.filling = false;
+            cat.links_fill_stop.store(true, Ordering::Release);
+        }
+    }
+
     fn join_flights(&self) {
+        let fill = self.links_fill.lock().take();
+        if let Some(handle) = fill {
+            if handle.join().is_err() {
+                self.fill_panicked();
+            }
+        }
+        let old = std::mem::take(&mut *self.links_fill_old.lock());
+        for handle in old {
+            if handle.join().is_err() {
+                tracing::warn!("a superseded branch catalog link fill thread panicked");
+            }
+        }
         let handles = std::mem::take(&mut *self.flights.lock());
         for handle in handles {
             if handle.join().is_err() {
@@ -5532,12 +6726,10 @@ impl BranchStore {
     }
 
     /// The compaction an operation owed to the background writer (`Group::compact_due`; DECISIONS
-    /// c9c821dd8d), led by it under the store mutex, off every acknowledgement path. Nothing is
-    /// done if the log no longer wants one (an operation past the hard limit compacted it inline).
-    /// A failure backs off as an operation's does (`defer_compaction`). The store's `unsynced` hint
-    /// is left as it was: a trunk barrier then takes the lock and finds nothing to flush.
-    /// Operations that arrive while it holds the mutex wait behind its syncs, and are counted
-    /// (`StoreMutex::compaction_waits`).
+    /// c9c821dd8d), led by it off every acknowledgement path (`compact_in_background`). A failure
+    /// backs off as an operation's does (`defer_compaction`). Mutant `compaction_syncs_under_mutex`
+    /// (test builds only): the whole compaction under the store mutex, as at c9c821dd8d, with every
+    /// operation arriving meanwhile counted (`compaction_waits`).
     fn lead_compaction(store: &StoreMutex, group: &Group) {
         if group
             .compact_due
@@ -5546,26 +6738,190 @@ impl BranchStore {
         {
             return;
         }
-        store.compacting.fetch_add(1, Ordering::AcqRel);
-        {
+        let led = if fe_mutant("compaction_syncs_under_mutex") {
+            store.compacting.fetch_add(1, Ordering::AcqRel);
             let mut inner = store.lock_uncounted();
             #[cfg(test)]
-            pause_at(Some(&group.confirm_hold), HOLD_COMPACT_LOCKED);
-            if inner.cat.is_none() && inner.journal.as_ref().is_some_and(Journal::wants_compaction) {
-                #[cfg(test)]
-                {
-                    group.lock().background_compactions += 1;
-                }
-                if let Err(e) = Self::compact_snapshot(&mut inner, group, false) {
-                    tracing::warn!("branch store compaction failed: {e}");
-                    if let Some(journal) = inner.journal.as_mut() {
-                        journal.defer_compaction();
-                    }
-                }
+            pause_at(Some(&group.confirm_hold), HOLD_COMPACT_TAKEN);
+            let led = if inner.cat.is_none() && inner.journal.as_ref().is_some_and(Journal::wants_compaction) {
+                Self::compact_snapshot(&mut inner, group, false)
+            } else {
+                Ok(())
+            };
+            drop(inner);
+            store.compacting.fetch_add(1, Ordering::AcqRel);
+            led
+        } else {
+            Self::compact_in_background(store, group)
+        };
+        if let Err(e) = led {
+            tracing::warn!("branch store compaction failed: {e}");
+            if let Some(journal) = store.lock().journal.as_mut() {
+                journal.defer_compaction();
             }
         }
-        store.compacting.fetch_add(1, Ordering::AcqRel);
         group.compact_due.store(COMPACT_IDLE, Ordering::Release);
+    }
+
+    /// A snapshot store's syncing compaction with no sync under the store mutex (DECISIONS
+    /// bd0d845f97), the held-free upgrade's shape: what it syncs is taken under the mutex, synced
+    /// holding no lock, and landed under the mutex only over the log it was taken from (the
+    /// journal's rewrites count, nonce and generation). Operations go on throughout, their group
+    /// flights included.
+    ///
+    /// 1. Capture (mutex): the state's snapshot, a `Record::Checkpoint` marker of the next
+    ///    generation buffered after it, the arena's handle (`Journal::begin_bg_compaction`).
+    /// 2. The marker written (holding no lock; a flight is led if none does it).
+    /// 3. The arena and the snapshot's temp file synced (no lock).
+    /// 4. The snapshot renamed in (mutex, if the log is unchanged); from here a crash leaves an
+    ///    older log whose records past the marker recovery replays over the snapshot.
+    /// 5. Its directory synced (no lock); everything below the marker is then durable in the class.
+    /// 6. The log cut to what follows the marker: copied and synced into a temp log holding no
+    ///    lock (`prepare_cut`), caught up likewise with what flights wrote meanwhile
+    ///    (`extend_cut`, up to `COMPACT_CATCH_UPS` passes), then renamed in under the mutex
+    ///    (`finish_cut`) once nothing is left to copy. Only if flights still landed after the last
+    ///    pass is that tail copied and synced under the mutex: counted (`compaction_waits`).
+    ///
+    /// Test hooks (`Group::confirm_hold`): `HOLD_COMPACT_TAKEN` after step 2, and
+    /// `HOLD_COMPACT_TAIL` inside the counted tail's mutex hold.
+    fn compact_in_background(store: &StoreMutex, group: &Group) -> Result<()> {
+        #[cfg(test)]
+        let hold = Some(&group.confirm_hold);
+        let bg = {
+            let mut inner = store.lock();
+            if inner.cat.is_some() || !inner.journal.as_ref().is_some_and(Journal::wants_compaction) {
+                return Ok(());
+            }
+            let snapshot = inner.snapshot();
+            let StoreInner { journal, arena, .. } = &mut *inner;
+            let (Some(journal), Some(arena)) = (journal.as_mut(), arena.as_ref()) else {
+                return Ok(());
+            };
+            journal.begin_bg_compaction(&snapshot, arena)?
+        };
+        #[cfg(test)]
+        {
+            group.lock().background_compactions += 1;
+        }
+        let landed = (|| -> Result<()> {
+            Self::wait_durable_on(store, group, None, bg.lsn(), SyncClass::Off)?;
+            #[cfg(test)]
+            pause_at(hold, HOLD_COMPACT_TAKEN);
+            bg.sync_snapshot()?;
+            let installed = match store.lock().journal.as_mut() {
+                Some(journal) => journal.install_bg_snapshot(&bg)?,
+                None => false,
+            };
+            if !installed {
+                return Ok(());
+            }
+            bg.sync_dir()?;
+            group.mark_committed(bg.lsn(), bg.class());
+            // Test builds: stop here, as a crash between the snapshot's rename and the log's cut
+            // would (`COMPACT_STOP_BEFORE_CUT`).
+            #[cfg(test)]
+            if COMPACT_STOP_BEFORE_CUT.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            Self::cut_in_background(store, group, &bg)
+        })();
+        bg.discard();
+        landed
+    }
+
+    /// Step 6 of `compact_in_background`: the log cut to what follows the marker.
+    fn cut_in_background(store: &StoreMutex, group: &Group, bg: &super::journal::BgCompaction) -> Result<()> {
+        #[cfg(test)]
+        let hold = Some(&group.confirm_hold);
+        let (from, generation) = (bg.from(), bg.generation());
+        let source = {
+            let inner = Self::lock_quiesced(store, group)?;
+            let Some(journal) = inner.journal.as_ref() else {
+                return Ok(());
+            };
+            match journal.bg_cut_source(bg)? {
+                Some(source) => source,
+                None => return Ok(()),
+            }
+        };
+        let mut prep = Journal::prepare_cut(source, from, generation)?;
+        #[cfg(test)]
+        pause_at(hold, HOLD_COMPACT_PREPARED);
+        let passes = if compact_no_catch_up() { 0 } else { COMPACT_CATCH_UPS };
+        // The last pass copies under the mutex whatever is left. When that copy must be synced (a
+        // flight left in it claimed a sync), the hold is counted from before it locks to after it
+        // unlocks (`Compacting`, declared before `inner`, so dropped after it): the pass locks
+        // again counted. Under `COMPACT_CATCH_UPS_OFF` (the plant) it is counted every time.
+        let mut counted: Option<Compacting<'_>> = None;
+        let mut pass = 0;
+        loop {
+            let last = pass >= passes;
+            if last && compact_catch_ups_off() && counted.is_none() {
+                counted = Some(Compacting::begin(store));
+            }
+            let mut inner = Self::lock_quiesced(store, group)?;
+            let Some(journal) = inner.journal.as_mut() else {
+                break;
+            };
+            if !journal.cut_usable(&prep, from, generation) {
+                break;
+            }
+            let to = journal.log_len();
+            if to > prep.upto() && !last {
+                let fail = journal.take_replacement_sync_failure();
+                drop(inner);
+                Journal::extend_cut(&mut prep, to, fail)?;
+                pass += 1;
+                continue;
+            }
+            if counted.is_none() && journal.cut_tail_syncs(&prep)? {
+                drop(inner);
+                counted = Some(Compacting::begin(store));
+                continue;
+            }
+            #[cfg(test)]
+            if counted.is_some() {
+                pause_at(hold, HOLD_COMPACT_TAIL);
+            }
+            journal.finish_cut(prep, from, generation)?;
+            journal.set_snapshot_len(bg.snapshot_len());
+            // What the flights after the marker wrote is durable only in their own class: the cut's
+            // rename waits for the next flight's directory sync, as a catalog store's install's.
+            let written = journal.lsn() - journal.pending_len();
+            let class = journal.sync_class();
+            group.mark_durable(written, class);
+            let durable = group.durable(inner.free_class());
+            inner.mature_frees(durable);
+            drop(inner);
+            drop(counted);
+            return Ok(());
+        }
+        // The log changed under the cut: the snapshot stays installed, the older log is replayed
+        // past its marker, and the next compaction cuts it.
+        Ok(())
+    }
+
+    /// The store mutex with no group flight in the air (a cut's copy must end a flight): waited for
+    /// holding no lock, then re-checked under it. Fails once the store is fail-stopped.
+    fn lock_quiesced<'a>(store: &'a StoreMutex, group: &Group) -> Result<StoreGuard<'a>> {
+        loop {
+            {
+                let mut g = group.lock();
+                while g.flushing {
+                    if group.poisoned() {
+                        return Err(group_poisoned());
+                    }
+                    g = group.wait(g);
+                }
+            }
+            let inner = store.lock_uncounted();
+            if group.poisoned() {
+                return Err(group_poisoned());
+            }
+            if !group.lock().flushing {
+                return Ok(inner);
+            }
+        }
     }
 
     /// Whether this process's background writer runs (`start_confirm_writer`): not when it could
@@ -6628,6 +7984,12 @@ impl BranchStore {
 
     /// This store's group's own handle, for its catalog to forward failed syncs to
     /// (`Catalog::link_drain_parent`).
+    /// This store's group (the `vacuum_target_drains_into_source` mutant links a VACUUM target's
+    /// store to it).
+    pub(crate) fn group_ref(&self) -> &Group {
+        &self.group
+    }
+
     pub(crate) fn group_handle(group: &Group) -> Option<crate::sync::Weak<Group>> {
         group.me.get().cloned()
     }
@@ -6785,7 +8147,7 @@ impl BranchStore {
         };
         if unsynced && *failpoint == Some(BranchFailpoint::BarrierBeforeRecords) {
             *failpoint = None;
-            *orphans = journal.pending_slots.clone();
+            orphans.clone_from(&journal.pending_slots);
             journal.poison();
             return Err(LimboError::InternalError(
                 "failpoint: the trunk commit's branch barrier stopped before its records"
@@ -7443,6 +8805,12 @@ impl BranchStore {
         self.group.confirm_notifies.load(Ordering::Relaxed)
     }
 
+    /// Test builds (lead ruling f329b0d2a8): the group's `confirm_done` key.
+    #[cfg(test)]
+    pub(crate) fn confirm_done_for_test(&self) -> u64 {
+        self.group.confirm_done.load(Ordering::Acquire)
+    }
+
     /// Test builds (C15 ruling, exception (b)'s plant): the log header's raised-class field is
     /// stale, so the next write that takes it rewrites it (`Journal::stale_header_for_test`).
     #[cfg(test)]
@@ -7531,8 +8899,9 @@ impl BranchStore {
                 pending.insert(names.filter.hash(name));
             }
             names.filter.pending = Some(pending);
-            reader
+            (reader, cat.generation)
         };
+        let (reader, scan_generation) = reader;
         let hasher = self.inner.lock().names.filter.hasher.clone();
         #[cfg(test)]
         let fail_scan = NAME_SCAN_FAILS.swap(false, std::sync::atomic::Ordering::AcqRel);
@@ -7540,6 +8909,8 @@ impl BranchStore {
         let fail_scan = false;
         let shared = self.inner.clone();
         let stop = self.name_filter_stop.clone();
+        #[cfg(test)]
+        let install_hold = NAME_INSTALL_HOLD.with(|h| h.borrow().clone());
         let spawned = crate::thread::Builder::new()
             .name("branch-name-filter".to_string())
             .spawn(move || {
@@ -7549,8 +8920,32 @@ impl BranchStore {
                 let scanned = if fail_scan {
                     Err(LimboError::InternalError("failpoint: the name scan failed".to_string()))
                 } else {
-                    reader.name_hashes(|name| hasher.hash_one(name), &stop)
+                    reader.name_pairs(&stop)
                 };
+                // LEAP L4 slice 4: the exact mirror of `branch_name`, built here off the mutex from
+                // the same scan as the filter's hashes, and installed only if no checkpoint
+                // committed since the scan began (the install would apply its names to a mirror
+                // that predates them; one that committed before the scan read them is applied
+                // twice, which is idempotent).
+                let (scanned, mirror) = match scanned {
+                    Ok(pairs) => {
+                        let hashes: Vec<u64> = pairs.iter().map(|(name, _)| hasher.hash_one(&**name)).collect();
+                        // Keyed as the filter is (a per-process random key: the mirror adversary's MED-1).
+                        let mirror = name_mirror_from_pairs(pairs, hasher.clone());
+                        (Ok(hashes), mirror)
+                    }
+                    Err(e) => (Err(e), None),
+                };
+                #[cfg(test)]
+                if let Some(hold) = install_hold.as_ref() {
+                    use std::sync::atomic::Ordering as O;
+                    let arrived = 1 | HOLD_ARRIVED;
+                    if hold.compare_exchange(1, arrived, O::AcqRel, O::Acquire).is_ok() {
+                        while hold.load(O::Acquire) == arrived {
+                            crate::thread::sleep(Duration::from_millis(1));
+                        }
+                    }
+                }
                 // The set of the scanned names is built here, off the store mutex: its one table of
                 // up to 2N buckets and its N inserts were the O(N) background hold (LEAP L4's build
                 // guard: 147,464 B held at 10^4 branches, 1,179,656 B at 10^5, the table to the
@@ -7578,6 +8973,20 @@ impl BranchStore {
                         _ => break inner,
                     }
                 };
+                // Review L4 L1: a mirror a checkpoint outdated is counted and freed after the mutex is
+                // dropped (its N frees are not a hold). Mutant `l4_mirror_ignores_generation` (test
+                // builds only): installed whatever committed meanwhile (the oracle's plant).
+                let mut discarded = None;
+                if let Some(mirror) = mirror {
+                    if inner.cat.as_ref().is_some_and(|c| c.generation == scan_generation)
+                        || fe_mutant("l4_mirror_ignores_generation")
+                    {
+                        inner.names.catalog = Some(Arc::new(mirror));
+                    } else {
+                        inner.names.mirror_misses += 1;
+                        discarded = Some(mirror);
+                    }
+                }
                 let filter = &mut inner.names.filter;
                 let pending = filter.pending.take().unwrap_or_default();
                 match scanned {
@@ -7592,6 +9001,8 @@ impl BranchStore {
                         tracing::debug!("branch name filter not built: {e}")
                     }
                 }
+                drop(inner);
+                drop(discarded);
             });
         match spawned {
             Ok(handle) => *self.name_filter_build.lock() = Some(handle),
@@ -7763,6 +9174,7 @@ impl BranchStore {
     }
 
     pub(crate) fn compact_now(&self) -> Result<()> {
+        self.finish_links_fill();
         // A fuzzy checkpoint in flight finishes first: the sharp one may not overlap it (F-FZ). One
         // another thread starts after the join is waited for once more; then this refuses.
         let mut attempts = 0;
@@ -7809,6 +9221,7 @@ impl BranchStore {
             self.compact_now()?;
             return Ok(true);
         }
+        self.finish_links_fill();
         let installed = || *self.installs.0.lock().unwrap_or_else(|e| e.into_inner());
         let started = Instant::now();
         let mut pause = Duration::from_millis(1);
@@ -7875,6 +9288,13 @@ impl BranchStore {
         self.group.lock().confirm_wakeups
     }
 
+    /// Test builds: the background writer's words since the last call, as (taken at, time since its
+    /// flight landed) (`Group::confirm_word_log`).
+    #[cfg(test)]
+    pub(crate) fn take_confirm_word_log_for_test(&self) -> Vec<(Instant, Duration)> {
+        std::mem::take(&mut *self.group.confirm_word_log.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+
     /// Test builds (fastest-budgets, review C08 #1): the words written since the last landing that
     /// left a confirmation, of that flight itself (the idle tail's, at a burst's end).
     #[cfg(test)]
@@ -7919,6 +9339,220 @@ impl BranchStore {
     #[cfg(test)]
     pub(crate) fn take_commit_yield_for_test(&self) -> bool {
         self.commit_yield.swap(false, Ordering::AcqRel)
+    }
+
+    /// Test builds (LEAP L4's oracle): every in-memory fact that lets a query be skipped equals that
+    /// query's answer now. (1) For each trunk page complete in memory (`trunk_complete`, or every
+    /// page under `trunk_all_complete`), every catalog trunk version not reaped is in `trunk_cache`
+    /// or the lineage, so `trunk_pred` could answer nothing the memory does not. (2) Under
+    /// `free_exhausted`, the catalog has no free slot above `free_cursor`. The catalog is read by
+    /// the store's own reader connection, as the skipped queries would read it. `Err` names the
+    /// first fact that disagrees; `Ok` says which facts were set: (complete pages, all complete,
+    /// free exhausted, a meta fact not trivial), so a test can show they were exercised.
+    /// Test builds (LEAP L4 2b): the touched slots whose checkpoint state the last open inferred and
+    /// checked against the free table (`CHECK_FREE_INFERENCE`).
+    #[cfg(test)]
+    pub(crate) fn free_inferred_for_test(&self) -> u64 {
+        self.inner.lock().cat.as_ref().map_or(0, |cat| cat.free_inferred_at_open)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn l4_facts_check_for_test(&self) -> std::result::Result<(usize, bool, bool, bool), String> {
+        let mut inner = self.inner.lock();
+        let inner = &mut *inner;
+        let Some(cat) = inner.cat.as_mut() else {
+            return Ok((0, false, false, false));
+        };
+        // (6) 2b: the open's first-touch inference equalled the free table on every slot it read.
+        if let Some(m) = cat.free_inference_mismatch.clone() {
+            return Err(m);
+        }
+        let rows = cat
+            .catalog
+            .trunk_born_range(None, u64::MAX, u64::MAX >> 1)
+            .map_err(|e| format!("reading the catalog's trunk versions: {e}"))?;
+        for (page, born, _, _, _) in rows {
+            if !(cat.trunk_all_complete || cat.trunk_complete.contains(&page)) {
+                continue;
+            }
+            let in_cache = cat.trunk_cache.get(&page).is_some_and(|vs| vs.contains_key(&born));
+            let in_lineage = inner.trunk.lineage.retained.get(&page).is_some_and(|vs| vs.contains_key(&born));
+            if !(in_cache || in_lineage || cat.trunk_gone.contains(&(page, born))) {
+                return Err(format!(
+                    "trunk page {page} is complete in memory (all={}), but the catalog holds version born {born} the memory does not",
+                    cat.trunk_all_complete
+                ));
+            }
+        }
+        if cat.free_exhausted {
+            let after = cat
+                .catalog
+                .free_batch(cat.free_cursor, 1)
+                .map_err(|e| format!("reading the catalog's free table: {e}"))?;
+            if let Some(slot) = after.first() {
+                return Err(format!(
+                    "free_exhausted, yet the catalog lists free slot {slot} above the cursor {:?}",
+                    cat.free_cursor
+                ));
+            }
+        }
+        // (5) Slice 4: the name mirror, built and out of a flight, equals `branch_name`.
+        let in_flight_too = CHECK_FACTS_IN_FLIGHT.with(std::cell::Cell::get);
+        if let (Some(mirror), false) = (inner.names.catalog.as_ref(), cat.flight && !in_flight_too) {
+            let stop = std::sync::atomic::AtomicBool::new(false);
+            let rows = cat.catalog.name_pairs(&stop).map_err(|e| format!("name_pairs: {e}"))?;
+            let asked: HashMap<Arc<str>, BranchId> = rows.into_iter().map(|(n, id)| (n, BranchId(id))).collect();
+            if !mirror.same_as(&asked) {
+                let first = asked
+                    .iter()
+                    .find(|(n, id)| mirror.get(n) != Some(**id))
+                    .map(|(n, id)| (n.to_string(), *id))
+                    .or_else(|| mirror.iter().find(|(n, id)| asked.get(*n) != Some(id)).map(|(n, id)| (n.to_string(), id)));
+                return Err(format!(
+                    "the name mirror holds {} names, the catalog {}; first difference: {first:?}",
+                    mirror.len(),
+                    asked.len()
+                ));
+            }
+        }
+        // (8) The MCTS deletes: every resident branch's links, when known, equal the catalog's
+        // nearest rows to its own (its siblings below and above, its newest child), out of a
+        // flight (or in one, with CHECK_FACTS_IN_FLIGHT: the pinned snapshot is the last install's).
+        if !cat.flight || in_flight_too {
+            for (&id, st) in inner.branches.iter() {
+                let Some(l) = st.links else { continue };
+                let (p, f) = (st.parent.0, st.fork_epoch);
+                if inner.children.map.contains_key(&(p, f)) || inner.children.relinked.contains(&(p, f)) {
+                    continue;
+                }
+                let asked = super::catalog::Links {
+                    lo: cat.catalog.children_below(p, f, 1).map_err(|e| format!("children_below: {e}"))?.first().copied(),
+                    hi: cat.catalog.children_above(p, f, 1).map_err(|e| format!("children_above: {e}"))?.first().copied(),
+                    child_max: cat.catalog.children_below(id.0, u64::MAX, 1).map_err(|e| format!("children_below: {e}"))?.first().copied(),
+                };
+                if l != asked {
+                    return Err(format!("branch {}'s links are known as {l:?}; the catalog answers {asked:?}", id.0));
+                }
+            }
+        }
+        // (4) Slice 3, while no checkpoint is in the air: the trunk's newest catalog child and
+        // whether the catalog holds a trunk version, as known, equal their queries.
+        if !cat.flight || in_flight_too {
+            if let Some(known) = cat.trunk_child_max {
+                let asked = cat.catalog.children_below(0, u64::MAX, 1).map_err(|e| format!("children_below: {e}"))?.first().copied();
+                if known != asked {
+                    return Err(format!("the trunk's newest catalog child is known as {known:?}; the catalog answers {asked:?}"));
+                }
+            }
+            if let Some(known) = cat.trunk_versions {
+                let asked = !cat.catalog.trunk_born_range(None, u64::MAX, 1).map_err(|e| format!("trunk_born_range: {e}"))?.is_empty();
+                if known != asked {
+                    return Err(format!("the catalog is known to hold trunk versions: {known}; it answers {asked}"));
+                }
+            }
+        }
+        // (3) A format 19/20 meta row's facts (LEAP L4 slice 2) equal the queries an open skips.
+        let meta = cat.catalog.meta().map_err(|e| format!("reading the catalog's meta row: {e}"))?;
+        let mut meta_set = false;
+        if let Some(m) = meta.filter(|m| super::journal::meta_carries_facts(m.format)) {
+            meta_set = matches!(m.lease_min, Some(Some(_))) || m.held_released.is_some_and(|h| h > 0);
+            let lease_min = cat.catalog.lease_min().map_err(|e| format!("lease_min: {e}"))?;
+            let held = cat.catalog.released_ids().map_err(|e| format!("released_ids: {e}"))?.len() as u64;
+            if m.lease_min != Some(lease_min) || m.held_released != Some(held) {
+                return Err(format!(
+                    "the meta row says lease_min {:?} and {:?} held releases; the catalog answers {lease_min:?} and {held}",
+                    m.lease_min, m.held_released
+                ));
+            }
+        }
+        Ok((cat.trunk_complete.len(), cat.trunk_all_complete, cat.free_exhausted, meta_set))
+    }
+
+    /// Test builds: whether the exact name mirror is built (LEAP L4 slice 4).
+    #[cfg(test)]
+    /// Test builds: the most bytes the name mirror's part of one install allocated, since the last call.
+    #[cfg(test)]
+    pub(crate) fn take_mirror_install_bytes_for_test(&self) -> u64 {
+        std::mem::take(&mut self.inner.lock().names.mirror_install_bytes_max)
+    }
+
+    /// Test builds (LEAP L4, the MCTS deletes): resident branches whose links are known, and the
+    /// catalog's format (its meta row's, or `None` before its first checkpoint).
+    #[cfg(test)]
+    pub(crate) fn links_known_and_catalog_format_for_test(&self) -> (u64, Option<u32>) {
+        let mut inner = self.inner.lock();
+        let known = inner.branches.iter().filter(|(_, st)| st.links.is_some()).count() as u64;
+        let format = inner.cat.as_mut().and_then(|c| c.catalog.meta().ok().flatten()).map(|m| m.format);
+        (known, format)
+    }
+
+    /// Test builds: catalog WAL truncations that returned busy (links adversary 3 L3).
+    #[cfg(test)]
+    pub(crate) fn wal_truncate_busy_for_test(&self) -> u64 {
+        self.group.wal_truncate_busy.load(Ordering::Relaxed)
+    }
+
+    /// Test builds (links H1 reopened): whether the log is past the hard limit now.
+    #[cfg(test)]
+    pub(crate) fn past_hard_limit_for_test(&self) -> bool {
+        self.inner.lock().journal.as_ref().is_some_and(Journal::past_hard_limit)
+    }
+
+    /// Test builds (links adversary 3): `(filling, prefilled, fill threads started)`.
+    #[cfg(test)]
+    pub(crate) fn links_fill_state_for_test(&self) -> (bool, bool, u64) {
+        self.inner.lock().cat.as_ref().map_or((false, false, 0), |c| (c.filling, c.links_prefilled, c.links_fill_starts))
+    }
+
+    /// Test builds (links adversary L1): the child index's splice records, `moved` and `relinked`,
+    /// which only a catalog store's checkpoint consumes.
+    #[cfg(test)]
+    pub(crate) fn children_moved_relinked_for_test(&self) -> (usize, usize) {
+        let inner = self.inner.lock();
+        (inner.children.moved.len(), inner.children.relinked.len())
+    }
+
+    /// Test builds (lead ruling LOW 4): stop the link fill as a close does, without closing.
+    #[cfg(test)]
+    pub(crate) fn stop_links_fill_for_test(&self) {
+        self.stop_links_fill();
+    }
+
+    /// Test builds: whether this store's catalog has the link columns (format 21/22 or upgraded).
+    #[cfg(test)]
+    pub(crate) fn catalog_links_for_test(&self) -> bool {
+        self.inner.lock().cat.as_ref().is_some_and(|c| c.catalog.links())
+    }
+
+    pub(crate) fn name_mirror_built_for_test(&self) -> bool {
+        self.inner.lock().names.catalog.is_some()
+    }
+
+    /// Test builds (review L4): name mirrors discarded because a checkpoint committed during their
+    /// scan, and trims of the trunk-version cache past the resident cap.
+    #[cfg(test)]
+    pub(crate) fn mirror_misses_and_trims_for_test(&self) -> (u64, u64) {
+        let inner = self.inner.lock();
+        (inner.names.mirror_misses, inner.cat.as_ref().map_or(0, |c| c.trunk_trims))
+    }
+
+    /// Test builds (review L4 M1): use sites of slice 3's facts reached inside a flight with
+    /// `CHECK_FACTS_IN_FLIGHT` set, each of which asserted the known facts equal their queries.
+    #[cfg(test)]
+    pub(crate) fn in_flight_fact_checks_for_test(&self) -> u64 {
+        self.inner.lock().cat.as_ref().map_or(0, |c| c.in_flight_fact_checks)
+    }
+
+    /// Test builds (review L4 M1): slice 3's facts used while a checkpoint was in flight.
+    #[cfg(test)]
+    pub(crate) fn facts_used_in_flight_for_test(&self) -> u64 {
+        self.inner.lock().cat.as_ref().map_or(0, |c| c.facts_used_in_flight)
+    }
+
+    /// Test builds: the format version this store writes (LEAP L4: 19/20 created, 17/18 kept).
+    #[cfg(test)]
+    pub(crate) fn format_for_test(&self) -> Option<u32> {
+        self.inner.lock().journal.as_ref().map(Journal::format)
     }
 
     /// Test builds: hold this store's confirmation writer at `stage` (`HOLD_CONFIRM_WRITE`; 0
@@ -7994,6 +9628,7 @@ impl BranchStore {
     /// starts nothing. `Ok(false)`: nothing started (parked Commits remain, one is in flight, or
     /// this is not a catalog store).
     pub(crate) fn checkpoint_fuzzy_now(&self) -> Result<bool> {
+        self.finish_links_fill();
         let mut inner = self.inner.lock();
         // Mutant `plant_premise_only` (test builds only): the mutant runner's planted control
         // (its flagged-edit judge, 2026-10-06T14:45:43Z). It starts nothing, which trips only the
@@ -8041,7 +9676,35 @@ impl Drop for BranchStore {
         self.flight_hold.store(0, Ordering::Release);
         #[cfg(test)]
         self.group.confirm_hold.store(0, Ordering::Release);
+        // The link fill stops after the batch it is in (links adversary L4): the next open resumes it
+        // from the committed cursor (h1gap-rev-c LOW-1).
+        self.stop_links_fill();
         self.join_flights();
+        // h1gap-rev-c HIGH-3: a fill that completed with no operation after it (a session that wrote in a
+        // burst and went idle) leaves the flip owed, and nothing else would start it before the process
+        // exits: the close runs it. Prefilled, it only flips the meta row and relinks around its own
+        // changes. Mutant `l4_no_flip_at_close` (test builds only): not run, as before.
+        let flip_owed = self.inner.lock().cat.as_ref().is_some_and(|c| c.links_prefilled && !c.catalog.links_valid());
+        if flip_owed && !fe_mutant("l4_no_flip_at_close") {
+            if let Err(e) = self.compact_now() {
+                tracing::warn!("branch catalog upgrade not flipped at close: {e}");
+            }
+        } else {
+            // Lead ruling 2026-10-21T17:58:38Z: past the hard limit the fill gate defers each checkpoint until
+            // the fill's column-only transaction is recorded, and a deferred one starts at the next operation;
+            // the close is the last one, so it cuts here (the fill stopped and joined above, so no schema
+            // change can land under it), at the store's current version, never a flip. Mutant
+            // `l4_no_cut_at_close` (test builds only): not cut, as before.
+            let mut inner = self.inner.lock();
+            let cut_owed = inner.cat.is_some()
+                && !inner.cat.as_ref().is_some_and(|c| c.flight)
+                && inner.journal.as_ref().is_some_and(Journal::past_hard_limit);
+            if cut_owed && !fe_mutant("l4_no_cut_at_close") {
+                if let Err(e) = self.compact(&mut inner, false) {
+                    tracing::warn!("branch log not cut at close: {e}");
+                }
+            }
+        }
         // The name filter's build holds the store's files too: stopped, then joined.
         self.name_filter_stop.store(true, Ordering::Release);
         self.wait_name_filter();
@@ -8083,17 +9746,18 @@ fn name_taken(name: &str) -> LimboError {
 /// 14 LOW 13): each is the `InvalidArgument` it was before 620e69a81, with its old text, so
 /// `named_branch_refusals_are_typed` can be shown to fail on every assertion it makes.
 pub(crate) fn untyped_branch_error(e: LimboError) -> LimboError {
-    if !fe_mutant("untyped_branch_errors") {
-        return e;
-    }
+    // Per kind too (engine review 20 LOW 20: the all-kinds mutant failed its test at the first
+    // assertion, NameTaken, so the other two were never shown to fail): mutants
+    // `untyped_branch_errors_no_such`, `_name_taken` and `_in_use` untype one kind each.
+    let all = fe_mutant("untyped_branch_errors");
     match e {
-        LimboError::NoSuchBranch(name) => {
+        LimboError::NoSuchBranch(name) if all || fe_mutant("untyped_branch_errors_no_such") => {
             LimboError::InvalidArgument(format!("no branch is named {name:?}"))
         }
-        LimboError::NameTaken(name) => LimboError::InvalidArgument(format!(
-            "branch name {name:?} already names an unreleased branch"
-        )),
-        LimboError::BranchInUse { id, .. } => LimboError::InvalidArgument(format!(
+        LimboError::NameTaken(name) if all || fe_mutant("untyped_branch_errors_name_taken") => {
+            LimboError::InvalidArgument(format!("branch name {name:?} already names an unreleased branch"))
+        }
+        LimboError::BranchInUse { id, .. } if all || fe_mutant("untyped_branch_errors_in_use") => LimboError::InvalidArgument(format!(
             "branch {id} already has an open connection; a branch serves one connection at a \
              time, because a second one's page cache would silently miss the first one's commits"
         )),
@@ -8330,6 +9994,13 @@ impl StoreInner {
         let cached: usize = cat.trunk_cache.values().map(BTreeMap::len).sum();
         if cached > cap {
             cat.trunk_cache.clear();
+            cat.trunk_trims += 1;
+            // What the cache held is no longer in memory (LEAP L4). Mutant `l4_trim_keeps_complete`
+            // (test builds only): the complete marks outlive the cache (the oracle's plant).
+            if !fe_mutant("l4_trim_keeps_complete") {
+                cat.trunk_complete.clear();
+                cat.trunk_all_complete = false;
+            }
         }
     }
 
@@ -8433,9 +10104,23 @@ impl StoreInner {
             if self.names.filter.says_absent(name) {
                 return Ok(None);
             }
+            // The catalog's names, mirrored exactly (LEAP L4 slice 4).
+            if let Some(mirror) = self.names.catalog.as_ref().filter(|_| !fe_mutant("l4_probe_always")) {
+                let found = mirror.get(name);
+                if let Some(id) = found {
+                    self.names.last_found = Some((id, Arc::from(name)));
+                }
+                return Ok(found);
+            }
         }
         match self.cat.as_mut() {
-            Some(cat) => Ok(cat.catalog.name_get(name)?.map(BranchId)),
+            Some(cat) => {
+                let found = cat.catalog.name_get(name)?.map(BranchId);
+                if let Some(id) = found {
+                    self.names.last_found = Some((id, Arc::from(name)));
+                }
+                Ok(found)
+            }
             None => Ok(None),
         }
     }
@@ -8480,7 +10165,14 @@ impl StoreInner {
             let loaded = if cat.removed.contains(&next) {
                 None
             } else {
-                cat.catalog.load_branch(next.0)?
+                // The name a lookup just found this branch under, not read again (LEAP L4 slice 4).
+                let known = self
+                    .names
+                    .last_found
+                    .as_ref()
+                    .filter(|(found, _)| *found == next && !fe_mutant("l4_probe_always"))
+                    .map(|(_, name)| name.clone());
+                cat.catalog.load_branch_named(next.0, known.as_ref())?
             };
             let Some(b) = loaded else {
                 if chain.is_empty() {
@@ -8632,6 +10324,7 @@ impl StoreInner {
                 name: None,
                 fork_lsn: 0,
                 in_doubt: false,
+                links: b.links,
             },
         );
         self.note_table_growth(grown_before);
@@ -8655,6 +10348,12 @@ impl StoreInner {
             return Ok(());
         };
         if cat.trunk_known.contains(&page) {
+            return Ok(());
+        }
+        // A page whose catalog versions are all in memory needs no probe: `written` already counts
+        // them (LEAP L4).
+        if cat.trunk_all_complete && !fe_mutant("l4_probe_always") {
+            cat.trunk_known.insert(page);
             return Ok(());
         }
         // Mutant `probe_marked_first` (test builds only): as before review 3 #2, the page is known
@@ -8683,6 +10382,14 @@ impl StoreInner {
             }
             let written = self.trunk.written.entry(page).or_insert(0);
             *written = (*written).max(died);
+            // Mutant `l4_complete_over_a_row` (test builds only): marked complete although the
+            // catalog holds a version the memory does not (the oracle's plant).
+            if fe_mutant("l4_complete_over_a_row") {
+                cat.trunk_complete.insert(page);
+            }
+        } else {
+            // No catalog version of the page at all: the memory holds every one (LEAP L4).
+            cat.trunk_complete.insert(page);
         }
         cat.trunk_known.insert(page);
         Ok(())
@@ -8720,6 +10427,10 @@ impl StoreInner {
                 *examined += 1;
                 return Ok(Some((v.slot, v.crc)));
             }
+        }
+        // Every catalog version of the page is in memory, and none holds `at` (LEAP L4).
+        if (cat.trunk_all_complete || cat.trunk_complete.contains(&page)) && !fe_mutant("l4_probe_always") {
+            return Ok(None);
         }
         cat.trunk_probes += 1;
         cat.tva_probes += 1;
@@ -8760,6 +10471,27 @@ impl StoreInner {
         let Some(cat) = self.cat.as_mut() else {
             return Ok(());
         };
+        // LEAP L4 slice 3: a catalog with no trunk version has no trunk garbage (asked once while
+        // unknown, never while a checkpoint is in the air).
+        // Mutant `l4_child_facts_in_flight` (test builds only): the facts used in a flight too
+        // (equivalent: `CatState::assert_facts_in_flight`). Fire-check mutant
+        // `l4_flight_facts_stale_at_use` (test builds only): a known trunk-version fact made wrong
+        // here, inside a flight, after the oracle's last check and before this use site's assertion.
+        #[cfg(test)]
+        if cat.flight && fe_mutant("l4_flight_facts_stale_at_use") {
+            cat.trunk_versions = cat.trunk_versions.map(|v| !v);
+        }
+        #[cfg(test)]
+        cat.assert_facts_in_flight()?;
+        if (!cat.flight || fe_mutant("l4_child_facts_in_flight")) && !fe_mutant("l4_probe_always") {
+            cat.facts_used_in_flight += u64::from(cat.flight);
+            if cat.trunk_versions.is_none() {
+                cat.trunk_versions = Some(!cat.catalog.trunk_born_range(None, u64::MAX, 1)?.is_empty());
+            }
+            if cat.trunk_versions == Some(false) {
+                return Ok(());
+            }
+        }
         let only_f = |born: u64, died: u64| {
             lo.is_none_or(|lo| born > lo) && born <= f && f < died && hi.is_none_or(|hi| died <= hi)
         };
@@ -8955,13 +10687,23 @@ impl StoreInner {
                         page_size: page_size as u32,
                         next_id: self.next_id,
                         format: super::journal::format_version(self.splice),
+                        // A new catalog holds no lease and no held release (LEAP L4).
+                        lease_min: Some(None),
+                        held_released: Some(0),
                         ..Meta::default()
                     };
                     if let Err(e) = catalog.put_meta(&meta).and_then(|()| catalog.commit()) {
                         catalog.rollback();
                         return Err(e);
                     }
-                    self.cat = Some(CatState::new(catalog, self.sync, 0)?);
+                    let mut cat = CatState::new(catalog, self.sync, 0)?;
+                    // A catalog made now holds no trunk version (LEAP L4).
+                    cat.trunk_all_complete = !fe_mutant("l4_probe_always");
+                    self.cat = Some(cat);
+                    // A new catalog holds no name: its mirror is exact, empty, at once (LEAP L4).
+                    if self.names.catalog.is_none() && !fe_mutant("l4_probe_always") {
+                        self.names.catalog = Some(Arc::new(NameMirror::default()));
+                    }
                     // A new catalog holds no name: the filter is built, empty, at once.
                     if self.names.filter.built.is_none() && self.names.filter.pending.is_none() {
                         let mut built = HashSet::default();
@@ -9119,8 +10861,9 @@ impl StoreInner {
         let Some(cat) = self.cat.as_ref() else {
             return Ok(());
         };
-        if cat.flight {
-            // A fuzzy checkpoint is between its capture and its install; this one would overlap it.
+        if cat.flight || cat.filling {
+            // A fuzzy checkpoint is between its capture and its install, or the upgrade's link fill
+            // runs (links adversary L4); this one would overlap it.
             return Err(LimboError::Busy);
         }
         let t = Instant::now();
@@ -9130,6 +10873,8 @@ impl StoreInner {
         if fresh_arena && !fe_mutant("restart_keeps_free_table") {
             cap.fresh_arena = true;
             cap.free_cursor = None;
+            // The free table is cleared, then nothing written: empty (LEAP L4).
+            cap.free_exhausted = true;
             cap.taken.clear();
             cap.free_list.clear();
             cap.reserved.clear();
@@ -9276,6 +11021,11 @@ impl StoreInner {
         } else {
             cat.catalog.begin_read_snapshot()
         };
+        // Fire-check (test builds only) of `assert_facts_in_flight`: mutant
+        // `l4_flight_facts_planted_stale` makes a known trunk-version fact wrong for the flight.
+        if fe_mutant("l4_flight_facts_planted_stale") {
+            cat.trunk_versions = cat.trunk_versions.map(|v| !v);
+        }
         if let Err(e) = snapshot {
             if let Some((dirty, _)) = early {
                 cat.dirty = dirty;
@@ -9372,7 +11122,23 @@ impl StoreInner {
                 - reserved.len()
                 - if fe_mutant("in_use_keeps_deferred") { 0 } else { deferred.len() }) as u64,
             states: self.n_states,
-            format: super::journal::format_version(self.splice),
+            // One write path per on-disk format (DECISIONS e977c1d010, amended by 62c11ec63d): this build's
+            // version of the store's arm once the fill is complete (or the catalog already is), the flip in
+            // this checkpoint; else the store's CURRENT version, never an older one (h1gap-rev-c HIGH-2:
+            // past the hard limit the log is cut without the flip). Mutant `l4_upgrade_unbatched`: the
+            // whole fill in the checkpoint, as before the bounded fill.
+            format: {
+                let ours = super::journal::format_version(self.splice);
+                let complete = cat.links_prefilled || cat.catalog.links_valid() || !super::journal::carries_links(ours);
+                if complete || fe_mutant("l4_upgrade_unbatched") || fe_mutant("l4_flip_without_fill") {
+                    ours
+                } else {
+                    journal.format()
+                }
+            },
+            // Filled by the writer in the transaction that commits (`checkpoint_write`).
+            lease_min: None,
+            held_released: None,
         };
         if super::arena::trace_slots() {
             let named: Vec<(u64, Vec<Slot>)> = rows
@@ -9407,7 +11173,9 @@ impl StoreInner {
             trunk_new,
             trunk_gone,
             free_cursor: cat.free_cursor,
+            free_exhausted: cat.free_exhausted,
             fresh_arena: false,
+            links_prefilled: cat.links_prefilled,
             taken: cat.taken.iter().copied().collect(),
             free_list: arena.free_list().to_vec(),
             reserved,
@@ -9416,6 +11184,7 @@ impl StoreInner {
             meta,
             child_keys: self.children.map.keys().copied().collect(),
             child_removed: self.children.removed.keys().copied().collect(),
+            child_moved: self.children.moved.clone(),
             arena: arena_file,
             // Every record the catalog takes over stays as durable as it was (review B-F3).
             arena_sync: commit_class,
@@ -9430,6 +11199,8 @@ impl StoreInner {
                 self.names.gone.clone()
             },
             names_fresh: self.names.fresh.clone(),
+            mirror_base: self.names.catalog.as_ref().filter(|m| m.needs_room(self.names.fresh.len())).cloned(),
+            mirror_grown: None,
             lease_now: now,
             fail_after_commit,
             fail_write: self
@@ -9451,32 +11222,92 @@ impl StoreInner {
     /// out is dirty again and nothing else has changed.
     fn checkpoint_install(
         &mut self,
-        cap: Box<Captured>,
-        written: Result<()>,
+        mut cap: Box<Captured>,
+        written: Result<CkptFacts>,
         prepared: Option<super::journal::CutPrep>,
     ) -> Result<()> {
         let Some(cat) = self.cat.as_mut() else {
-            return written;
+            return written.map(|_| ());
         };
         let q0 = cat.catalog.counters.queries;
         cat.catalog.end_read_snapshot();
         cat.flight = false;
-        if let Err(e) = written {
-            // D-T2's mutant r13_install_err_drops_dirty: a failed write forgets the captured dirt.
-            if !mutant("r13_install_err_drops_dirty") {
-                for (id, what) in cap.dirty {
-                    *cat.dirty.entry(id).or_insert(0) |= what;
+        // A failed write may have reached the catalog or not: its trunk facts are unknown until
+        // asked again (LEAP L4 slice 3).
+        cat.trunk_child_max = None;
+        cat.trunk_versions = None;
+        let facts = match written {
+            Ok(facts) => facts,
+            Err(e) => {
+                // D-T2's mutant r13_install_err_drops_dirty: a failed write forgets the captured dirt.
+                if !mutant("r13_install_err_drops_dirty") {
+                    for (id, what) in cap.dirty {
+                        *cat.dirty.entry(id).or_insert(0) |= what;
+                    }
                 }
+                // The capture copied the names; the index still holds them, for the next checkpoint.
+                // Not retried before another threshold's worth of log (review 2 #5).
+                if let Some(journal) = self.journal.as_mut() {
+                    journal.defer_compaction();
+                }
+                return Err(e);
             }
-            // The capture copied the names; the index still holds them, for the next checkpoint.
-            // Not retried before another threshold's worth of log (review 2 #5).
-            if let Some(journal) = self.journal.as_mut() {
-                journal.defer_compaction();
-            }
-            return Err(e);
-        }
+        };
         cat.generation = cap.generation;
         cat.ckpt.count += 1;
+        // LEAP L4 slice 4: the mirror takes what the writer did to `branch_name` (its gone names
+        // deleted, then its fresh ones put). Mutant `l4_names_stale` (test builds only): the fresh
+        // names are not put (the oracle's plant).
+        // The mirror adversary's class (4): the room its fresh names need was made off the mutex by
+        // the checkpoint thread (`Captured::mirror_grown`) and is swapped in here; the copy it was
+        // made from is still held by that thread, so the old mirror is freed there, after the
+        // mutex. The capture's own reference goes first, so the mirror is changed in place.
+        #[cfg(test)]
+        let mirror_bytes0 = super::budget_probe::thread_allocs().1;
+        if let Some((from, grown)) = cap.mirror_grown.take() {
+            if self.names.catalog.as_ref().is_some_and(|m| Arc::as_ptr(m) as usize == from) {
+                self.names.catalog = match grown {
+                    Ok(grown) => Some(Arc::new(grown)),
+                    Err(Refused) => {
+                        self.names.mirror_refusals += 1;
+                        None
+                    }
+                };
+            }
+        }
+        drop(cap.mirror_base.take());
+        // Mutant `name_mirror_grown_under_mutex` (test builds only): the room is made here, under the
+        // mutex (the instrument's fire-check).
+        if fe_mutant("name_mirror_grown_under_mutex") {
+            if let Some(grown) = self.names.catalog.as_ref().and_then(|m| m.with_room(cap.names_fresh.len()).ok()) {
+                self.names.catalog = Some(Arc::new(grown));
+            }
+        }
+        if let Some(arc) = self.names.catalog.as_mut() {
+            let applied = match Arc::get_mut(arc) {
+                Some(mirror) => {
+                    for name in cap.names_gone.keys() {
+                        mirror.remove(name);
+                    }
+                    if fe_mutant("l4_names_stale") {
+                        Ok(())
+                    } else {
+                        cap.names_fresh.iter().try_for_each(|(name, id)| mirror.insert(name, *id))
+                    }
+                }
+                // Another holder of the mirror (none should exist here): drop it, the catalog answers.
+                None => Err(Refused),
+            };
+            if applied.is_err() {
+                self.names.mirror_refusals += 1;
+                self.names.catalog = None;
+            }
+        }
+        #[cfg(test)]
+        {
+            let bytes = super::budget_probe::thread_allocs().1 - mirror_bytes0;
+            self.names.mirror_install_bytes_max = self.names.mirror_install_bytes_max.max(bytes);
+        }
         // The catalog holds the captured names now: drop each entry no release or create since
         // has moved (see `NameIndex`).
         for (name, release) in &cap.names_gone {
@@ -9495,6 +11326,13 @@ impl StoreInner {
                 "a branch catalog checkpoint lost its log".to_string(),
             ));
         };
+        // ONE AUTHORITY (links adversary H1): the meta row this checkpoint committed carries the
+        // store's version (an upgrade's, in its own transaction), and the files follow it: the cut
+        // below is the first file written at it. Before the commit nothing was (a recovery's rewrite
+        // is at the version the store was opened at), so neither build sees a file ahead of its
+        // catalog. The store's catalog handle takes the recorded version too (link validity, L2).
+        journal.advance_format(cap.meta.format);
+        cat.catalog.note_recorded(cap.meta.format);
         if cap.fail_after_commit {
             journal.defer_compaction();
             journal.poison();
@@ -9534,6 +11372,7 @@ impl StoreInner {
         }
         // Children forked before the capture have rows now; links of children removed before it
         // pointed at rows that are deleted now.
+        self.children.moved.drain(..cap.child_moved.len().min(self.children.moved.len()));
         for key in &cap.child_keys {
             self.children.map.remove(key);
         }
@@ -9574,8 +11413,22 @@ impl StoreInner {
             cat.taken = arena.remove_free(&listed).into_iter().collect();
         }
         cat.free_cursor = None;
-        cat.free_exhausted = false;
-        cat.lease_floor = cat.catalog.lease_min()?;
+        // LEAP L4: a capture that read the catalog's free table to its end deleted what it read and
+        // wrote its own lists, so the table is exactly those: with none, it is empty, and the next
+        // allocation asks it nothing. Mutant `l4_free_ignores_puts` (test builds only): empty
+        // whatever was written (the oracle's plant).
+        let wrote_free = !(cap.free_list.is_empty() && cap.reserved.is_empty() && cap.deferred.is_empty());
+        cat.free_exhausted = cap.free_exhausted && (!wrote_free || fe_mutant("l4_free_ignores_puts"));
+        // LEAP L4: what the writer read of the catalog in its commit's transaction (`CkptFacts`).
+        cat.lease_floor = facts.lease_min;
+        cat.trunk_child_max = Some(facts.trunk_child_max);
+        cat.trunk_versions = Some(facts.trunk_versions);
+        // LEAP L4 (the MCTS deletes): an upgrade added the link columns, which this connection reads
+        // from now on; the links the writer set go to the resident states below.
+        if facts.upgraded {
+            cat.catalog.refresh_links()?;
+        }
+        let link_updates = facts.links;
         cat.ckpt.stmts_locked += cat.catalog.counters.queries - q0;
         self.lease.durable_at_least(cap.lease_now);
         // githost-shape instrument (observing only; r13-compose S-1): counted from the capture,
@@ -9591,6 +11444,18 @@ impl StoreInner {
         // F-W3: the catalog now holds every state that is not dirty. A state changed since the
         // capture is dirty again, so `evict_clean` keeps it (r13-compose S-2b). Only after the log
         // was cut: a failed rewrite leaves the old log, whose replay is correct, and nothing evicted.
+        // Each resident row's links as the writer set them (a row not resident is read with its
+        // links when it is loaded). Mutant `l4_stale_sibling_link` (test builds only): none
+        // applied (with the writer's own).
+        for (id, links) in link_updates {
+            if let Some(st) = self.branches.get_mut(&BranchId(id)) {
+                st.links = Some(links);
+            }
+        }
+        // Relinked keys captured here are catalog rows now, with links of their own.
+        for key in &cap.child_keys {
+            self.children.relinked.remove(key);
+        }
         if rewritten.is_ok() {
             self.evict_clean();
         }
@@ -9778,6 +11643,7 @@ impl StoreInner {
                 name: name.clone(),
                 fork_lsn: 0,
                 in_doubt: false,
+                links: None,
             },
         );
         self.note_table_growth(grown_before);
@@ -9949,8 +11815,46 @@ impl StoreInner {
                 )));
             }
             let catalog_mode = self.cat.is_some();
+            #[cfg(test)]
+            if let (Some(cat), true) = (self.cat.as_mut(), parent.is_trunk()) {
+                cat.assert_facts_in_flight()?;
+            }
+            // LEAP L4 slice 3: the trunk's newest child row in the catalog, known (asked once while
+            // unknown) whenever no checkpoint is in the air.
+            let newest = match self.cat.as_mut() {
+                Some(cat)
+                    if parent.is_trunk()
+                        && (!cat.flight || fe_mutant("l4_child_facts_in_flight"))
+                        && !fe_mutant("l4_probe_always") =>
+                {
+                    cat.facts_used_in_flight += u64::from(cat.flight);
+                    if cat.trunk_child_max.is_none() {
+                        cat.trunk_child_max = Some(cat.catalog.children_below(0, u64::MAX, 1)?.first().copied());
+                    }
+                    cat.trunk_child_max
+                }
+                _ => None,
+            };
+            // LEAP L4 (the MCTS deletes): the child's catalog neighbours, known without asking: a
+            // catalog child's from its own row's links; a child forked since the checkpoint, of a
+            // branch, from its parent's newest catalog child (every catalog child is older). A
+            // child a splice re-keyed since asks. Mutant `l4_probe_always`: never known.
+            let key = (parent.0, f);
+            let known = if fe_mutant("l4_probe_always") || !catalog_mode || self.children.relinked.contains(&key) {
+                None
+            } else if self.children.map.contains_key(&key) {
+                if parent.is_trunk() {
+                    None
+                } else {
+                    self.branches.get(&parent).and_then(|p| p.links).map(|l| (l.child_max, None))
+                }
+            } else {
+                // Mutant `l4_known_drops_hi` (test builds only): the row's upper link dropped (the
+                // nested crosscheck's plant, links adversary M1).
+                st.links.map(|l| (l.lo, if fe_mutant("l4_known_drops_hi") { None } else { l.hi }))
+            };
             let catalog = self.cat.as_mut().map(|c| &mut c.catalog);
-            let (listed, lo, hi) = self.children.remove(catalog, parent, f, catalog_mode)?;
+            let (listed, lo, hi) = self.children.remove(catalog, parent, f, catalog_mode, newest, known)?;
             crate::turso_assert!(listed, "detached a child the parent does not list");
             if parent.is_trunk() {
                 // In memory: every version (eager), or those retained since the last checkpoint
@@ -10179,7 +12083,7 @@ impl StoreInner {
             // 4. U6: the child takes the zombie's place, in the index as in the lineage.
             c.parent = zp;
             c.fork_epoch = zf;
-            children.relink(zid, cf, zp, zf, cid);
+            children.relink(zid, cf, zp, zf, cid, cat.is_some());
             if let Some(cat) = cat.as_mut() {
                 cat.dirty.remove(&zid);
                 cat.removed.insert(zid);
@@ -10218,7 +12122,13 @@ impl StoreInner {
             .filter(|(_, st)| st.handle == Handle::Released && st.open)
             .map(|(&id, _)| id)
             .collect();
-        if let Some(cat) = self.cat.as_mut() {
+        // LEAP L4: a format 19/20 meta row read at this open counted the rows released while held
+        // open; with none, the catalog is not asked (`held_released_at_open`, taken once).
+        let none_held = self
+            .cat
+            .as_mut()
+            .is_some_and(|cat| cat.held_released_at_open.take() == Some(0) && !fe_mutant("l4_lease_min_from_query"));
+        if let Some(cat) = self.cat.as_mut().filter(|_| !none_held) {
             let removed = &cat.removed;
             let rows = cat.catalog.released_ids()?;
             ids.extend(rows.into_iter().map(BranchId).filter(|id| !removed.contains(id)));
@@ -10609,6 +12519,7 @@ impl StoreInner {
                     name: b.name.as_deref().filter(|_| !b.released).map(Arc::from),
                     fork_lsn: 0,
                     in_doubt: false,
+                    links: None,
                 },
             );
             if let Some(name) = b.name.filter(|_| !b.released) {
@@ -11994,6 +13905,56 @@ mod sota_tree_tests {
 mod group_tests {
     use super::*;
 
+    /// Budget create_allocates_no_table_of_every_branch_under_the_store_mutex (64 KiB per create
+    /// under the store mutex) measured one create allocating 2,195,727 bytes as the live branches
+    /// reached 33,056 (artie raw l5-branch_b88c38329.txt): a new chunk of the branch table
+    /// (table.rs: CHUNK entries, allocated whole under the mutex). The chunk's own size must fit
+    /// the budget; the message prints the entry's size, so the fix can be sized from it.
+    #[test]
+    fn a_branch_table_chunk_fits_the_create_allocation_budget() {
+        let entry = std::mem::size_of::<Option<(BranchId, BranchState)>>();
+        let chunk = entry * super::super::table::CHUNK;
+        assert!(
+            chunk <= 64 << 10,
+            "CLAIM: a branch table chunk is {chunk} bytes ({} entries of {entry}; BranchState {}, Lineage {}, \
+             PageMap {}), over the 64 KiB a create may allocate under the store mutex",
+            super::super::table::CHUNK,
+            std::mem::size_of::<BranchState>(),
+            std::mem::size_of::<Lineage>(),
+            std::mem::size_of::<PageMap>()
+        );
+    }
+
+    /// DECISIONS ba515419c3 (found by fastest-budgets reading bb6af4d94): `offer_confirm` compared
+    /// an offered confirmation only with the one the writer HOLDS. Once the writer had taken and
+    /// written flight N's proved word, the slot was empty, so a re-offer of that same word (a
+    /// held-free upgrade's landing, `mark_upgraded`, with no flight since; a proved ordered flight
+    /// upgraded) was queued again and written a second time: one extra pwrite. Here flight N lands
+    /// proved, the writer's step is done by hand (take, write), and the upgrade re-offers N's word:
+    /// nothing is queued, and the word was written once. Mutant `reoffer_written_word`.
+    #[test]
+    fn a_reoffer_of_a_written_word_writes_it_once() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let log = || std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(dir.path().join("log")).unwrap();
+        let group = Group::new(0, Arc::new(AtomicBool::new(false)));
+        group.lock().flushing = true;
+        assert!(group.land(10, SyncClass::FullFsync, true, Some(Confirm::for_test(log(), true))), "premise: flight N landed");
+        let (_, taken) = group.lock().confirm.take().expect("premise: N's proved word is queued");
+        group.write_confirm(&taken, false);
+        drop(taken);
+        assert_eq!(group.confirms_written.load(Ordering::Relaxed), 1, "premise: N's word was written");
+        let left = group.mark_upgraded(10, SyncClass::FullFsync, Some(Confirm::for_test(log(), true)));
+        if let Some((_, again)) = group.lock().confirm.take() {
+            group.write_confirm(&again, false);
+        }
+        drop(left);
+        assert_eq!(
+            group.confirms_written.load(Ordering::Relaxed),
+            1,
+            "CLAIM: a re-offer of the word already written was queued and written again"
+        );
+    }
+
     /// Engine review 8 #9 (its FIX half): an ordered flight's landing leaves no earlier flight's
     /// confirmation queued. An ordered flight is barriered, not synced, so it has no confirmation
     /// of its own, and the log's last flight is now it: the earlier word, written into page 0 by
@@ -12090,3 +14051,34 @@ mod fail_stop_tests {
     }
 }
 
+/// Test builds (links adversary M1): every delete that took its neighbours from known links,
+/// compared with the catalog query path it replaces, on the thread that set `ON` (the nested
+/// histories of `l4_nested_tests`). Off, a delete issues no extra query, so no budget sees it.
+#[cfg(test)]
+pub(crate) mod links_crosscheck {
+    use std::cell::{Cell, RefCell};
+    std::thread_local! {
+        pub(crate) static ON: Cell<bool> = const { Cell::new(false) };
+        /// Known-path deletes checked, and those of a branch's child (not the trunk's).
+        pub(crate) static CHECKS: Cell<(u64, u64)> = const { Cell::new((0, 0)) };
+        pub(crate) static MISMATCHES: Cell<u64> = const { Cell::new(0) };
+        pub(crate) static FIRST: RefCell<Option<String>> = const { RefCell::new(None) };
+    }
+    pub(crate) fn on() -> bool {
+        ON.with(Cell::get)
+    }
+    pub(crate) fn note(p: u64, f: u64, got: (Option<u64>, Option<u64>), want: (Option<u64>, Option<u64>), row: (Option<u64>, Option<u64>)) {
+        CHECKS.with(|c| {
+            let (n, b) = c.get();
+            c.set((n + 1, b + u64::from(p != 0)));
+        });
+        if got != want {
+            MISMATCHES.with(|m| m.set(m.get() + 1));
+            FIRST.with(|first| {
+                first.borrow_mut().get_or_insert_with(|| {
+                    format!("delete of ({p}, {f}): known path {got:?}, query path {want:?}, row links {row:?}")
+                });
+            });
+        }
+    }
+}
