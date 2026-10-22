@@ -17736,6 +17736,42 @@ fn a_constant_cast_past_numeric_p_s_is_22003_with_no_row() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// The lead's ruling (LEAD-RULINGS 3abd61b6d3 (a); 5d2f9d25f's stated blind spot; numfuzz seeds 53 at e4882aaed and 603
+/// at 5d2f9d25f): a CREATE VIEW whose query has a function or operator with no candidate is 42883 as the query alone is,
+/// and the view is not created; each was created. Expected answers: PG 18.6, recorded (artie 73c95898ea,
+/// rec37-view-numeric-refusals/pg18-wirefuzz-a_view_whose_query_has_no_candidate_is_42883.out), but nv6's column type
+/// (the engine's numeric).
+#[test]
+fn a_view_whose_query_has_no_candidate_is_42883() {
+    let dir = Scratch::new("view-resolve");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let ddl = "CREATE TABLE nt (id int PRIMARY KEY, c0 numeric(38,10), c1 real, c2 double precision, c3 real)";
+    a.q(ddl).ok(ddl);
+    let mut wrong = Vec::new();
+    for (sql, message) in [
+        ("CREATE VIEW nv1 AS SELECT id, (abs((c2)::numeric(10,0)) * (c1)::text) AS v FROM nt", "operator does not exist: numeric * text"),
+        ("CREATE VIEW nv2 AS SELECT id, (c1 % ((c1)::bigint * ((-1))::float8)) AS v FROM nt", "operator does not exist: real % double precision"),
+        ("CREATE VIEW nv3 AS SELECT id, ceil((c0)::text) AS v FROM nt", "function ceil(text) does not exist"),
+        ("CREATE VIEW nv4 AS SELECT id, round(c2, 2) AS v FROM nt", "function round(double precision, integer) does not exist"),
+        ("CREATE VIEW nv5 AS SELECT id, -((c0)::text) AS v FROM nt", "operator does not exist: - text"),
+        ("CREATE VIEW nv6 AS SELECT id, ceil(c0) AS v, round(c0, 2) AS w, c0 % 3 AS x FROM nt", ""),
+        ("SELECT id FROM nv1", r#"relation "nv1" does not exist"#),
+        ("SELECT v FROM nv6", ""),
+    ] {
+        let r = a.q(sql);
+        let fine = match message {
+            "" => r.error.is_none(),
+            m if m.starts_with("relation") => r.error.as_ref().is_some_and(|e| e.code == "42P01" && e.message == m),
+            m => r.error.as_ref().is_some_and(|e| e.code == "42883" && e.message == m),
+        };
+        if !fine {
+            wrong.push(format!("{sql}: PG {message:?}; got {:?} {:?}", r.tags, r.error));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// numfuzz (seed 2116 at 5d9c4fe5e; PG 18.6's answer in its finding, artie baedf0d84d): a typed literal (NUMERIC '0.1')
 /// has no parse location, so 1d8a8b230's rewrite of one cast constant assigned to an integer column was keyed by -1 and
 /// written over every other such literal: NUMERIC '-7' into a numeric(20,5) column was stored as 0, SILENTLY. A rewrite
