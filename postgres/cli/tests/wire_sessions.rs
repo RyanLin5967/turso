@@ -18006,6 +18006,39 @@ fn a_float_cast_to_text_is_written_as_its_output_routine_writes_it() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// A FROM subquery's alias column list names its columns (the lead's item from engine, red 66bae14e5's dropped case):
+/// `(VALUES (1, 2)) AS t(x, y)` has columns x and y, and a shorter list renames the first ones. The list was dropped, so
+/// `SELECT *` answered the engine's names column1 and column2 (SILENT: a client reading by name read none), and `x`
+/// was no column. More names than columns is 42P10. EXPECTED ANSWERS NOT YET RECORDED: they follow PG 18.6's
+/// buildRelationAliases, and the scenario is banked for recording (artie rec63-values-alias-columns-PENDING).
+#[test]
+fn a_from_subquery_alias_column_list_names_its_columns() {
+    let dir = Scratch::new("subquery-alias-columns");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let mut wrong = Vec::new();
+    let some = |v: &[&str]| v.iter().map(|x| Some(x.to_string())).collect::<Vec<_>>();
+    let names = |v: &[&str]| Some(v.iter().map(|x| x.to_string()).collect::<Vec<_>>());
+    for (sql, want_names, want_rows) in [
+        ("SELECT * FROM (VALUES (1, 2)) AS t(x, y)", names(&["x", "y"]), vec![some(&["1", "2"])]),
+        ("SELECT x FROM (VALUES (1), (2)) AS t(x) ORDER BY x", names(&["x"]), vec![some(&["1"]), some(&["2"])]),
+        ("SELECT * FROM (VALUES (1, 2)) AS t(x)", names(&["x", "column2"]), vec![some(&["1", "2"])]),
+        ("SELECT * FROM (SELECT 1 AS a, 2 AS b) AS t(c)", names(&["c", "b"]), vec![some(&["1", "2"])]),
+        ("SELECT t.c FROM (SELECT 1 AS a) AS t(c)", names(&["c"]), vec![some(&["1"])]),
+    ] {
+        let r = a.q(sql);
+        if r.error.is_some() || r.names != want_names || r.rows != want_rows {
+            wrong.push(format!("{sql}: PG {want_names:?} {want_rows:?}; got {:?} {:?} {:?}", r.names, r.rows, r.error));
+        }
+    }
+    let r = a.q("SELECT * FROM (VALUES (1)) AS t(x, y)");
+    let message = r#"table "t" has 1 columns available but 2 columns specified"#;
+    if !r.error.as_ref().is_some_and(|e| e.code == "42P10" && e.message == message) {
+        wrong.push(format!("two names for one column: PG 42P10 {message:?}; got {:?} {:?}", r.rows, r.error));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// numfuzz seed 6261 at 4c7bc6102 (artie numfuzz-4c7bc6102-s6221-6420, PG 18.6's answer recorded by the fuzzer on
 /// eceubuntu2): abs of a smallint is a smallint, so abs(-32768) is 22003 'smallint out of range'; it answered 32768.
 /// The engine holds every integer as an i64, so only the declared width can refuse it.
