@@ -175,35 +175,43 @@ fn d0_syncs_nothing_on_the_branch_store_or_the_trunk() {
     }
 }
 
-/// PROBE, not for delivery: d0_syncs_nothing_on_the_branch_store_or_the_trunk's body with
-/// `io::SYNC_PROBE` armed over its counted window; prints every counted sync's thread and stack.
+/// PROBE, not for delivery: d0_syncs_nothing_on_the_branch_store_or_the_trunk's body, 20 times per
+/// catalog mode, with `io::SYNC_PROBE` armed exactly over each counted window (armed, counts read,
+/// body, counts read, disarmed); prints each window that counted or logged a sync, with every
+/// logged sync's thread and stack.
 #[test]
 fn probe_d0_which_sync() {
     let _s = serial();
+    let me = std::thread::current().name().map(str::to_string);
     for catalog in [false, true] {
-        let dir = tempfile::TempDir::new().unwrap();
-        let db = open_at(&dir.path().join("d0.db"), opts(catalog, SyncClass::Off));
-        let trunk = db.connect().unwrap();
-        seed(&trunk);
-        let first = trunk.fork_branch().unwrap();
-        *crate::io::SYNC_PROBE.lock().unwrap() = Some(Vec::new());
-        let me = std::thread::current().name().map(str::to_string);
-        let counted = syncs_of(|| {
+        for round in 0..20 {
+            let dir = tempfile::TempDir::new().unwrap();
+            let db = open_at(&dir.path().join("d0.db"), opts(catalog, SyncClass::Off));
+            let trunk = db.connect().unwrap();
+            seed(&trunk);
+            let first = trunk.fork_branch().unwrap();
+            *crate::io::SYNC_PROBE.lock().unwrap() = Some(Vec::new());
+            let before = sync_counts();
             let b = trunk.fork_branch().unwrap();
             let bc = b.connect().unwrap();
             bc.execute("UPDATE t SET v = 'mine' WHERE id = 3").unwrap();
             trunk.execute("UPDATE t SET v = 'new' WHERE id = 7").unwrap();
             drop(bc);
             drop(b);
-        });
-        let log = crate::io::SYNC_PROBE.lock().unwrap().take().unwrap_or_default();
-        let own = log.iter().filter(|l| l.contains(&format!("thread={me:?}"))).count();
-        println!("PROBE catalog={catalog} counted={counted:?} logged={} on_this_thread={own} this_thread={me:?}", log.len());
-        for l in &log {
-            println!("PROBE-SYNC {}", l.lines().take(60).collect::<Vec<_>>().join("\n    "));
+            let after = sync_counts();
+            let log = crate::io::SYNC_PROBE.lock().unwrap().take().unwrap_or_default();
+            let counted = (after.fsync - before.fsync, after.full_fsync - before.full_fsync);
+            let own = log.iter().filter(|l| l.contains(&format!("thread={me:?}"))).count();
+            if counted != (0, 0) || !log.is_empty() {
+                println!("PROBE catalog={catalog} round={round} counted={counted:?} logged={} on_this_thread={own}", log.len());
+                for l in &log {
+                    println!("PROBE-SYNC {}", l.lines().take(14).collect::<Vec<_>>().join("\n    "));
+                }
+            }
+            drop(first);
         }
-        drop(first);
     }
+    println!("PROBE done this_thread={me:?}");
 }
 
 /// D1 never issues F_FULLFSYNC (the control for the D2 tests: the counter does not read F_FULLFSYNC
