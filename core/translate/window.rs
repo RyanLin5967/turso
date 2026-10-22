@@ -103,6 +103,24 @@ pub fn plan_windows(
     // Remove named windows that are not referenced by any function, as they can be ignored.
     windows.retain(|w| !w.functions.is_empty());
 
+    // Under a dialect whose float sums are naive (`float_sum_naive`, PostgreSQL), a sum, total or
+    // avg over a frame whose start moves is recomputed over the frame for each row, as PostgreSQL
+    // does (it has no inverse transition for a float sum): a running total that subtracts each row
+    // leaving the frame is not the naive sum of the rows left (LEAD-RULINGS ef1e848258 item 3).
+    // An explicit EXCLUDE NO OTHERS selects that recomputing path and excludes nothing (see
+    // `Frame::exclude`). Mutant `window_float_sum_subtracts` (test builds only): as before.
+    if connection.float_sum_naive && !crate::branch::store::fe_mutant("window_float_sum_subtracts") {
+        for w in windows.iter_mut() {
+            let moving_start = !matches!(w.frame.start, crate::translate::plan::FrameBoundary::UnboundedPreceding);
+            let sums = w.functions.iter().any(|f| {
+                matches!(&f.func, AccumulatorFunc::Agg(AggFunc::Sum | AggFunc::Total | AggFunc::Avg))
+            });
+            if moving_start && sums && w.frame.exclude.is_none() {
+                w.frame.exclude = Some(turso_parser::ast::FrameExclude::NoOthers);
+            }
+        }
+    }
+
     if !windows.is_empty() {
         // Sanity check: this should never happen because the syntax disallows combining VALUES with windows
         turso_assert!(
