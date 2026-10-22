@@ -2166,7 +2166,7 @@ fn prepare_statement_parsed(
             [b"ceil(".as_slice(), b"ceiling(", b"floor(", b"round(", b"trunc(", b"abs(", b"sign(", b"sqrt(", b"exp(", b"ln(", b"log(", b"log10(", b"pow(", b"power("]
                 .iter()
                 .any(|w| may_name(w))
-                || [b"%".as_slice(), b"::text", b"::varchar", b"::char", b"::bpchar", b"::name", b"as text", b"as varchar", b"as char"]
+                || [b"%".as_slice(), b"::text", b"::varchar", b"::char", b"::bpchar", b"::name", b"as text", b"as varchar", b"as char", b"-'", b"- '", b"+'", b"+ '"]
                     .iter()
                     .any(|w| may_name(w))
         };
@@ -2545,7 +2545,9 @@ fn text_integer_casts(
 /// an expression of a string type (upper('x')), a negated or hexadecimal constant, a set
 /// operation's branches, a DEFAULT, and a literal to a float or boolean column (stored as the
 /// engine reads it). A constant to a numeric(p, s) column past it is 22003 'numeric field
-/// overflow', and an INSERT ... SELECT's targets are judged as VALUES items are (numfuzz seeds
+/// overflow', an INSERT ... SELECT's set operation is judged after its branches' types resolve
+/// (rec45; a plain UNION's non-integral constants are left to the engine, whose rounding would
+/// come before the UNION's duplicate removal), and an INSERT ... SELECT's targets are judged as VALUES items are (numfuzz seeds
 /// 1442, 1600 at 1d8a8b230; recorded, rec33-assign-numeric-select, artie 555adcffb6).
 /// A CREATE TABLE's and an ALTER TABLE ADD COLUMN's DEFAULTs, coerced to their columns as
 /// PostgreSQL coerces them (the lead's ruling LEAD-RULINGS 3abd61b6d3 (b); recorded,
@@ -2885,7 +2887,114 @@ fn literal_assignments(
         Some((target, typmods, text))
     };
     let mut float_rewrites: std::collections::HashMap<i32, f64> = std::collections::HashMap::new();
+    // A set operation's branch constants written as their value, applied once coerce is done.
+    let mut setop_rewrites: Vec<(i32, i64)> = Vec::new();
+    // The relation a value's column reference reads, with the names it is known by: an UPDATE's
+    // target (with no FROM), an INSERT ... SELECT's one FROM table; none for VALUES.
+    let source: Option<(std::sync::Arc<turso_core::schema::BTreeTable>, String, String)> = match stmt {
+        Node::UpdateStmt(u) if u.from_clause.is_empty() => {
+            let alias = u.relation.as_ref().and_then(|r| r.alias.as_ref()).map(|a| a.aliasname.clone()).unwrap_or_else(|| relation.relname.clone());
+            Some((table.clone(), relation.relname.clone(), alias))
+        }
+        Node::InsertStmt(i) => match i.select_stmt.as_deref().and_then(|s| s.node.as_ref()) {
+            Some(Node::SelectStmt(sel)) if sel.values_lists.is_empty() && sel.larg.is_none() => match sel.from_clause.as_slice() {
+                [only] => match only.node.as_ref() {
+                    Some(Node::RangeVar(rv)) if resolves_to_main(pg_conn, rv) => schema.get_btree_table(&rv.relname).map(|t| {
+                        let alias = rv.alias.as_ref().map(|a| a.aliasname.clone()).unwrap_or_else(|| rv.relname.clone());
+                        (t, rv.relname.clone(), alias)
+                    }),
+                    _ => None,
+                },
+                _ => None,
+            },
+            _ => None,
+        },
+        _ => None,
+    };
+    // The string type a value has when it is one PostgreSQL types as a string whatever its
+    // arguments (rec44): a text function's result, a || with a string side, a string cast, or a
+    // column of the source relation declared text, varchar or char. None for anything else,
+    // which the engine judges (an untyped literal is read as the column's input).
+    fn string_type(node: &PgNode, source: &Option<(std::sync::Arc<turso_core::schema::BTreeTable>, String, String)>) -> Option<u32> {
+        use turso_pg_parser::pg_query::protobuf::node::Node;
+        const TEXT_FUNCTIONS: &[&str] = &[
+            "upper", "lower", "concat", "concat_ws", "substr", "substring", "trim", "btrim", "ltrim", "rtrim", "replace",
+            "repeat", "lpad", "rpad", "left", "right", "md5", "to_char", "format", "initcap", "reverse", "chr", "quote_ident",
+            "quote_literal", "quote_nullable", "translate", "split_part", "regexp_replace", "to_hex",
+        ];
+        match node.node.as_ref()? {
+            Node::FuncCall(f) => {
+                let name = f.funcname.last().and_then(|n| match &n.node {
+                    Some(Node::String(s)) => Some(s.sval.as_str()),
+                    _ => None,
+                })?;
+                TEXT_FUNCTIONS.contains(&name).then_some(25)
+            }
+            Node::AExpr(e) if matches!(e.name.as_slice(), [n] if matches!(&n.node, Some(Node::String(s)) if s.sval == "||")) => {
+                let side = |x: Option<&PgNode>| {
+                    x.is_some_and(|x| matches!(x.node.as_ref(), Some(Node::AConst(c)) if matches!(c.val, Some(turso_pg_parser::pg_query::protobuf::a_const::Val::Sval(_)))) || string_type(x, source).is_some())
+                };
+                (side(e.lexpr.as_deref()) || side(e.rexpr.as_deref())).then_some(25)
+            }
+            Node::TypeCast(c) => match c.type_name.as_ref()?.names.last()?.node.as_ref()? {
+                Node::String(s) if c.type_name.as_ref()?.array_bounds.is_empty() => match s.sval.as_str() {
+                    "text" => Some(25),
+                    "varchar" => Some(1043),
+                    "bpchar" => Some(1042),
+                    "name" => Some(19),
+                    _ => None,
+                },
+                _ => None,
+            },
+            Node::ColumnRef(r) => {
+                let (table, name, alias) = source.as_ref()?;
+                let fields: Vec<&str> = r
+                    .fields
+                    .iter()
+                    .map(|f| match &f.node {
+                        Some(Node::String(s)) => Some(s.sval.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Option<Vec<_>>>()?;
+                let column = match fields.as_slice() {
+                    [c] => *c,
+                    [q, c] if q.eq_ignore_ascii_case(alias) || q.eq_ignore_ascii_case(name) => *c,
+                    _ => return None,
+                };
+                let (_, col) = table.get_column(column).filter(|(_, c)| c.array_dimensions() == 0)?;
+                let base = col.ty_str.split('(').next().unwrap_or("").trim();
+                if base.eq_ignore_ascii_case("TEXT") {
+                    Some(25)
+                } else if base.eq_ignore_ascii_case("VARCHAR") || base.eq_ignore_ascii_case("CHARACTER VARYING") {
+                    Some(1043)
+                } else if base.eq_ignore_ascii_case("BPCHAR") || base.eq_ignore_ascii_case("CHAR") {
+                    Some(1042)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
     let mut coerce = |column: &str, value: &PgNode| -> Result<(), SqlErrorMessage> {
+        // A value of a string type to a numeric or boolean column: 42804 (rec44). A bare string
+        // cast is judged below, with the domain's name.
+        if !matches!(value.node.as_ref(), Some(Node::TypeCast(_))) {
+            if let Some(from) = string_type(value, &source) {
+                let target = column_type(column).map_or(25, |ty| crate::catalog::sqlite_type_to_pg_oid(&ty) as u32);
+                if matches!(target, 16 | 20 | 21 | 23 | 700 | 701 | 1700) {
+                    let declared = table.get_column(column).map(|(_, c)| c.ty_str.as_str()).filter(|ty| domain_base(ty).is_some());
+                    return Err(SqlErrorMessage::classified(
+                        SqlErrorKind::DatatypeMismatch,
+                        format!(
+                            "column \"{column}\" is of type {} but expression is of type {}",
+                            declared.unwrap_or(crate::result_types::type_name(target)),
+                            crate::result_types::type_name(from)
+                        ),
+                    ));
+                }
+            }
+        }
         // A numeric NaN or Infinity cast into an integer column: 0A000 (rec42; numfuzz seed 2436).
         if let Some(Node::TypeCast(c)) = value.node.as_ref() {
             let bits = column_type(column).map_or(0, |t| integer_bits(&t));
@@ -2922,6 +3031,18 @@ fn literal_assignments(
                     }
                 }
                 return Ok(());
+            }
+        }
+        // Any other element type with an input routine of its own (rec46): read element by element,
+        // the column's typmod applied to each.
+        if let (Some((_, c)), Some(Node::AConst(k))) = (table.get_column(column), value.node.as_ref()) {
+            if c.array_dimensions() > 0 && k.location >= 0 {
+                if let (Some(Val::Sval(text)), Some(reader)) = (k.val.as_ref(), array_element_reader(c)) {
+                    if let Some(canonical) = array_literal(&text.sval, reader.as_ref())? {
+                        text_rewrites.insert(k.location, canonical);
+                    }
+                    return Ok(());
+                }
             }
         }
         // A constant to a numeric(p, s) column past it: 22003 'numeric field overflow'.
@@ -3107,54 +3228,36 @@ fn literal_assignments(
                     }
                 }
             }
+            // A minus over a constant cast (- 3000000000::bigint, - 2.5::numeric; rec43): the cast's
+            // value, negated, then the column's range; rewritten where the minus stands.
+            Some(Node::AExpr(e))
+                if e.lexpr.is_none()
+                    && e.location >= 0
+                    && matches!(e.name.as_slice(), [n] if matches!(&n.node, Some(Node::String(s)) if s.sval == "-")) =>
+            {
+                let bits = column_type(column).map_or(0, |t| integer_bits(&t));
+                let Some(Node::TypeCast(c)) = e.rexpr.as_deref().and_then(|r| r.node.as_ref()) else { return Ok(()) };
+                let Some((target, typmods, text)) = constant_cast(c).filter(|_| bits > 0) else { return Ok(()) };
+                let Some(value) = judge_constant_cast(target, &typmods, &text)? else { return Ok(()) };
+                let value = -value;
+                let limit = 1i128 << (bits - 1);
+                if value < -limit || value >= limit {
+                    return Err(SqlErrorMessage::classified(
+                        SqlErrorKind::NumericValueOutOfRange,
+                        format!("{} out of range", match bits {
+                            16 => "smallint",
+                            32 => "integer",
+                            _ => "bigint",
+                        }),
+                    ));
+                }
+                rewrites.insert(e.location, value as i64);
+            }
             Some(Node::TypeCast(c)) if constant_cast(c).is_some() => {
                 let bits = column_type(column).map_or(0, |t| integer_bits(&t));
                 let Some((target, typmods, text)) = constant_cast(c).filter(|_| bits > 0) else { return Ok(()) };
-                let width = |name: &str| match name {
-                    "int2" => Some((16, "smallint")),
-                    "int4" => Some((32, "integer")),
-                    "int8" => Some((64, "bigint")),
-                    _ => None,
-                };
                 let out_of_range = |name: &str| SqlErrorMessage::classified(SqlErrorKind::NumericValueOutOfRange, format!("{name} out of range"));
-                // The cast's own value first, as the planner folds the inner cast first.
-                let value = if target == "numeric" {
-                    // A bare numeric keeps every digit, so only a typmod rounds before the column.
-                    let scale = match typmods.as_slice() {
-                        [_, scale] => *scale,
-                        _ => 0,
-                    };
-                    if let Some(precision) = typmods.first() {
-                        if crate::functions::numeric_overflows(&text, *precision, scale) == Some(true) {
-                            return Err(SqlErrorMessage::classified(SqlErrorKind::NumericValueOutOfRange, "numeric field overflow"));
-                        }
-                    }
-                    let rounded = if typmods.is_empty() {
-                        crate::functions::round_decimal(&text)
-                    } else {
-                        crate::functions::round_decimal_at(&text, scale)
-                    };
-                    match rounded {
-                        Some(v) => v,
-                        None => return Ok(()),
-                    }
-                } else {
-                    let Some((cast_bits, cast_name)) = width(target) else { return Ok(()) };
-                    if let Some((message, kind)) = crate::functions::validate_pg_input(&text, cast_name) {
-                        return Err(SqlErrorMessage::classified(kind, message));
-                    }
-                    let Some(v) = (match crate::functions::pg_strtoint(&text, 64) {
-                        crate::functions::PgInt::Value(v) => Some(i128::from(v)),
-                        _ => crate::functions::round_decimal(&text),
-                    }) else {
-                        return Ok(());
-                    };
-                    let limit = 1i128 << (cast_bits - 1);
-                    if v < -limit || v >= limit {
-                        return Err(out_of_range(cast_name));
-                    }
-                    v
-                };
+                let Some(value) = judge_constant_cast(target, &typmods, &text)? else { return Ok(()) };
                 let limit = 1i128 << (bits - 1);
                 if value < -limit || value >= limit {
                     return Err(out_of_range(match bits {
@@ -3232,6 +3335,131 @@ fn literal_assignments(
                         }
                     }
                 }
+                // A set operation (rec45): each output column's branches resolve to one type first,
+                // as select_common_type resolves them, then that type is assigned to the column.
+                if select.larg.is_some() {
+                    use turso_pg_parser::pg_query::protobuf::{SelectStmt, SetOperation};
+                    fn leaves<'a>(s: &'a SelectStmt, out: &mut Vec<&'a SelectStmt>, union_only: &mut bool, union_all: &mut bool) {
+                        match (s.larg.as_deref(), s.rarg.as_deref()) {
+                            (Some(l), Some(r)) => {
+                                if s.op() != SetOperation::SetopUnion {
+                                    *union_only = false;
+                                }
+                                if !s.all {
+                                    *union_all = false;
+                                }
+                                leaves(l, out, union_only, union_all);
+                                leaves(r, out, union_only, union_all);
+                            }
+                            _ => out.push(s),
+                        }
+                    }
+                    let (mut branches, mut union_only, mut union_all) = (Vec::new(), true, true);
+                    leaves(select, &mut branches, &mut union_only, &mut union_all);
+                    union_all &= union_only;
+                    // Every branch row is produced: no FROM, no WHERE, no VALUES.
+                    let constant = branches.iter().all(|b| b.from_clause.is_empty() && b.where_clause.is_none() && b.values_lists.is_empty());
+                    let width = branches.first().map_or(0, |b| b.target_list.len());
+                    for k in 0..width {
+                        let Some(column) = column_at(k) else { continue };
+                        let values: Option<Vec<&PgNode>> = branches
+                            .iter()
+                            .map(|b| match b.target_list.get(k)?.node.as_ref() {
+                                Some(Node::ResTarget(r)) => r.val.as_deref(),
+                                _ => None,
+                            })
+                            .collect();
+                        let Some(values) = values else { continue };
+                        // (untyped texts, string types, integer constants (value, is int8, location, text), decimals)
+                        let (mut untyped, mut strings, mut numbers, mut other) = (Vec::new(), Vec::new(), Vec::new(), false);
+                        let mut decimal = false;
+                        let mut int8 = false;
+                        for v in &values {
+                            match v.node.as_ref() {
+                                Some(Node::AConst(c)) if !c.isnull => match c.val.as_ref() {
+                                    Some(Val::Sval(t)) => untyped.push(t.sval.as_str()),
+                                    Some(Val::Ival(i)) => numbers.push((Some(i128::from(i.ival)), c.location, i.ival.to_string())),
+                                    Some(Val::Fval(f)) => {
+                                        let whole = crate::functions::round_decimal(&f.fval).filter(|v| v.to_string() == f.fval);
+                                        match whole {
+                                            Some(_) => int8 = true,
+                                            None => decimal = true,
+                                        }
+                                        numbers.push((crate::functions::round_decimal(&f.fval), c.location, f.fval.clone()));
+                                    }
+                                    _ => other = true,
+                                },
+                                Some(Node::AConst(_)) => {}
+                                _ => match string_type(v, &None) {
+                                    Some(t) => strings.push(t),
+                                    None => other = true,
+                                },
+                            }
+                        }
+                        if other {
+                            continue;
+                        }
+                        let target = column_type(column).map_or(25, |ty| crate::catalog::sqlite_type_to_pg_oid(&ty) as u32);
+                        let numeric_target = matches!(target, 16 | 20 | 21 | 23 | 700 | 701 | 1700);
+                        if numbers.is_empty() {
+                            // All strings: text, or the one string type every typed branch has.
+                            let common = match strings.first() {
+                                Some(first) if strings.iter().all(|t| t == first) => *first,
+                                Some(_) => 25,
+                                None => 25,
+                            };
+                            if numeric_target && (!untyped.is_empty() || !strings.is_empty()) {
+                                return Err(SqlErrorMessage::classified(
+                                    SqlErrorKind::DatatypeMismatch,
+                                    format!(
+                                        "column \"{column}\" is of type {} but expression is of type {}",
+                                        crate::result_types::type_name(target),
+                                        crate::result_types::type_name(common)
+                                    ),
+                                ));
+                            }
+                            continue;
+                        }
+                        if !strings.is_empty() {
+                            continue;
+                        }
+                        // Untyped branches take the numbers' type, read by its input routine.
+                        let common_name = if decimal { "numeric" } else if int8 { "bigint" } else { "integer" };
+                        for t in &untyped {
+                            let refused = if decimal {
+                                turso_pg_parser::pg_input::pg_numeric_in(t).is_none().then(|| (format!("invalid input syntax for type numeric: \"{t}\""), SqlErrorKind::InvalidTextRepresentation))
+                            } else {
+                                crate::functions::validate_pg_input(t, common_name)
+                            };
+                            if let Some((message, kind)) = refused {
+                                return Err(SqlErrorMessage::classified(kind, message));
+                            }
+                        }
+                        let bits = column_type(column).map_or(0, |t| integer_bits(&t));
+                        if bits == 0 || !union_only || !constant {
+                            continue;
+                        }
+                        let limit = 1i128 << (bits - 1);
+                        for (value, location, text) in &numbers {
+                            let Some(value) = value else { continue };
+                            if *value < -limit || *value >= limit {
+                                return Err(SqlErrorMessage::classified(
+                                    SqlErrorKind::NumericValueOutOfRange,
+                                    format!("{} out of range", match bits {
+                                        16 => "smallint",
+                                        32 => "integer",
+                                        _ => "bigint",
+                                    }),
+                                ));
+                            }
+                            // UNION ALL keeps every row, so a rounded value is the same rows; UNION
+                            // removes duplicates before the column's rounding, so it is left alone.
+                            if union_all && *location >= 0 && *text != value.to_string() {
+                                setop_rewrites.push((*location, *value as i64));
+                            }
+                        }
+                    }
+                }
             }
             if let Some(conflict) = i.on_conflict_clause.as_ref() {
                 set_list(&conflict.target_list, &mut coerce)?;
@@ -3241,7 +3469,156 @@ fn literal_assignments(
         _ => {}
     }
     drop(coerce);
+    rewrites.extend(setop_rewrites);
     Ok((rewrites, text_rewrites, float_rewrites))
+}
+
+/// A constant cast's own value, as the planner folds it before an integer column's assignment
+/// (rec32, rec43): a cast to numeric(p, s) checked against its modifiers (22003 'numeric field
+/// overflow') and rounded half away from zero to its scale, a bare numeric keeping every digit; a
+/// cast to an integer type read by its input routine or rounded, and range-checked (22003). None
+/// for a spelling it does not read, which the caller leaves alone.
+fn judge_constant_cast(target: &str, typmods: &[i32], text: &str) -> std::result::Result<Option<i128>, SqlErrorMessage> {
+    let width = |name: &str| match name {
+        "int2" => Some((16, "smallint")),
+        "int4" => Some((32, "integer")),
+        "int8" => Some((64, "bigint")),
+        _ => None,
+    };
+    let out_of_range = |name: &str| SqlErrorMessage::classified(SqlErrorKind::NumericValueOutOfRange, format!("{name} out of range"));
+    if target == "numeric" {
+        let scale = match typmods {
+            [_, scale] => *scale,
+            _ => 0,
+        };
+        if let Some(precision) = typmods.first() {
+            if crate::functions::numeric_overflows(text, *precision, scale) == Some(true) {
+                return Err(SqlErrorMessage::classified(SqlErrorKind::NumericValueOutOfRange, "numeric field overflow"));
+            }
+        }
+        return Ok(if typmods.is_empty() { crate::functions::round_decimal(text) } else { crate::functions::round_decimal_at(text, scale) });
+    }
+    let Some((cast_bits, cast_name)) = width(target) else { return Ok(None) };
+    if let Some((message, kind)) = crate::functions::validate_pg_input(text, cast_name) {
+        return Err(SqlErrorMessage::classified(kind, message));
+    }
+    let Some(v) = (match crate::functions::pg_strtoint(text, 64) {
+        crate::functions::PgInt::Value(v) => Some(i128::from(v)),
+        _ => crate::functions::round_decimal(text),
+    }) else {
+        return Ok(None);
+    };
+    let limit = 1i128 << (cast_bits - 1);
+    if v < -limit || v >= limit {
+        return Err(out_of_range(cast_name));
+    }
+    Ok(Some(v))
+}
+
+/// A numeric element's text rounded half away from zero to `scale` places, written with exactly
+/// that many (numeric_in under a typmod: 1.005 at scale 2 is 1.01, 2.5 is 2.50); None past 38 digits.
+fn numeric_at_scale(plain: &str, scale: i32) -> Option<String> {
+    let scaled = crate::functions::round_decimal(&format!("{plain}e{scale}")).filter(|v| v.abs() != i128::MAX)?;
+    if scale <= 0 {
+        return Some(scaled.to_string());
+    }
+    let unit = 10i128.pow(scale as u32);
+    let sign = if scaled < 0 { "-" } else { "" };
+    let (q, r) = (scaled.abs() / unit, scaled.abs() % unit);
+    Some(format!("{sign}{q}.{r:0width$}", width = scale as usize))
+}
+
+/// An array element written as array_out writes it: quoted when empty, when it spells NULL, or
+/// when it holds a blank, a brace, a comma, a quote or a backslash.
+fn array_element_out(value: &str, out: &mut String) {
+    let quote = value.is_empty()
+        || value.eq_ignore_ascii_case("NULL")
+        || value.bytes().any(|c| matches!(c, b'{' | b'}' | b',' | b'"' | b'\\' | b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c));
+    if !quote {
+        out.push_str(value);
+        return;
+    }
+    out.push('"');
+    for c in value.chars() {
+        if c == '"' || c == '\\' {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push('"');
+}
+
+/// The element reader of a float8, float4, numeric(p, s), boolean or varchar(n) array column, as
+/// array_in calls each element's input routine with the column's typmod (rec46); None for an
+/// element type read elsewhere or not at all.
+fn array_element_reader(c: &turso_core::schema::Column) -> Option<Box<dyn Fn(&str, &mut String) -> Result<(), SqlErrorMessage>>> {
+    use turso_parser::ast::{Expr, Literal};
+    let params: Vec<i32> = c
+        .ty_params
+        .iter()
+        .map(|e| match &**e {
+            Expr::Literal(Literal::Numeric(n)) => n.parse().ok(),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let ty = c.ty_str.trim().to_ascii_uppercase();
+    match ty.as_str() {
+        "DOUBLE PRECISION" | "FLOAT8" | "DOUBLE" | "REAL" | "FLOAT4" => {
+            let float4 = matches!(ty.as_str(), "REAL" | "FLOAT4");
+            let name = if float4 { "real" } else { "double precision" };
+            Some(Box::new(move |raw: &str, out: &mut String| match turso_pg_parser::pg_input::pg_float_in(raw, float4) {
+                Ok(_) => {
+                    out.push_str(raw.trim());
+                    Ok(())
+                }
+                Err(true) => Err(SqlErrorMessage::classified(SqlErrorKind::NumericValueOutOfRange, format!("\"{raw}\" is out of range for type {name}"))),
+                Err(false) => Err(SqlErrorMessage::classified(SqlErrorKind::InvalidTextRepresentation, format!("invalid input syntax for type {name}: \"{raw}\""))),
+            }))
+        }
+        "NUMERIC" | "DECIMAL" => {
+            let typmod = match params.as_slice() {
+                [] => None,
+                [p] => Some((*p, 0)),
+                [p, s] => Some((*p, *s)),
+                _ => return None,
+            };
+            Some(Box::new(move |raw: &str, out: &mut String| {
+                let Some(plain) = turso_pg_parser::pg_input::pg_numeric_in(raw) else {
+                    return Err(SqlErrorMessage::classified(SqlErrorKind::InvalidTextRepresentation, format!("invalid input syntax for type numeric: \"{raw}\"")));
+                };
+                let Some((precision, scale)) = typmod else {
+                    out.push_str(&plain);
+                    return Ok(());
+                };
+                if crate::functions::numeric_overflows(&plain, precision, scale) == Some(true) {
+                    return Err(SqlErrorMessage::classified(SqlErrorKind::NumericValueOutOfRange, "numeric field overflow"));
+                }
+                out.push_str(&numeric_at_scale(&plain, scale).unwrap_or(plain));
+                Ok(())
+            }))
+        }
+        "BOOLEAN" | "BOOL" => Some(Box::new(|raw: &str, out: &mut String| match turso_pg_parser::pg_input::pg_boolin(raw) {
+            Some(v) => {
+                out.push(if v { 't' } else { 'f' });
+                Ok(())
+            }
+            None => Err(SqlErrorMessage::classified(SqlErrorKind::InvalidTextRepresentation, format!("invalid input syntax for type boolean: \"{raw}\""))),
+        })),
+        "VARCHAR" | "CHARACTER VARYING" => {
+            let [limit] = params.as_slice() else { return None };
+            let limit = usize::try_from(*limit).ok()?;
+            Some(Box::new(move |raw: &str, out: &mut String| {
+                // varchar_input under a typmod: excess spaces are cut, anything else past it is 22001.
+                let kept: String = raw.chars().take(limit).collect();
+                if raw.chars().skip(limit).any(|c| c != ' ') {
+                    return Err(SqlErrorMessage::classified(SqlErrorKind::StringDataRightTruncation, format!("value too long for type character varying({limit})")));
+                }
+                array_element_out(&kept, out);
+                Ok(())
+            }))
+        }
+        _ => None,
+    }
 }
 
 /// An integer array literal read as array_in reads it, each element by int2in/int4in/int8in
@@ -3250,6 +3627,24 @@ fn literal_assignments(
 /// {1,31,1000}; recorded, rec41-array-domain-assign); Ok(None) when unchanged, or when it is not a
 /// literal this reads (dimension decorations, unbalanced braces), which the engine judges.
 fn integer_array_literal(text: &str, name: &str) -> Result<Option<String>, SqlErrorMessage> {
+    array_literal(text, &|raw: &str, out: &mut String| {
+        if let Some((message, kind)) = crate::functions::validate_pg_input(raw, name) {
+            return Err(SqlErrorMessage::classified(kind, message));
+        }
+        match crate::functions::pg_strtoint(raw, 64) {
+            crate::functions::PgInt::Value(v) => out.push_str(&v.to_string()),
+            _ => out.push_str(raw),
+        }
+        Ok(())
+    })
+}
+
+/// An array literal read as array_in reads it, each element (unquoted, never NULL) handed to
+/// `element`, which writes its canonical text or refuses it as the element type's input routine
+/// does: Ok(Some) with the literal's canonical text when an element is spelled otherwise, Ok(None)
+/// when unchanged, or when it is not a literal this reads (dimension decorations, unbalanced
+/// braces, a backslash or a non-ASCII unquoted element), which the engine judges.
+fn array_literal(text: &str, element: &dyn Fn(&str, &mut String) -> Result<(), SqlErrorMessage>) -> Result<Option<String>, SqlErrorMessage> {
     let b = text.as_bytes();
     let blank = |c: u8| matches!(c, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c);
     let mut out = String::with_capacity(text.len());
@@ -3260,16 +3655,6 @@ fn integer_array_literal(text: &str, name: &str) -> Result<Option<String>, SqlEr
     if b.get(i) != Some(&b'{') {
         return Ok(None);
     }
-    let element = |raw: &str, out: &mut String| -> Result<(), SqlErrorMessage> {
-        if let Some((message, kind)) = crate::functions::validate_pg_input(raw, name) {
-            return Err(SqlErrorMessage::classified(kind, message));
-        }
-        match crate::functions::pg_strtoint(raw, 64) {
-            crate::functions::PgInt::Value(v) => out.push_str(&v.to_string()),
-            _ => out.push_str(raw),
-        }
-        Ok(())
-    };
     while i < b.len() {
         match b[i] {
             c if blank(c) => i += 1,

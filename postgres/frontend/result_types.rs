@@ -2940,6 +2940,11 @@ impl Infer<'_> {
                     },
                     (Some(a), None) if param(e.rexpr.as_deref()) => Some(a),
                     (None, Some(b)) if param(e.lexpr.as_deref()) => Some(b),
+                    // A prefix minus or plus over an untyped literal leaves every candidate: 42725
+                    // 'operator is not unique: - unknown' (recorded, rec43-negated-hex-assign).
+                    (_, _) if e.lexpr.is_none() && matches!(op, Some("-" | "+")) && untyped(e.rexpr.as_deref()) => {
+                        self.refusal(SqlErrorKind::AmbiguousFunction, format!("operator is not unique: {} unknown", op.unwrap_or("")))
+                    }
                     // A prefix minus or plus has no candidate over a string type: 42883 'operator
                     // does not exist: - text' (numfuzz seed 288 at 6e17acc9a: answered).
                     (None, Some(b)) if e.lexpr.is_none() && matches!(op, Some("-" | "+")) && matches!(category(b), Some(('S', _))) => {

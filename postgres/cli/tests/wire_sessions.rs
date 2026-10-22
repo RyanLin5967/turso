@@ -17906,6 +17906,271 @@ fn a_float_numeric_or_boolean_column_reads_its_literal_as_its_input_routine_does
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// The lead's ruling (LEAD-RULINGS 9d87841628, 4): an array literal assigned to a float, real, numeric(p,s), boolean or
+/// varchar(n) array column is read element by element by the element type's input routine: out-of-range and
+/// malformed elements are refused with the element routine's code (22003, 22P02, 22001), even when no row matches,
+/// numeric elements are rounded to the column's scale, and a varchar element's excess spaces are cut. Expected
+/// answers: PG 18.6, recorded (artie 4a4b465a38,
+/// rec46-array-assign/pg18-wirefuzz-an_array_of_non_integer_elements_is_read_by_its_element_input_routine.out).
+#[test]
+fn an_array_of_non_integer_elements_is_read_by_its_element_input_routine() {
+    let dir = Scratch::new("array-element-assign");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let ddl = "CREATE TABLE na (id int PRIMARY KEY, f float8[], r real[], n numeric(5,2)[], b boolean[], t text[], v varchar(3)[])";
+    a.q(ddl).ok(ddl);
+    let mut wrong = Vec::new();
+    for (sql, code, message) in [
+        ("INSERT INTO na (id, f) VALUES (1, '{1.5,2e308}')", "22003", r#""2e308" is out of range for type double precision"#),
+        ("INSERT INTO na (id, f) VALUES (1, '{1.5,abc}')", "22P02", r#"invalid input syntax for type double precision: "abc""#),
+        ("INSERT INTO na (id, f) VALUES (1, '{1.5,NaN,-Infinity}')", "", ""),
+        ("INSERT INTO na (id, r) VALUES (2, '{1e39}')", "22003", r#""1e39" is out of range for type real"#),
+        ("INSERT INTO na (id, r) VALUES (2, '{0.1,1e-50}')", "22003", r#""1e-50" is out of range for type real"#),
+        ("INSERT INTO na (id, n) VALUES (3, '{1.005,999.995}')", "22003", "numeric field overflow"),
+        ("INSERT INTO na (id, n) VALUES (3, '{1.005,2.5}')", "", ""),
+        ("INSERT INTO na (id, b) VALUES (4, '{t,maybe}')", "22P02", r#"invalid input syntax for type boolean: "maybe""#),
+        ("INSERT INTO na (id, b) VALUES (4, '{yes,off,NULL}')", "", ""),
+        ("INSERT INTO na (id, v) VALUES (5, '{abcd}')", "22001", "value too long for type character varying(3)"),
+        ("INSERT INTO na (id, v) VALUES (5, '{\"ab \",\"abc   \"}')", "", ""),
+        ("INSERT INTO na (id, t) VALUES (6, '{a,\"b,c\",NULL}')", "", ""),
+        ("INSERT INTO na (id, f) VALUES (7, ARRAY[1.5, 2])", "", ""),
+        ("INSERT INTO na (id, n) VALUES (8, ARRAY[1.005, 2])", "", ""),
+        ("UPDATE na SET n = '{1234.5}' WHERE id = 1000", "22003", "numeric field overflow"),
+        ("UPDATE na SET b = '{x}' WHERE id = 1000", "22P02", r#"invalid input syntax for type boolean: "x""#),
+    ] {
+        let r = a.q(sql);
+        let fine = if code.is_empty() {
+            r.error.is_none()
+        } else {
+            r.error.as_ref().is_some_and(|e| e.code == code && e.message == message)
+        };
+        if !fine {
+            wrong.push(format!("{sql}: PG {code:?} {message:?}; got {:?} {:?}", r.tags, r.error));
+        }
+    }
+    let rows = |rows: &[&[&str]]| -> Vec<Vec<Option<String>>> {
+        rows.iter().map(|row| row.iter().map(|v| (!v.is_empty()).then(|| v.to_string())).collect()).collect()
+    };
+    for (sql, want) in [
+        (
+            "SELECT id, f, r, n, b, t, v FROM na ORDER BY id",
+            rows(&[
+                &["1", "{1.5,NaN,-Infinity}", "", "", "", "", ""],
+                &["3", "", "", "{1.01,2.50}", "", "", ""],
+                &["4", "", "", "", "{t,f,NULL}", "", ""],
+                &["5", "", "", "", "", "", "{\"ab \",abc}"],
+                &["6", "", "", "", "", "{a,\"b,c\",NULL}", ""],
+                &["7", "{1.5,2}", "", "", "", "", ""],
+                &["8", "", "", "{1.01,2.00}", "", "", ""],
+            ]),
+        ),
+        (
+            "SELECT n[1], n[2], r[2], f[2] FROM na WHERE id IN (1, 2, 3) ORDER BY id",
+            rows(&[&["", "", "", "NaN"], &["1.01", "2.50", "", ""]]),
+        ),
+    ] {
+        let r = a.q(sql);
+        if r.error.is_some() || r.rows != want {
+            wrong.push(format!("{sql}: PG {want:?}; got {:?} {:?}", r.rows, r.error));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// The lead's ruling (LEAD-RULINGS 9d87841628, 3): an INSERT ... SELECT whose query is a set operation is coerced to
+/// its columns after the branches' types resolve together: untyped literals in every branch resolve to text (42804),
+/// a string-typed branch makes the column text, and a constant past the column in a UNION of constant branches is
+/// 22003, while a non-integral one rounds. Expected answers: PG 18.6, recorded (artie afc7757a41,
+/// rec45-setop-assign/pg18-wirefuzz-a_set_operation_assigned_to_a_column_is_coerced_after_its_branches_resolve.out).
+#[test]
+fn a_set_operation_assigned_to_a_column_is_coerced_after_its_branches_resolve() {
+    let dir = Scratch::new("setop-assign");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let ddl = "CREATE TABLE so (id int PRIMARY KEY, b int, s smallint, t text)";
+    a.q(ddl).ok(ddl);
+    let text = r#"column "b" is of type integer but expression is of type text"#;
+    let mut wrong = Vec::new();
+    for (sql, code, message) in [
+        ("INSERT INTO so (id, b) SELECT 1, '5' UNION SELECT 2, '6'", "42804", text),
+        ("INSERT INTO so (id, b) SELECT 1, 5 UNION ALL SELECT 2, 3000000000", "22003", "integer out of range"),
+        ("INSERT INTO so (id, s) SELECT 1, 40000 UNION SELECT 2, 1", "22003", "smallint out of range"),
+        ("INSERT INTO so (id, b) SELECT 3, 2.5 UNION ALL SELECT 4, 3.5", "", ""),
+        ("INSERT INTO so (id, b) SELECT 5, 'x' INTERSECT SELECT 5, 'x'", "42804", text),
+        ("INSERT INTO so (id, b) SELECT 6, 7 EXCEPT SELECT 8, 9", "", ""),
+        ("INSERT INTO so (id, b) SELECT 7, upper('x') UNION SELECT 8, 'y'", "42804", text),
+        ("INSERT INTO so (id, t) SELECT 9, 1 UNION SELECT 10, 2", "", ""),
+        ("INSERT INTO so (id, b) SELECT 11, '0x1F'::int UNION SELECT 12, 1", "", ""),
+    ] {
+        let r = a.q(sql);
+        let fine = if code.is_empty() {
+            r.error.is_none()
+        } else {
+            r.error.as_ref().is_some_and(|e| e.code == code && e.message == message)
+        };
+        if !fine {
+            wrong.push(format!("{sql}: PG {code:?} {message:?}; got {:?} {:?}", r.tags, r.error));
+        }
+    }
+    let r = a.q("SELECT id, b, s, t FROM so ORDER BY id");
+    let want: Vec<Vec<Option<String>>> = [
+        ["3", "3", "", ""],
+        ["4", "4", "", ""],
+        ["6", "7", "", ""],
+        ["9", "", "", "1"],
+        ["10", "", "", "2"],
+        ["11", "31", "", ""],
+        ["12", "1", "", ""],
+    ]
+    .iter()
+    .map(|row| row.iter().map(|v| (!v.is_empty()).then(|| v.to_string())).collect())
+    .collect();
+    if r.error.is_some() || r.rows != want {
+        wrong.push(format!("SELECT: PG {want:?}; got {:?} {:?}", r.rows, r.error));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// The lead's ruling (LEAD-RULINGS 9d87841628, 2): a value of a string type assigned to a numeric or boolean column (a
+/// text function's result, a || of strings, a text or varchar column) is 42804, even when no row matches; each was
+/// stored or answered. Expected answers: PG 18.6, recorded (artie e139983801,
+/// rec44-string-expression-assign/pg18-wirefuzz-a_string_expression_assigned_to_a_numeric_or_boolean_column_is_42804.out).
+#[test]
+fn a_string_expression_assigned_to_a_numeric_or_boolean_column_is_42804() {
+    let dir = Scratch::new("string-expression-assign");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in [
+        "CREATE TABLE se (id int PRIMARY KEY, b int, n numeric(6,2), f double precision, t boolean, s text, v varchar(5))",
+        "INSERT INTO se (id, s, v) VALUES (1, '5', '6')",
+    ] {
+        a.q(sql).ok(sql);
+    }
+    let m = |col: &str, ty: &str, from: &str| format!(r#"column "{col}" is of type {ty} but expression is of type {from}"#);
+    let mut wrong = Vec::new();
+    for (sql, message) in [
+        ("INSERT INTO se (id, b) VALUES (2, upper('x'))", m("b", "integer", "text")),
+        ("INSERT INTO se (id, b) VALUES (2, 'a' || 'b')", m("b", "integer", "text")),
+        ("INSERT INTO se (id, b) VALUES (2, lower('5'))", m("b", "integer", "text")),
+        ("INSERT INTO se (id, b) VALUES (2, concat(1, 2))", m("b", "integer", "text")),
+        ("INSERT INTO se (id, b) VALUES (2, substr('123', 1, 2))", m("b", "integer", "text")),
+        ("INSERT INTO se (id, b) VALUES (2, length('abc'))", String::new()),
+        ("INSERT INTO se (id, n) VALUES (3, md5('a'))", m("n", "numeric", "text")),
+        ("INSERT INTO se (id, t) VALUES (3, upper('t'))", m("t", "boolean", "text")),
+        ("INSERT INTO se (id, f) VALUES (3, 'x'::varchar || 'y')", m("f", "double precision", "text")),
+        ("INSERT INTO se (id, b) VALUES (3, to_char(5, '9'))", m("b", "integer", "text")),
+        ("UPDATE se SET b = s WHERE id = 1000", m("b", "integer", "text")),
+        ("UPDATE se SET b = v WHERE id = 1000", m("b", "integer", "character varying")),
+        ("UPDATE se SET b = se.s WHERE id = 1000", m("b", "integer", "text")),
+        ("INSERT INTO se (id, b) SELECT 4, s FROM se", m("b", "integer", "text")),
+        ("INSERT INTO se (id, b) VALUES (5, trim(' 7 '))", m("b", "integer", "text")),
+        ("INSERT INTO se (id, s) VALUES (6, upper('x'))", String::new()),
+    ] {
+        let r = a.q(sql);
+        let fine = if message.is_empty() {
+            r.error.is_none()
+        } else {
+            r.error.as_ref().is_some_and(|e| e.code == "42804" && e.message == message)
+        };
+        if !fine {
+            wrong.push(format!("{sql}: PG {message:?}; got {:?} {:?}", r.tags, r.error));
+        }
+    }
+    let r = a.q("SELECT id, b, s FROM se ORDER BY id");
+    let want: Vec<Vec<Option<String>>> = [["1", "", "5"], ["2", "3", ""], ["6", "", "X"]]
+        .iter()
+        .map(|row| row.iter().map(|v| (!v.is_empty()).then(|| v.to_string())).collect())
+        .collect();
+    if r.error.is_some() || r.rows != want {
+        wrong.push(format!("SELECT: PG {want:?}; got {:?} {:?}", r.rows, r.error));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// The lead's ruling (LEAD-RULINGS 9d87841628, 1): a hexadecimal, octal or binary constant and a negated cast constant
+/// assigned to an integer column are range-checked and rounded as any constant is, even when no row matches, and a
+/// prefix minus over an untyped literal is 42725. Expected answers: PG 18.6, recorded (artie a85d2e2a20,
+/// rec43-negated-hex-assign/pg18-wirefuzz-a_negated_or_hexadecimal_constant_assigned_to_an_integer_column_is_range_checked.out).
+#[test]
+fn a_negated_or_hexadecimal_constant_assigned_to_an_integer_column_is_range_checked() {
+    let dir = Scratch::new("negated-hex-assign");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let ddl = "CREATE TABLE nh (id int PRIMARY KEY, a smallint, b int, c bigint)";
+    a.q(ddl).ok(ddl);
+    let mut wrong = Vec::new();
+    for (sql, code, message) in [
+        ("INSERT INTO nh (id, b) VALUES (1, 0x80000000)", "22003", "integer out of range"),
+        ("INSERT INTO nh (id, c) VALUES (1, 0xFFFFFFFFFFFFFFFF)", "22003", "bigint out of range"),
+        ("INSERT INTO nh (id, a) VALUES (1, 0x8000)", "22003", "smallint out of range"),
+        ("INSERT INTO nh (id, b) VALUES (1, -0x80000000)", "", ""),
+        ("INSERT INTO nh (id, c) VALUES (2, 0x7FFFFFFFFFFFFFFF)", "", ""),
+        ("INSERT INTO nh (id, b) VALUES (3, 0b1111111111111111111111111111111)", "", ""),
+        ("INSERT INTO nh (id, b) VALUES (4, 0o20000000000)", "22003", "integer out of range"),
+        ("INSERT INTO nh (id, b) VALUES (4, - 3000000000::bigint)", "22003", "integer out of range"),
+        ("INSERT INTO nh (id, b) VALUES (4, - 2.5::numeric)", "", ""),
+        ("INSERT INTO nh (id, a) VALUES (5, -(40000))", "22003", "smallint out of range"),
+        ("INSERT INTO nh (id, b) VALUES (5, - '5')", "42725", "operator is not unique: - unknown"),
+        ("INSERT INTO nh (id, b) VALUES (6, 0x_FF)", "", ""),
+        ("UPDATE nh SET b = - 3000000000::bigint WHERE id = 1000", "22003", "integer out of range"),
+        ("UPDATE nh SET c = 0x10000000000000000 WHERE id = 1000", "22003", "bigint out of range"),
+    ] {
+        let r = a.q(sql);
+        let fine = if code.is_empty() {
+            r.error.is_none()
+        } else {
+            r.error.as_ref().is_some_and(|e| e.code == code && e.message == message)
+        };
+        if !fine {
+            wrong.push(format!("{sql}: PG {code:?} {message:?}; got {:?} {:?}", r.tags, r.error));
+        }
+    }
+    let r = a.q("SELECT id, a, b, c FROM nh ORDER BY id");
+    let want: Vec<Vec<Option<String>>> = [
+        ["1", "", "-2147483648", ""],
+        ["2", "", "", "9223372036854775807"],
+        ["3", "", "2147483647", ""],
+        ["4", "", "-3", ""],
+        ["6", "", "255", ""],
+    ]
+    .iter()
+    .map(|row| row.iter().map(|v| (!v.is_empty()).then(|| v.to_string())).collect())
+    .collect();
+    if r.error.is_some() || r.rows != want {
+        wrong.push(format!("SELECT: PG {want:?}; got {:?} {:?}", r.rows, r.error));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// The lead's ruling (LEAD-RULINGS 9d87841628), the condition on dd348f3dd: 'NaN' into a double precision or real column
+/// (PostgreSQL stores NaN; the engine's REAL stores none) is refused loudly, never stored as NULL, 0 or a number, on
+/// every assignment path, and an existing row keeps its value.
+#[test]
+fn nan_into_a_float_column_is_refused_never_stored_otherwise() {
+    let dir = Scratch::new("nan-refused");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in ["CREATE TABLE fn (id int PRIMARY KEY, d double precision, r real)", "INSERT INTO fn VALUES (1, 1.5, 2.5)"] {
+        a.q(sql).ok(sql);
+    }
+    for sql in [
+        "INSERT INTO fn (id, d) VALUES (2, 'NaN')",
+        "INSERT INTO fn (id, r) VALUES (3, ' nan ')",
+        "INSERT INTO fn (id, d) SELECT 4, 'NaN'",
+        "UPDATE fn SET d = 'NaN' WHERE id = 1",
+        "INSERT INTO fn (id, d) VALUES (1, 0) ON CONFLICT (id) DO UPDATE SET d = 'NaN'",
+    ] {
+        let r = a.q(sql);
+        assert!(r.error.is_some(), "{sql} was not refused: {:?}", r.tags);
+    }
+    let r = a.q("SELECT id, d, r FROM fn ORDER BY id");
+    assert_eq!(
+        r.rows,
+        vec![vec![Some("1".to_string()), Some("1.5".to_string()), Some("2.5".to_string())]],
+        "a NaN assignment left a row or changed one"
+    );
+}
+
 /// The lead's ruling (LEAD-RULINGS 0fac7e134e), the condition on 8f49aa6f1: ALTER COLUMN SET DEFAULT, which this server
 /// does not implement, is refused loudly, 0A000, and changes nothing: the column keeps its default (none) and an
 /// INSERT omitting it stores NULL.
