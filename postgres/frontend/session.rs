@@ -2680,7 +2680,9 @@ fn literal_assignments(
                         return Err(SqlErrorMessage::classified(SqlErrorKind::NumericValueOutOfRange, format!("{name} out of range")));
                     }
                     if text.is_some_and(|t| *t != value.to_string()) {
-                        rewrites.insert(c.location, value as i64);
+                        if c.location >= 0 {
+                            rewrites.insert(c.location, value as i64);
+                        }
                     }
                 }
                 if let Some(Val::Sval(text)) = c.val.as_ref() {
@@ -2689,7 +2691,9 @@ fn literal_assignments(
                     }
                     if let crate::functions::PgInt::Value(v) = crate::functions::pg_strtoint(&text.sval, 64) {
                         if v.to_string() != text.sval {
-                            rewrites.insert(c.location, v);
+                            if c.location >= 0 {
+                                rewrites.insert(c.location, v);
+                            }
                         }
                     }
                 }
@@ -2750,7 +2754,12 @@ fn literal_assignments(
                         _ => "bigint",
                     }));
                 }
-                rewrites.insert(c.location, value as i64);
+                // A typed literal (NUMERIC '0.1') has no location of its own: keyed by its
+                // constant's, never by -1, which every other typed literal shares (numfuzz seed 2116
+                // at 5d9c4fe5e: NUMERIC '-7' beside it was stored as 0).
+                if let Some(key) = turso_pg_parser::translator::cast_rewrite_key(c) {
+                    rewrites.insert(key, value as i64);
+                }
             }
             Some(Node::TypeCast(c)) => {
                 if let Some(from) = string_cast(c) {

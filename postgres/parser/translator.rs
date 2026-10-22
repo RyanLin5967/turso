@@ -300,6 +300,19 @@ struct LateralScope {
     merged: bool,
 }
 
+/// The key a cast's rewrite ([`PostgreSQLTranslator::with_integer_literals`]) stands under: the
+/// cast's own parse location, or, for a typed literal (NUMERIC '0.1'), which has none (-1, shared by
+/// every typed literal), its constant's; None when neither is known.
+pub fn cast_rewrite_key(cast: &pg_query::protobuf::TypeCast) -> Option<i32> {
+    if cast.location >= 0 {
+        return Some(cast.location);
+    }
+    match cast.arg.as_deref().and_then(|a| a.node.as_ref()) {
+        Some(pg_query::protobuf::node::Node::AConst(c)) if c.location >= 0 => Some(c.location),
+        _ => None,
+    }
+}
+
 impl PostgreSQLTranslator {
     pub fn new() -> Self {
         Self::default()
@@ -343,6 +356,7 @@ impl PostgreSQLTranslator {
         self
     }
 
+    /// Keyed by parse location ([`cast_rewrite_key`] for a cast), never a negative one.
     pub fn with_integer_literals(mut self, values: std::collections::HashMap<i32, i64>) -> Self {
         self.integer_literals = Some(values);
         self
@@ -3764,7 +3778,7 @@ impl PostgreSQLTranslator {
             Some(pg_query::protobuf::node::Node::TypeCast(type_cast)) => {
                 // A cast of a constant the caller read as an integer column's assignment reads it
                 // ([`PostgreSQLTranslator::with_integer_literals`]): its value ('2.5'::numeric is 3).
-                if let Some(v) = self.integer_literals.as_ref().and_then(|m| m.get(&type_cast.location)) {
+                if let Some(v) = cast_rewrite_key(type_cast).and_then(|key| self.integer_literals.as_ref()?.get(&key)) {
                     return Ok(ast::Expr::Literal(sql_string(&v.to_string())));
                 }
                 // An explicit cast to varchar(n) cuts its value to n characters, as PostgreSQL's
