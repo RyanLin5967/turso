@@ -2914,6 +2914,10 @@ impl Infer<'_> {
                         self.integer_abs.borrow_mut().insert(call.location, t);
                         Some(t)
                     }
+                    // sign has a float8 and a numeric candidate, so an integer or a float4 resolves
+                    // to the float8 one, as ceil does; abs has integer candidates and keeps the type
+                    // (the engine's RESUME item 15, recorded uw-pg18-int_math_float-rec15).
+                    ("sign", INT2 | INT4 | INT8 | FLOAT4) => Some(FLOAT8),
                     ("min" | "max" | "abs" | "sign", t) => Some(t),
                     ("ceil" | "ceiling" | "floor" | "round" | "trunc", t @ (NUMERIC | FLOAT8)) => {
                         Some(t)
