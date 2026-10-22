@@ -1580,13 +1580,19 @@ fn ls_fill_live_child() {
     db.branch_wait_name_filter();
     let trunk = db.connect().unwrap();
     let (mut cuts, mut last, mut grown, mut grown_creates) = (0u64, log_present(&path), 0u64, 0u64);
+    // Observing (the cycle-excess diagnostic): per full cycle (cut to cut), its creates, the log just before
+    // the cut and the tail just after.
+    let (mut cycles, mut since): (Vec<(u64, u64, u64)>, u64) = (Vec::new(), 0);
     let mut creates = 0u64;
     // Until the fill completes (cuts after it need no fill) or 60,000 creates.
     while creates < 60_000 && !db.branches.links_fill_state_for_test().1 {
         let _ = trunk.fork_branch().unwrap().into_id();
         creates += 1;
         let now = log_present(&path);
+        since += 1;
         if now < last {
+            cycles.push((since, last, now));
+            since = 0;
             cuts += 1;
         } else {
             grown += now - last;
@@ -1603,6 +1609,25 @@ fn ls_fill_live_child() {
     println!(
         "LS-LIVE-CYCLE flight_creates={} grown={grown} grown_creates={grown_creates} cuts={cuts} creates={creates}",
         super::store::FLIGHT_CREATES.load(Ordering::Acquire) - fc0
+    );
+    // Full cycles only: the first (from the open) and the run's tail are partial.
+    let full: Vec<&(u64, u64, u64)> = cycles.iter().skip(1).collect();
+    let mut n: Vec<u64> = full.iter().map(|c| c.0).collect();
+    n.sort_unstable();
+    let mut peak: Vec<u64> = full.iter().map(|c| c.1).collect();
+    peak.sort_unstable();
+    let mut tail: Vec<u64> = full.iter().map(|c| c.2).collect();
+    tail.sort_unstable();
+    let med = |v: &Vec<u64>| v.get(v.len() / 2).copied().unwrap_or(0);
+    println!(
+        "LS-LIVE-CYCLE2 full={} creates_med={} creates_min={} creates_max={} peak_med={} tail_med={} first={:?}",
+        full.len(),
+        med(&n),
+        n.first().copied().unwrap_or(0),
+        n.last().copied().unwrap_or(0),
+        med(&peak),
+        med(&tail),
+        cycles.first()
     );
     // Completed, the flip and the links: the flip's checkpoint, then the independent oracle (FLAGGED stricter: a
     // fill that completes early must still leave every row's links right).
@@ -1634,7 +1659,7 @@ fn under_sustained_creates_the_fill_completes() {
         let r = readings(&text, "LS-LIVE ");
         assert_eq!(r.len(), 1, "premise: the child reported:\n{text}");
         let (creates, cuts, starts, empty, batches, prefilled, per_create) = (r[0][0], r[0][1], r[0][2], r[0][3], r[0][4], r[0][5], r[0][6]);
-        for l in text.lines().filter(|l| l.contains("LS-LIVE-CYCLE ")) {
+        for l in text.lines().filter(|l| l.contains("LS-LIVE-CYCLE")) {
             println!("{l}");
         }
         let k = (2 * (4u64 << 10)) / per_create.max(1);
