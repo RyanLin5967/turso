@@ -1055,9 +1055,10 @@ const VIEW_RED_ZONE: usize = 100 * 1024;
 const VIEW_STACK: usize = 1024 * 1024;
 
 /// The parameter number of a bare `$n`.
-/// Whether `c` casts to int2, int4 or int8 an operand other than a constant, a column, a parameter
-/// or a cast of a constant: the operands the translator does not already round
-/// ([`Walked::integer_casts`]).
+/// Whether `c` casts to int2, int4 or int8 an operand other than a constant, a column or a
+/// parameter: the operands the translator does not already round ([`Walked::integer_casts`]). A
+/// cast of a constant's cast is one (' 2.50 '::numeric::int truncated to 2 for PG's 3; numfuzz
+/// seed 6789): only a constant cast straight to an integer is read by its own path.
 pub fn integer_cast_of_compound(c: &turso_pg_parser::pg_query::protobuf::TypeCast, arg: &PgNode) -> bool {
     let integer = c.type_name.as_ref().filter(|t| t.array_bounds.is_empty()).and_then(|t| t.names.last()).is_some_and(|n| {
         matches!(&n.node, Some(Node::String(s)) if matches!(s.sval.as_str(), "int2" | "int4" | "int8"))
@@ -1065,7 +1066,6 @@ pub fn integer_cast_of_compound(c: &turso_pg_parser::pg_query::protobuf::TypeCas
     integer
         && match arg.node.as_ref() {
             Some(Node::AConst(_) | Node::ColumnRef(_) | Node::ParamRef(_)) => false,
-            Some(Node::TypeCast(inner)) => !matches!(inner.arg.as_deref().and_then(|a| a.node.as_ref()), Some(Node::AConst(_))),
             Some(_) => true,
             None => false,
         }

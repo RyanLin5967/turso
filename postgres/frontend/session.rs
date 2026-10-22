@@ -2462,6 +2462,49 @@ type LiteralAssignments = (
     std::collections::HashMap<i32, (i32, i32)>,
 );
 
+/// The integer value of a constant expression PostgreSQL's planner folds: integer literals, a
+/// decimal literal cast to an integer (rounded half away from zero, as numeric's cast rounds it),
+/// integer or numeric casts of those, unary minus and + - *, in i128. None for anything else,
+/// including a decimal that is not cast to an integer, a division, or an i128 overflow.
+fn fold_integer(node: &turso_pg_parser::pg_query::protobuf::Node) -> Option<i128> {
+    use turso_pg_parser::pg_query::protobuf::{a_const::Val, node::Node};
+    match node.node.as_ref()? {
+        Node::AConst(c) if !c.isnull => match c.val.as_ref()? {
+            Val::Ival(i) => Some(i128::from(i.ival)),
+            Val::Fval(f) => f.fval.parse::<i128>().ok(),
+            _ => None,
+        },
+        Node::TypeCast(c) => {
+            let target = c.type_name.as_ref().filter(|t| t.array_bounds.is_empty() && t.typmods.is_empty())?.names.last()?;
+            let integer = matches!(&target.node, Some(Node::String(s)) if matches!(s.sval.as_str(), "int2" | "int4" | "int8"));
+            let numeric = matches!(&target.node, Some(Node::String(s)) if s.sval == "numeric");
+            let arg = c.arg.as_deref()?;
+            match arg.node.as_ref()? {
+                Node::AConst(k) if integer => match k.val.as_ref()? {
+                    Val::Fval(f) => crate::functions::round_decimal(&f.fval),
+                    _ => fold_integer(arg),
+                },
+                _ if integer || numeric => fold_integer(arg),
+                _ => None,
+            }
+        }
+        Node::AExpr(e) => {
+            let op = e.name.iter().find_map(|n| match &n.node {
+                Some(Node::String(s)) => Some(s.sval.as_str()),
+                _ => None,
+            })?;
+            match (e.lexpr.as_deref(), op) {
+                (None, "-") => fold_integer(e.rexpr.as_deref()?)?.checked_neg(),
+                (Some(l), "+") => fold_integer(l)?.checked_add(fold_integer(e.rexpr.as_deref()?)?),
+                (Some(l), "-") => fold_integer(l)?.checked_sub(fold_integer(e.rexpr.as_deref()?)?),
+                (Some(l), "*") => fold_integer(l)?.checked_mul(fold_integer(e.rexpr.as_deref()?)?),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 /// The location of an assigned value that is an expression: an operator, a function call, a cast
 /// of a non-constant or a column. None for a constant, a constant's cast or a parameter, which are
 /// judged where they are read.
@@ -3105,6 +3148,27 @@ fn literal_assignments(
         if let Some(bits) = column_type(column).map(|t| integer_bits(&t)).filter(|b| *b > 0) {
             if let Some(assignment) = integer_assignment(value, bits, &source) {
                 int_assignments.insert(assignment.0, (bits, assignment.1));
+            }
+        }
+        // A constant expression past the column is refused here, even when no row matches, as
+        // PostgreSQL folds it before any row is read (rec57; numfuzz seeds 6673, 6700: UPDATE 0).
+        if !matches!(value.node.as_ref(), Some(Node::AConst(_))) {
+            if let Some(v) = fold_integer(value) {
+                if let Some(bits) = column_type(column).map(|t| integer_bits(&t)).filter(|b| *b > 0) {
+                    let limit = 1i128 << (bits - 1);
+                    if v < -limit || v >= limit {
+                        return Err(SqlErrorMessage::classified(SqlErrorKind::NumericValueOutOfRange, format!("{} out of range", match bits {
+                            16 => "smallint",
+                            32 => "integer",
+                            _ => "bigint",
+                        })));
+                    }
+                }
+                if let Some((precision, scale)) = numeric_column(column) {
+                    if crate::functions::numeric_overflows(&v.to_string(), precision, scale) == Some(true) {
+                        return Err(SqlErrorMessage::classified(SqlErrorKind::NumericValueOutOfRange, "numeric field overflow"));
+                    }
+                }
             }
         }
         // ... and to a numeric(p, s) column, checked and rounded to its modifiers (rec54, numfuzz
