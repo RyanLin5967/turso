@@ -249,9 +249,10 @@ pub struct PostgreSQLTranslator {
     /// knows is declared text ([`PostgreSQLTranslator::with_text_integer_casts`]): read as int4in
     /// reads text, where a numeric(p, s) column's decimal text rounds.
     text_integer_casts: Option<std::collections::HashSet<i32>>,
-    /// The string literals (by their parse locations) the caller read as an integer column's input
-    /// reads them ([`PostgreSQLTranslator::with_integer_literals`]): written as the value's decimal
-    /// text, which the engine's integer column takes ('0x1F' is 31, '1_000' is 1000).
+    /// The string and numeric literals (by their parse locations) the caller read as an integer
+    /// column's assignment reads them ([`PostgreSQLTranslator::with_integer_literals`]): written as
+    /// the value's decimal text, which the engine's integer column takes ('0x1F' is 31, '1_000' is
+    /// 1000, 1.5 is 2).
     integer_literals: Option<std::collections::HashMap<i32, i64>>,
     /// The cast targets this translation met that are neither built-in nor known, lowercased, for
     /// the caller to look up ([`PostgreSQLTranslator::unmapped_cast_types`]). A cast to a domain
@@ -4505,9 +4506,12 @@ impl PostgreSQLTranslator {
                     // (sanitize_string strips them during bytecode emission): sql_string.
                     Ok(ast::Expr::Literal(sql_string(&s.sval)))
                 }
-                pg_query::protobuf::a_const::Val::Fval(f) => Ok(ast::Expr::Literal(
-                    ast::Literal::Numeric(decimal_numeric_literal(&f.fval)),
-                )),
+                pg_query::protobuf::a_const::Val::Fval(f) => {
+                    if let Some(v) = self.integer_literals.as_ref().and_then(|m| m.get(&a_const.location)) {
+                        return Ok(ast::Expr::Literal(sql_string(&v.to_string())));
+                    }
+                    Ok(ast::Expr::Literal(ast::Literal::Numeric(decimal_numeric_literal(&f.fval))))
+                }
                 pg_query::protobuf::a_const::Val::Boolval(b) => {
                     // SQLite uses 0/1 for booleans
                     Ok(ast::Expr::Literal(ast::Literal::Numeric(

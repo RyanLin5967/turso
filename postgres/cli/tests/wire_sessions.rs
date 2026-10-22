@@ -13447,8 +13447,6 @@ replays_postgresql!(
         (13, "PGDIV-INT-RANGE error-step [engine]: i * 2 is 22003 integer out of range as PG; PG sends the RowDescription (23) first, ours refuses before it"),
         (14, "PGDIV-INT-RANGE error-text [engine]: '2147483648'::int4 is 22003 as PG, saying 'integer out of range'; PG 'value \"2147483648\" is out of range for type integer'"),
         (16, "PGDIV-INT-RANGE error-text [engine]: CAST(9.5e18 AS BIGINT) is 22003 as PG, saying 'integer out of range'; PG 'bigint out of range'"),
-        (18, "PGDIV-INT-RANGE value [engine]: SILENT: INSERT of 2147483648 into an INT column succeeds; PG 22003 integer out of range"),
-        (19, "PGDIV-INT-RANGE cascade [engine]: sum(i) 4294967296 vs 2147483648 because #18 stored the out-of-range row (cascade of #18)"),
         (20, "PGDIV-SUM-INT8-NUMERIC value [engine]: sum(bigint) past int8: ours 22003 'integer overflow'; PG sum(int8) is numeric and answers 9223372036854775808 typed 1700"),
     ]
 );
