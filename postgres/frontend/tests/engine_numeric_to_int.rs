@@ -1,8 +1,8 @@
 //! fastest-engine red (RESUME item 13, fastest-wire numfuzz seed 2159; SILENT): under the
 //! PostgreSQL dialect a numeric cast to an integer rounds half away from zero, as PostgreSQL 18.6
 //! does (recorded on iccad11, artie raw uw-pg18-numeric_to_int-rec14-iccad11.txt): ' 2.50 '::int
-//! is 3, -2.5 is -3, 0.5 is 1, -0.5 is -1, for int2, int4 and int8, in a constant, a column, and an
-//! INSERT ... SELECT into an integer column; a rounded value past the width is 22003. Seed 2159's
+//! is 3, -2.5 is -3, 0.5 is 1, -0.5 is -1, for int2, int4 and int8, in a constant and over a
+//! column. Seed 2159's
 //! `((trunc(566.309) * (' 2.50 '::numeric)::int))::int` is 1698. The engine truncates (SQLite's
 //! CAST), so seed 2159 answered 1132.
 //!
@@ -45,8 +45,6 @@ fn a_numeric_cast_to_an_integer_rounds_half_away_from_zero_under_the_postgresql_
     for sql in [
         "CREATE TABLE n (id int PRIMARY KEY, v numeric(10,2))",
         "INSERT INTO n VALUES (1, 2.50), (2, -2.50), (3, 7.49), (4, 7.50)",
-        "CREATE TABLE i (id int PRIMARY KEY, x int)",
-        "INSERT INTO i SELECT id, v FROM n",
     ] {
         if let Err(e) = c.execute(sql) {
             wrong.push(format!("setup {sql}: {e}"));
@@ -66,7 +64,6 @@ fn a_numeric_cast_to_an_integer_rounds_half_away_from_zero_under_the_postgresql_
             "SELECT id, v::int, v::int2, v::int8 FROM n ORDER BY id",
             vec![row(&["1", "3", "3", "3"]), row(&["2", "-3", "-3", "-3"]), row(&["3", "7", "7", "7"]), row(&["4", "8", "8", "8"])],
         ),
-        ("SELECT id, x FROM i ORDER BY id", vec![row(&["1", "3"]), row(&["2", "-3"]), row(&["3", "7"]), row(&["4", "8"])]),
     ];
     for (sql, want) in cases {
         match rows(&c, sql) {
@@ -74,14 +71,50 @@ fn a_numeric_cast_to_an_integer_rounds_half_away_from_zero_under_the_postgresql_
             other => wrong.push(format!("{sql}: {other:?}, PostgreSQL {want:?}")),
         }
     }
-    // PostgreSQL 18.6: 22003 (smallint / integer out of range) once rounded past the width.
+    assert!(wrong.is_empty(), "CLAIM: numeric to integer rounds half away from zero: {wrong:#?}");
+}
+
+/// The int2 and int4 widths (the int4/int2 class, which waits on the numeric DESIGN's adversary):
+/// PostgreSQL 18.6 refuses a numeric that rounds past the width with 22003 (recorded). The engine
+/// casts to its one 64-bit integer, so no width is checked.
+#[test]
+fn a_numeric_rounded_past_int2_or_int4_is_22003_under_the_postgresql_dialect() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let c = conn(dir.path());
+    let mut wrong = Vec::new();
     for sql in ["SELECT ('32767.5'::numeric)::int2", "SELECT ('2147483647.5'::numeric)::int"] {
         match rows(&c, sql) {
             Err(e) if e.contains("out of range") || e.contains("integer overflow") => {}
             other => wrong.push(format!("{sql}: {other:?}, PostgreSQL 22003 out of range")),
         }
     }
-    assert!(wrong.is_empty(), "CLAIM: numeric to integer rounds half away from zero: {wrong:#?}");
+    assert!(wrong.is_empty(), "CLAIM: a numeric rounded past the integer width is 22003: {wrong:#?}");
+}
+
+/// An assignment, not a cast: PostgreSQL 18.6 stores a numeric into an integer column rounded
+/// (recorded: 3, -3, 7, 8). The engine refuses it LOUDLY ("cannot store REAL value in INTEGER
+/// column"), a refusal where PostgreSQL answers; INSERT ... SELECT's assignment coercion.
+#[test]
+fn an_insert_select_rounds_a_numeric_into_an_integer_column_under_the_postgresql_dialect() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let c = conn(dir.path());
+    let mut wrong = Vec::new();
+    for sql in [
+        "CREATE TABLE n (id int PRIMARY KEY, v numeric(10,2))",
+        "INSERT INTO n VALUES (1, 2.50), (2, -2.50), (3, 7.49), (4, 7.50)",
+        "CREATE TABLE i (id int PRIMARY KEY, x int)",
+        "INSERT INTO i SELECT id, v FROM n",
+    ] {
+        if let Err(e) = c.execute(sql) {
+            wrong.push(format!("{sql}: {e}"));
+        }
+    }
+    let want = vec![row(&["1", "3"]), row(&["2", "-3"]), row(&["3", "7"]), row(&["4", "8"])];
+    match rows(&c, "SELECT id, x FROM i ORDER BY id") {
+        Ok(got) if got == want => {}
+        other => wrong.push(format!("SELECT id, x FROM i: {other:?}, PostgreSQL {want:?}")),
+    }
+    assert!(wrong.is_empty(), "CLAIM: INSERT ... SELECT rounds a numeric into an integer column: {wrong:#?}");
 }
 
 #[test]
