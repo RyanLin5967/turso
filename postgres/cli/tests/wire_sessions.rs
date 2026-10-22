@@ -18976,6 +18976,38 @@ fn a_default_is_coerced_to_its_column_as_postgresql_coerces_it() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// (b1), attached tables (LEAD-RULINGS 0fac7e134e; unblocked by the engine's resident_btree_table, item 14): an assignment
+/// to a table of another schema (an attached database) is judged as one to a main table, qualified or through the search
+/// path. literal_assignments judged main's tables alone, so 40000 into s.t's smallint was stored silently. Expected
+/// answers: the recorded main-table answers (rec29-constant-assign, artie c9722422e1: 40000 into a smallint is 22003, 2.5
+/// is stored 3), which PostgreSQL applies whatever the schema; this schema shape is not separately recorded.
+#[test]
+fn an_assignment_to_another_schemas_table_is_judged_as_to_a_main_table() {
+    let dir = Scratch::new("attached-assign");
+    // The branch server refuses CREATE SCHEMA, so the schema is made through the CLI first.
+    cli_script(&dir, b"CREATE SCHEMA s;\nCREATE TABLE s.t (id int PRIMARY KEY, sm smallint);\n");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let mut wrong = Vec::new();
+    for sql in ["INSERT INTO s.t (id, sm) VALUES (1, 40000)", "UPDATE s.t SET sm = 40000 WHERE id = 1"] {
+        let r = a.q(sql);
+        if !r.error.as_ref().is_some_and(|e| e.code == "22003" && e.message == "smallint out of range") {
+            wrong.push(format!("{sql}: PG 22003 \"smallint out of range\"; got {:?} {:?}", r.tags, r.error));
+        }
+    }
+    a.q("INSERT INTO s.t (id, sm) VALUES (3, 2.5)").ok("2.5");
+    a.q("SET search_path = s, public").ok("set");
+    let r = a.q("INSERT INTO t (id, sm) VALUES (4, 40000)");
+    if !r.error.as_ref().is_some_and(|e| e.code == "22003" && e.message == "smallint out of range") {
+        wrong.push(format!("unqualified t under search_path s: PG 22003 \"smallint out of range\"; got {:?} {:?}", r.tags, r.error));
+    }
+    let r = a.q("SELECT id, sm FROM s.t ORDER BY id");
+    if r.error.is_some() || r.rows != vec![vec![Some("3".to_string()), Some("3".to_string())]] {
+        wrong.push(format!("s.t: PG [[3, 3]]; got {:?} {:?}", r.rows, r.error));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// The lead's ruling (LEAD-RULINGS 3abd61b6d3 (b)), literal_assignments' table: an assignment is judged against the
 /// table the name resolves to, the search path's: with search_path s, public, 'x' into t.b is s.t's text column and is
 /// stored, where literal_assignments judged public.t's int column and refused it 22P02. Expected answers: PG 18.6,
