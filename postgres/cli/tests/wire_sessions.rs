@@ -13266,11 +13266,6 @@ replays_postgresql!(
         (19, "PGDIV-NEG-ZERO value [engine]: SILENT: SELECT -0.0 answers '-0' typed 701; PG numeric '0.0'"),
         (20, "PGDIV-NEG-ZERO value [engine]: SILENT: SELECT -0.0::float8 answers '0'; PG '-0' (cast binds before unary minus)"),
         (22, "PGDIV-NEG-ZERO value [engine]: SILENT: '-0'::numeric answers '-0' typed 701; PG '0' typed 1700"),
-        (25, "PGDIV-REAL-RANGE value [engine]: SILENT: insert 1e39 into a real column succeeds (stored as Infinity); PG 22003 out of range for type real"),
-        (26, "PGDIV-REAL-RANGE value [engine]: SILENT: insert '1e39' into real succeeds (Infinity); PG 22003"),
-        (27, "PGDIV-REAL-RANGE value [engine]: SILENT: insert -1e39 into real succeeds (-Infinity); PG 22003"),
-        (28, "PGDIV-REAL-RANGE value [engine]: SILENT: insert 1e-50 into real succeeds (stored 0); PG 22003 underflow"),
-        (29, "PGDIV-REAL-RANGE cascade [engine]: select * from rr returns Infinity, Infinity, -Infinity, 0 where PG has 0 rows (cascade of #25-#28)"),
         (30, "PGDIV-REAL-RANGE value [engine]: SILENT: CAST(1e39 AS real) answers 'Infinity'; PG 22003"),
         (31, "PGDIV-REAL-RANGE value [engine]: SILENT: 1e39::real answers 'Infinity'; PG 22003"),
     ]
@@ -13294,8 +13289,6 @@ replays_postgresql!(
     pg18_float_replays_as_postgresql_answered,
     "pg18-float.out",
     [
-        (21, "PGDIV-REAL-RANGE value [engine]: SILENT: INSERT of 1.7976931348623157e308 into a real column succeeds (stored Infinity); PG 22003 out of range for type real"),
-        (22, "PGDIV-REAL-RANGE value [engine]: SILENT: INSERT of 5e-324 into a real column succeeds (stored 0); PG 22003 out of range for type real"),
         (27, "PGDIV-NEG-ZERO value [engine]: SILENT: row 25 (-0.0 numeric literal) reads '-0','-0' where PG stores '0','0'; extra rows 20 and 21 are a cascade of #21/#22"),
     ]
 );
