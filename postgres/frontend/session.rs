@@ -2400,10 +2400,17 @@ fn walk_statement(
 /// with the operand's type, to round as PostgreSQL's cast does
 /// ([`crate::result_types::Walked::integer_casts`]); the real and float8 values written as text,
 /// to write as float4out or float8out does ([`crate::result_types::Walked::float_texts`]); the %
-/// over a numeric, to compute PostgreSQL's remainder ([`crate::result_types::Walked::numeric_mods`]).
+/// over a numeric, to compute PostgreSQL's remainder ([`crate::result_types::Walked::numeric_mods`]);
+/// each abs() of a smallint or an integer, to refuse the type's smallest value
+/// ([`crate::result_types::Walked::integer_abs`]).
 /// Read from the parse and the schema alone, so the engine's re-prepare translates alike; the walk
-/// runs only for a statement holding such a cast, a cast to a string type, a || or a %.
-type CastWalk = (std::collections::HashMap<i32, u32>, std::collections::HashMap<i32, u32>, std::collections::HashSet<i32>);
+/// runs only for a statement holding such a cast, a cast to a string type, a ||, a % or an abs().
+type CastWalk = (
+    std::collections::HashMap<i32, u32>,
+    std::collections::HashMap<i32, u32>,
+    std::collections::HashSet<i32>,
+    std::collections::HashMap<i32, u32>,
+);
 fn cast_walk(pg_conn: &PgConnectionInner, parse: &turso_pg_parser::pg_query::ParseResult) -> std::result::Result<CastWalk, SqlErrorMessage> {
     use turso_pg_parser::pg_query::{protobuf::node::Node, NodeRef};
     let string_target = |c: &turso_pg_parser::pg_query::protobuf::TypeCast| {
@@ -2414,6 +2421,7 @@ fn cast_walk(pg_conn: &PgConnectionInner, parse: &turso_pg_parser::pg_query::Par
     let any = parse.protobuf.nodes().iter().any(|(n, ..)| match n {
         NodeRef::TypeCast(c) => string_target(c) || c.arg.as_deref().is_some_and(|arg| crate::result_types::integer_cast_of_compound(c, arg)),
         NodeRef::AExpr(e) => e.name.iter().any(|n| matches!(&n.node, Some(Node::String(s)) if s.sval == "||" || s.sval == "%")),
+        NodeRef::FuncCall(f) => f.funcname.last().is_some_and(|n| matches!(&n.node, Some(Node::String(s)) if s.sval == "abs")),
         _ => false,
     });
     if !any {
@@ -2421,7 +2429,12 @@ fn cast_walk(pg_conn: &PgConnectionInner, parse: &turso_pg_parser::pg_query::Par
     }
     let schema = pg_conn.conn.current_schema();
     let walked = walk_statement(pg_conn, &schema, parse)?;
-    Ok((walked.integer_casts.into_iter().collect(), walked.float_texts.into_iter().collect(), walked.numeric_mods.into_iter().collect()))
+    Ok((
+        walked.integer_casts.into_iter().collect(),
+        walked.float_texts.into_iter().collect(),
+        walked.numeric_mods.into_iter().collect(),
+        walked.integer_abs.into_iter().collect(),
+    ))
 }
 
 /// THE translation of a statement, for the session's prepare and for the engine's re-prepare of it
@@ -2478,7 +2491,7 @@ pub(crate) fn session_translation(
     let text_casts = text_integer_casts(pg_conn, sql, parse_result);
     // Each cast to an integer type of a compound numeric or float expression rounds as its type's
     // cast does (PGDIV-INT-CAST-TRUNCATES; numfuzz seed 3504): the engine's CAST truncates.
-    let (rounding, float_texts, numeric_mods) = cast_walk(pg_conn, parse_result).map_err(LimboError::InvalidArgument)?;
+    let (rounding, float_texts, numeric_mods, integer_abs) = cast_walk(pg_conn, parse_result).map_err(LimboError::InvalidArgument)?;
     // Each value assigned to a column is coerced as parse analysis coerces it, here so the
     // re-prepare judges it alike; a literal an integer column reads is written as its value.
     let (integer_literals, text_literals, float_literals, int_assignments, numeric_assignments) = literal_assignments(pg_conn, parse_result).map_err(LimboError::InvalidArgument)?;
@@ -2493,6 +2506,7 @@ pub(crate) fn session_translation(
         let t = if rounding.is_empty() { t } else { t.with_integer_cast_rounding(rounding.clone()) };
         let t = if float_texts.is_empty() { t } else { t.with_float_texts(float_texts.clone()) };
         let t = if numeric_mods.is_empty() { t } else { t.with_numeric_mods(numeric_mods.clone()) };
+        let t = if integer_abs.is_empty() { t } else { t.with_integer_abs(integer_abs.clone()) };
         let t = if int_assignments.is_empty() { t } else { t.with_integer_assignments(int_assignments.clone()) };
         let t = if numeric_assignments.is_empty() { t } else { t.with_numeric_assignments(numeric_assignments.clone()) };
         let t = if text_literals.is_empty() { t } else { t.with_text_literals(text_literals.clone()) };

@@ -678,6 +678,10 @@ pub struct Walked {
     /// where the engine's % reads both sides as integers (numfuzz seeds 4703, 5316; recorded,
     /// rec52-numeric-modulo).
     pub numeric_mods: std::collections::BTreeSet<i32>,
+    /// Each abs() of a smallint (21) or an integer (23), by the call's parse location, with that
+    /// type: PostgreSQL's int2abs and int4abs refuse the type's smallest value (22003), where the
+    /// engine's i64 answers it (numfuzz seed 6261 at 4c7bc6102: abs(-32768::int2) was 32768).
+    pub integer_abs: std::collections::BTreeMap<i32, u32>,
     /// A plain SELECT's result columns' types, in order, as the walk read them (empty for any other
     /// statement): [`aggregate_types`] takes the aggregates' from these.
     pub columns: Vec<Option<u32>>,
@@ -898,6 +902,7 @@ fn parameter_types_with(
         integer_casts: Default::default(),
         float_texts: Default::default(),
         numeric_mods: Default::default(),
+        integer_abs: Default::default(),
         column_assignments: Vec::new(),
     };
     let mut columns = Vec::new();
@@ -923,6 +928,7 @@ fn parameter_types_with(
     let integer_casts = infer.integer_casts.take();
     let float_texts = infer.float_texts.take();
     let numeric_mods = infer.numeric_mods.take();
+    let integer_abs = infer.integer_abs.take();
     Ok(Walked {
         params: infer.types,
         untyped,
@@ -933,6 +939,7 @@ fn parameter_types_with(
         integer_casts,
         float_texts,
         numeric_mods,
+        integer_abs,
         columns,
         assignments: infer.assignments,
     })
@@ -1043,6 +1050,8 @@ struct Infer<'a> {
     float_texts: std::rc::Rc<std::cell::RefCell<std::collections::BTreeMap<i32, u32>>>,
     /// Each % over a numeric, by its location ([`Walked::numeric_mods`]).
     numeric_mods: std::rc::Rc<std::cell::RefCell<std::collections::BTreeSet<i32>>>,
+    /// Each abs() of a smallint or an integer, by its location ([`Walked::integer_abs`]).
+    integer_abs: std::rc::Rc<std::cell::RefCell<std::collections::BTreeMap<i32, u32>>>,
     /// Each bare $n assigned to a column, in the order PostgreSQL analyses them: ($n, the column's
     /// name, its type) ([`Walked::column_assignments`]).
     column_assignments: Vec<(u32, String, u32)>,
@@ -1778,6 +1787,7 @@ impl Infer<'_> {
             integer_casts: self.integer_casts.clone(),
             float_texts: self.float_texts.clone(),
             numeric_mods: self.numeric_mods.clone(),
+            integer_abs: self.integer_abs.clone(),
             column_assignments: Vec::new(),
         };
         let columns = walk.select(query, &Vec::new());
@@ -2900,6 +2910,10 @@ impl Infer<'_> {
                             .collect();
                         self.refusal(SqlErrorKind::UndefinedFunction, format!("function {}({}) does not exist", parts.join("."), types.join(", ")))
                     }
+                    ("abs", t @ (INT2 | INT4)) => {
+                        self.integer_abs.borrow_mut().insert(call.location, t);
+                        Some(t)
+                    }
                     ("min" | "max" | "abs" | "sign", t) => Some(t),
                     ("ceil" | "ceiling" | "floor" | "round" | "trunc", t @ (NUMERIC | FLOAT8)) => {
                         Some(t)
@@ -3162,6 +3176,7 @@ impl Infer<'_> {
             integer_casts: self.integer_casts.clone(),
             float_texts: self.float_texts.clone(),
             numeric_mods: self.numeric_mods.clone(),
+            integer_abs: self.integer_abs.clone(),
             column_assignments: Vec::new(),
         };
         let level = walk.from_items(&s.from_clause, scope);
