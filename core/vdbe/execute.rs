@@ -43,7 +43,8 @@ use crate::vdbe::affinity::{
     apply_numeric_affinity, real_to_i64, try_for_float, Affinity, NumericParseResult, ParsedNumber,
 };
 use crate::vdbe::hash_table::{
-    HashEntry, HashInsertResult, HashTable, HashTableConfig, PendingHashInsert, DEFAULT_MEM_BUDGET,
+    DistinctInsert, HashEntry, HashInsertResult, HashTable, HashTableConfig, PendingHashInsert,
+    DEFAULT_MEM_BUDGET,
 };
 use crate::vdbe::insn::InsertFlags;
 use crate::vdbe::metrics::HashJoinMetrics;
@@ -17616,17 +17617,13 @@ pub fn op_hash_distinct(
 
     let mut key_refs: SmallVec<[ValueRef; 2]> = SmallVec::with_capacity(data.num_keys);
     key_refs.extend(key_values.iter().map(|v| v.as_ref()));
-    match hash_table.insert_distinct(key_values, &key_refs, Some(&mut state.metrics.hash_join))? {
-        IOResult::Done(inserted) => {
-            state.pc = if inserted {
-                state.pc + 1
-            } else {
-                data.target_pc.as_offset_int()
-            };
-            Ok(InsnFunctionStepResult::Step)
-        }
-        IOResult::IO(io) => Ok(InsnFunctionStepResult::IO(io)),
-    }
+    state.pc = match hash_table.insert_distinct(key_values, &key_refs)? {
+        DistinctInsert::New => state.pc + 1,
+        DistinctInsert::Duplicate => data.target_pc.as_offset_int(),
+        DistinctInsert::Overflow { first: true } => data.open_pc.as_offset_int(),
+        DistinctInsert::Overflow { first: false } => data.tree_pc.as_offset_int(),
+    };
+    Ok(InsnFunctionStepResult::Step)
 }
 
 pub fn op_hash_build_finalize(
