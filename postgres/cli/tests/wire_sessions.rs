@@ -17811,8 +17811,8 @@ fn a_float_numeric_or_boolean_column_reads_its_literal_as_its_input_routine_does
 /// numfuzz seeds 5961, 5498, 4822 (artie b1d9ea5276, 1ed077342a, 4f001ce3aa): an expression's value assigned to a
 /// numeric(p, s) column is checked and rounded as PostgreSQL's assignment cast does it: numeric infinity in any form
 /// (negated, through float8, through round) and a value past the precision are 22003 'numeric field overflow', a float8
-/// is read through its shortest text and rounded to the scale (2.555 is 2.56), and NaN is stored. Infinity was stored,
-/// and an overflow was refused with the engine's longer message. Expected answers: PG 18.6, recorded (artie a8e16a651e,
+/// is read through its shortest text and rounded to the scale (2.555 is 2.56); NaN, which PG stores, is refused loudly
+/// (the NaN ruling). Infinity was refused 22P02 with "-inf", and an overflow with the engine's longer message. Expected answers: PG 18.6, recorded (artie a8e16a651e,
 /// rec54-expression-assign-numeric/pg18-wirefuzz-an_expression_assigned_to_a_numeric_typmod_column_is_checked_as_postgresql_checks_it.out).
 #[test]
 fn an_expression_assigned_to_a_numeric_typmod_column_is_checked_as_postgresql_checks_it() {
@@ -17841,15 +17841,20 @@ fn an_expression_assigned_to_a_numeric_typmod_column_is_checked_as_postgresql_ch
     for sql in [
         "UPDATE en SET n = f * 1 WHERE id IN (1, 2)",
         "INSERT INTO en (id, n) SELECT 3, m + 0.004 FROM en WHERE id = 1",
-        "INSERT INTO en (id, n) SELECT 4, 'NaN'::numeric * 1",
     ] {
         let r = a.q(sql);
         if r.error.is_some() {
             wrong.push(format!("{sql}: PG succeeds; got {:?}", r.error));
         }
     }
+    // PG stores NaN; the engine's REAL holds none, so NaN is refused loudly and never stored otherwise
+    // (the lead's ruling, LEAD-RULINGS 9d87841628's condition on dd348f3dd).
+    let r = a.q("INSERT INTO en (id, n) SELECT 4, 'NaN'::numeric * 1");
+    if r.error.is_none() {
+        wrong.push(format!("NaN: refused loudly; got {:?}", r.tags));
+    }
     let r = a.q("SELECT id, n FROM en ORDER BY id");
-    let want: Vec<Vec<Option<String>>> = [["1", "2.56"], ["2", "-1.01"], ["3", "1234.50"], ["4", "NaN"]]
+    let want: Vec<Vec<Option<String>>> = [["1", "2.56"], ["2", "-1.01"], ["3", "1234.50"]]
         .iter()
         .map(|row| row.iter().map(|v| Some(v.to_string())).collect())
         .collect();
