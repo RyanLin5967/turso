@@ -628,6 +628,103 @@ fn create_in_the_path(pg_conn: &PgConnectionInner, parse: &mut turso_pg_parser::
 /// ([`turso_pg_parser::long_decimal_literal`], the lexer's tokens). The text bounds the scan, never
 /// decides it: such a literal is written with 16 or more digits, so a statement with fewer is not
 /// scanned (L5's write budget).
+/// A float column compared with a numeric constant past the type the comparison resolves to is
+/// 22003 with numeric_out's text of the constant, before anything runs, as PostgreSQL's parse
+/// analysis casts the constant (recorded, rec59-float-compare-range; numfuzz seed 4912: an IN list
+/// answered no rows). An IN list's constants take the column's own type (real or double
+/// precision); a comparison or a BETWEEN compares a real as float8. Judged before
+/// [`refuse_long_decimals`], so a constant past float8 is PostgreSQL's 22003, not the 0A000 a wide
+/// literal elsewhere is. Only a statement that may hold such a constant is scanned
+/// ([`may_hold_long_numeric`]); a column is resolved among the statement's unqualified relations.
+fn refuse_float_comparisons_out_of_range(
+    pg_conn: &PgConnectionInner,
+    sql: &str,
+    parse: &turso_pg_parser::pg_query::ParseResult,
+) -> Result<()> {
+    use turso_pg_parser::pg_query::protobuf::{a_const::Val, node::Node, AExprKind};
+    use turso_pg_parser::pg_query::NodeRef;
+    if !may_hold_long_numeric(sql) {
+        return Ok(());
+    }
+    let nodes = parse.protobuf.nodes();
+    let schema = pg_conn.conn.current_schema();
+    let relations: Vec<(String, std::sync::Arc<turso_core::schema::BTreeTable>)> = nodes
+        .iter()
+        .filter_map(|(n, ..)| match n {
+            NodeRef::RangeVar(rv) if rv.schemaname.is_empty() => {
+                let table = schema.get_btree_table(&rv.relname)?;
+                Some((rv.alias.as_ref().map(|a| a.aliasname.clone()).unwrap_or_else(|| rv.relname.clone()), table))
+            }
+            _ => None,
+        })
+        .collect();
+    // A column reference's float type (700 or 701) when every relation holding it declares it so.
+    let float_column = |node: &turso_pg_parser::pg_query::protobuf::Node| -> Option<u32> {
+        let Some(Node::ColumnRef(r)) = node.node.as_ref() else { return None };
+        let fields: Vec<&str> = r.fields.iter().map(|f| match &f.node {
+            Some(Node::String(s)) => Some(s.sval.as_str()),
+            _ => None,
+        }).collect::<Option<Vec<_>>>()?;
+        let types: Vec<i64> = match fields.as_slice() {
+            [c] => relations.iter().filter_map(|(_, t)| t.get_column(c).map(|(_, col)| crate::catalog::sqlite_type_to_pg_oid(&col.ty_str))).collect(),
+            [q, c] => relations
+                .iter()
+                .filter(|(known, _)| known.eq_ignore_ascii_case(q))
+                .filter_map(|(_, t)| t.get_column(c).map(|(_, col)| crate::catalog::sqlite_type_to_pg_oid(&col.ty_str)))
+                .collect(),
+            _ => return None,
+        };
+        match types.as_slice() {
+            [first, rest @ ..] if matches!(*first, 700 | 701) && rest.iter().all(|t| t == first) => Some(*first as u32),
+            _ => None,
+        }
+    };
+    // The refusal of a numeric constant `node` read as float4 (`float4`) or float8.
+    let past = |node: &turso_pg_parser::pg_query::protobuf::Node, float4: bool| -> Option<SqlErrorMessage> {
+        let Some(Node::AConst(c)) = node.node.as_ref() else { return None };
+        let Some(Val::Fval(f)) = c.val.as_ref() else { return None };
+        let out = turso_pg_parser::pg_input::numeric_out(&f.fval)?;
+        (turso_pg_parser::pg_input::pg_float_in(&out, float4) == Err(true)).then(|| {
+            SqlErrorMessage::classified(
+                SqlErrorKind::NumericValueOutOfRange,
+                format!("\"{out}\" is out of range for type {}", if float4 { "real" } else { "double precision" }),
+            )
+        })
+    };
+    for (n, ..) in &nodes {
+        let NodeRef::AExpr(e) = n else { continue };
+        let (Some(l), Some(r)) = (e.lexpr.as_deref(), e.rexpr.as_deref()) else { continue };
+        let kind = AExprKind::try_from(e.kind).unwrap_or(AExprKind::Undefined);
+        let refusal = match kind {
+            AExprKind::AexprIn => match (float_column(l), r.node.as_ref()) {
+                (Some(ty), Some(Node::List(list))) => list.items.iter().find_map(|item| past(item, ty == 700)),
+                _ => None,
+            },
+            AExprKind::AexprOp => {
+                let comparison = e.name.iter().any(|n| matches!(&n.node, Some(Node::String(s)) if matches!(s.sval.as_str(), "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=")));
+                if !comparison {
+                    None
+                } else if float_column(l).is_some() {
+                    past(r, false)
+                } else if float_column(r).is_some() {
+                    past(l, false)
+                } else {
+                    None
+                }
+            }
+            AExprKind::AexprBetween | AExprKind::AexprNotBetween => match (float_column(l), r.node.as_ref()) {
+                (Some(_), Some(Node::List(list))) => list.items.iter().find_map(|item| past(item, false)),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(refusal) = refusal {
+            return Err(LimboError::InvalidArgument(refusal));
+        }
+    }
+    Ok(())
+}
+
 fn refuse_long_decimals(
     pg_conn: &PgConnectionInner,
     sql: &str,
@@ -1997,6 +2094,7 @@ fn prepare_statement_parsed(
     refuse_dropped_schemas(pg_conn, &parse_result)?;
     refuse_alter_column_type_across_families(pg_conn, &parse_result)?;
     refuse_cross_database(pg_conn, sql, &parse_result)?;
+    refuse_float_comparisons_out_of_range(pg_conn, sql, &parse_result)?;
     refuse_long_decimals(pg_conn, sql, &parse_result)?;
     refuse_unresolvable_under_an_empty_path(pg_conn, &parse_result)?;
     if !pg_conn.conn.get_auto_commit() {
