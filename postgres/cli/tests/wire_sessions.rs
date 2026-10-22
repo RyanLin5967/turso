@@ -17736,6 +17736,26 @@ fn a_constant_cast_past_numeric_p_s_is_22003_with_no_row() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// numfuzz (seed 2116 at 5d9c4fe5e; PG 18.6's answer in its finding, artie baedf0d84d): a typed literal (NUMERIC '0.1')
+/// has no parse location, so 1d8a8b230's rewrite of one cast constant assigned to an integer column was keyed by -1 and
+/// written over every other such literal: NUMERIC '-7' into a numeric(20,5) column was stored as 0, SILENTLY. A rewrite
+/// stands only where its own constant stands.
+#[test]
+fn a_typed_literal_rewrite_stands_only_where_it_stands() {
+    let dir = Scratch::new("typed-literal-rewrite");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in [
+        "CREATE TABLE nt (id int PRIMARY KEY, c0 numeric(20,5), c1 numeric(20,5), c2 bigint, c3 numeric(20,5))",
+        "INSERT INTO nt (id, c0, c1, c2, c3) VALUES (1, (-32768), NUMERIC '-7', NUMERIC '0.1', (-1))",
+    ] {
+        a.q(sql).ok(sql);
+    }
+    let r = a.q("SELECT id, c1 AS v FROM nt ORDER BY id");
+    let want = vec![vec![Some("1".to_string()), Some("-7.00000".to_string())]];
+    assert!(r.error.is_none() && r.rows == want, "PG {want:?}; got {:?} {:?}", r.rows, r.error);
+}
+
 /// The lead's ruling (LEAD-RULINGS 82dcec6b66 item 5; the float8 blind spot of c8b6e2916): a double is written in the
 /// shortest digits that read back as it from strictly inside its rounding interval, as float8out writes it (d2s.c
 /// without STRICTLY_SHORTEST): 20197275871653528's 16-digit form 2.019727587165353e+16 is the halfway point to its
