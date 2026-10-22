@@ -17808,6 +17808,43 @@ fn a_float_numeric_or_boolean_column_reads_its_literal_as_its_input_routine_does
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// numfuzz seeds 4703, 5316 (artie f1fec7d3cc, d0d756b0b5): a numeric modulo is the remainder PostgreSQL computes (a
+/// fraction, its sign the dividend's), and a numeric modulo by zero is 22012; the engine's % reads both sides as
+/// integers, so 87.343 % -0.6767537 was a modulo by zero, NULL (and so the smallint it was assigned), and
+/// -(24165.9 % 2570.14) answered -1035 for PG's -1034.64. Expected answers: PG 18.6, recorded (artie de48459f69,
+/// rec52-numeric-modulo/pg18-wirefuzz-a_numeric_modulo_is_the_remainder_postgresql_computes.out); the rows whose text
+/// carries a numeric(p, s) column's scale (1034.640) are the engine's NUMERIC class and are not asserted here.
+#[test]
+fn a_numeric_modulo_is_the_remainder_postgresql_computes() {
+    let dir = Scratch::new("numeric-modulo");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in [
+        "CREATE TABLE nm (id int PRIMARY KEY, n numeric(10,3), i int, s smallint)",
+        "INSERT INTO nm VALUES (1, 24165.9, 7, 3), (2, -24165.9, -7, 0), (3, 0.5, 0, 2)",
+    ] {
+        a.q(sql).ok(sql);
+    }
+    let mut wrong = Vec::new();
+    let r = a.q("SELECT 87.343 % -0.6767537 AS a, -(24165.9 % 2570.14) AS b, 7.5 % 2 AS c, -7.5 % 2 AS d, 10 % 3.3 AS e");
+    let want: Vec<Vec<Option<String>>> = vec![["0.0417727", "-1034.64", "1.5", "-1.5", "0.1"].iter().map(|v| Some(v.to_string())).collect()];
+    if r.error.is_some() || r.rows != want {
+        wrong.push(format!("literal modulos: PG {want:?}; got {:?} {:?}", r.rows, r.error));
+    }
+    for sql in ["SELECT n % i FROM nm WHERE id = 3", "SELECT 5.5 % 0 AS v"] {
+        let r = a.q(sql);
+        if !r.error.as_ref().is_some_and(|e| e.code == "22012" && e.message == "division by zero") {
+            wrong.push(format!("{sql}: PG 22012 'division by zero'; got {:?} {:?}", r.rows, r.error));
+        }
+    }
+    a.q("INSERT INTO nm (id, s) SELECT 4, (00087.343 % (-0.6767537))").ok("insert select");
+    let r = a.q("SELECT id, s FROM nm WHERE id = 4");
+    if r.rows != vec![vec![Some("4".to_string()), Some("0".to_string())]] {
+        wrong.push(format!("smallint assigned 87.343 % -0.6767537: PG [[4, 0]]; got {:?} {:?}", r.rows, r.error));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// numfuzz seeds 4681 and 4784 at 783dee075 (artie f1fec7d3cc): a real or double precision value cast to text, varchar or
 /// concatenated with || is written as float4out or float8out writes it (the shortest text that reads back exactly):
 /// a real column's -683390.3 was written -683390.3125, a float8 expression's -2837.7029749885614 as -2837.70297498856.
