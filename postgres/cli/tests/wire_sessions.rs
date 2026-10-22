@@ -18006,6 +18006,46 @@ fn a_float_cast_to_text_is_written_as_its_output_routine_writes_it() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// numfuzz shard 8421-8620 at f1dc48429 (artie 62179ffdbb), four loud classes answered as PostgreSQL answers them:
+/// int4in's overflow during the digits is 22003 before any junk after them is 22P02; trunc with a scale over a numeric
+/// (two arguments: 42601 here) and over a numeric(p, s) cast (42883 here, read as float8) answers PG's truncation; a
+/// parse-analysis refusal (- text, 42883) comes before a folded constant's 22003. Expected answers: PG 18.6, recorded on
+/// eceubuntu2 (artie cca0e1edf6, rec60-loud-classes/pg18-wirefuzz-loud_classes_answer_as_postgresql_does.out); its trunc
+/// over a bare numeric column is the bare-NUMERIC divergence (stored float8) and is not asserted here.
+#[test]
+fn loud_classes_answer_as_postgresql_does() {
+    let dir = Scratch::new("loud-classes");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE lc (id int PRIMARY KEY, i int, s smallint, n numeric(6,2), m numeric)").ok("create");
+    let mut wrong = Vec::new();
+    for (sql, code, message) in [
+        ("INSERT INTO lc (id, i) VALUES (1, '332919446264442293.2332642300320518857')", "22003", r#"value "332919446264442293.2332642300320518857" is out of range for type integer"#),
+        ("INSERT INTO lc (id, i) VALUES (1, '99999999999x')", "22003", r#"value "99999999999x" is out of range for type integer"#),
+        ("INSERT INTO lc (id, s) VALUES (1, '1.5')", "22P02", r#"invalid input syntax for type smallint: "1.5""#),
+        ("INSERT INTO lc (id, i) VALUES (1, '12abc')", "22P02", r#"invalid input syntax for type integer: "12abc""#),
+        ("SELECT trunc(2.5::float8, 1) AS v", "42883", "function trunc(double precision, integer) does not exist"),
+        ("INSERT INTO lc (id, n, m) SELECT 3, -(0037293.122), -(((0.687146)::numeric)::text)", "42883", "operator does not exist: - text"),
+    ] {
+        let r = a.q(sql);
+        if !r.error.as_ref().is_some_and(|e| e.code == code && e.message == message) {
+            wrong.push(format!("{sql}: PG {code} {message:?}; got {:?} {:?}", r.rows, r.error));
+        }
+    }
+    a.q("INSERT INTO lc (id, n, m) VALUES (2, 1.25, 7.777)").ok("row");
+    let rows = |v: &[&str]| vec![v.iter().map(|x| Some(x.to_string())).collect::<Vec<_>>()];
+    for (sql, want) in [
+        ("SELECT trunc(-((-5.790658508032)), 2) AS a, trunc(5.799, 1) AS b, trunc(-5.799, 0) AS c, trunc(123.456, -1) AS d", rows(&["5.79", "5.7", "-5", "120"])),
+        ("SELECT trunc((n)::numeric(6,2), 1) AS a, round((n)::numeric(6,2), 1) AS c FROM lc WHERE id = 2", rows(&["1.2", "1.3"])),
+    ] {
+        let r = a.q(sql);
+        if r.error.is_some() || r.rows != want {
+            wrong.push(format!("{sql}: PG {want:?}; got {:?} {:?}", r.rows, r.error));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// numfuzz seed 4912 at 783dee075 (artie 4f001ce3aa): a float column compared with a numeric constant past the type the
 /// comparison resolves to is 22003 with numeric_out's text of the constant: an IN list takes the column's type (real), so
 /// -0.330e300 is past it; = and < compare a real as float8, so 1e39 is not, and 1e400 is past float8. The IN list
