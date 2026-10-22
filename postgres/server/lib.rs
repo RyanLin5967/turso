@@ -6724,9 +6724,12 @@ fn encode_value(
                 // {, }, or commas when the type is Kind::Array. Since we store
                 // array values as pre-formatted PG array literals (e.g.
                 // "{1,2,3}"), encode with Type::TEXT to bypass the quoting.
+                let floats = (*pg_type == Type::FLOAT8_ARRAY || *pg_type == Type::FLOAT4_ARRAY)
+                    .then(|| float_array_text(text, *pg_type == Type::FLOAT4_ARRAY))
+                    .flatten();
                 encoder
                     .encode_field_with_type_and_format(
-                        &text,
+                        &floats.as_deref().unwrap_or(text),
                         &Type::TEXT,
                         FieldFormat::Text,
                         &FormatOptions::default(),
@@ -6742,6 +6745,43 @@ fn encode_value(
             .encode_field(&b.as_slice())
             .map_err(|e| turso_core::LimboError::InternalError(e.to_string())),
     }
+}
+
+/// A float8[] or float4[] value's text with each element as float8out or float4out writes it
+/// ('{1.5,2}', never the engine's '{1.5,2.0}'; recorded, rec46-array-assign). The engine writes
+/// each element by Rust's shortest round-trip text, so reading it back is exact. None when an
+/// element does not read as a float, which is left as the engine wrote it. Blind spot: the
+/// elements are written with the default extra_float_digits, as every array value is here, and
+/// the engine has already written a negative zero as 0.
+fn float_array_text(text: &str, float4: bool) -> Option<String> {
+    let digits = pgwire::types::format::float_digits::ExtraFloatDigits(FormatOptions::default().extra_float_digits);
+    let mut out = String::with_capacity(text.len());
+    let mut token = String::new();
+    let mut flush = |token: &mut String, out: &mut String| -> Option<()> {
+        if !token.is_empty() {
+            if token.eq_ignore_ascii_case("NULL") {
+                out.push_str(token);
+            } else {
+                let v: f64 = token.trim().parse().ok()?;
+                out.push_str(&if float4 { digits.format_f32(v as f32) } else { digits.format_f64(v) });
+            }
+            token.clear();
+        }
+        Some(())
+    };
+    for c in text.chars() {
+        match c {
+            '{' | '}' | ',' => {
+                flush(&mut token, &mut out)?;
+                out.push(c);
+            }
+            // A quoted element is not one the engine writes for a float.
+            '"' => return None,
+            _ => token.push(c),
+        }
+    }
+    flush(&mut token, &mut out)?;
+    Some(out)
 }
 
 fn sqlite_type_to_pg_type(type_str: &str) -> Type {

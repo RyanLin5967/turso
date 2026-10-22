@@ -2999,6 +2999,18 @@ fn literal_assignments(
                 return Ok(());
             }
         }
+        // Any other element type with an input routine of its own (rec46): read element by element,
+        // the column's typmod applied to each.
+        if let (Some((_, c)), Some(Node::AConst(k))) = (table.get_column(column), value.node.as_ref()) {
+            if c.array_dimensions() > 0 && k.location >= 0 {
+                if let (Some(Val::Sval(text)), Some(reader)) = (k.val.as_ref(), array_element_reader(c)) {
+                    if let Some(canonical) = array_literal(&text.sval, reader.as_ref())? {
+                        text_rewrites.insert(k.location, canonical);
+                    }
+                    return Ok(());
+                }
+            }
+        }
         // A constant to a numeric(p, s) column past it: 22003 'numeric field overflow'.
         if let Some((precision, scale)) = numeric_column(column) {
             let text = match value.node.as_ref() {
@@ -3469,12 +3481,136 @@ fn judge_constant_cast(target: &str, typmods: &[i32], text: &str) -> std::result
     Ok(Some(v))
 }
 
+/// A numeric element's text rounded half away from zero to `scale` places, written with exactly
+/// that many (numeric_in under a typmod: 1.005 at scale 2 is 1.01, 2.5 is 2.50); None past 38 digits.
+fn numeric_at_scale(plain: &str, scale: i32) -> Option<String> {
+    let scaled = crate::functions::round_decimal(&format!("{plain}e{scale}")).filter(|v| v.abs() != i128::MAX)?;
+    if scale <= 0 {
+        return Some(scaled.to_string());
+    }
+    let unit = 10i128.pow(scale as u32);
+    let sign = if scaled < 0 { "-" } else { "" };
+    let (q, r) = (scaled.abs() / unit, scaled.abs() % unit);
+    Some(format!("{sign}{q}.{r:0width$}", width = scale as usize))
+}
+
+/// An array element written as array_out writes it: quoted when empty, when it spells NULL, or
+/// when it holds a blank, a brace, a comma, a quote or a backslash.
+fn array_element_out(value: &str, out: &mut String) {
+    let quote = value.is_empty()
+        || value.eq_ignore_ascii_case("NULL")
+        || value.bytes().any(|c| matches!(c, b'{' | b'}' | b',' | b'"' | b'\\' | b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c));
+    if !quote {
+        out.push_str(value);
+        return;
+    }
+    out.push('"');
+    for c in value.chars() {
+        if c == '"' || c == '\\' {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push('"');
+}
+
+/// The element reader of a float8, float4, numeric(p, s), boolean or varchar(n) array column, as
+/// array_in calls each element's input routine with the column's typmod (rec46); None for an
+/// element type read elsewhere or not at all.
+fn array_element_reader(c: &turso_core::schema::Column) -> Option<Box<dyn Fn(&str, &mut String) -> Result<(), SqlErrorMessage>>> {
+    use turso_parser::ast::{Expr, Literal};
+    let params: Vec<i32> = c
+        .ty_params
+        .iter()
+        .map(|e| match &**e {
+            Expr::Literal(Literal::Numeric(n)) => n.parse().ok(),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let ty = c.ty_str.trim().to_ascii_uppercase();
+    match ty.as_str() {
+        "DOUBLE PRECISION" | "FLOAT8" | "DOUBLE" | "REAL" | "FLOAT4" => {
+            let float4 = matches!(ty.as_str(), "REAL" | "FLOAT4");
+            let name = if float4 { "real" } else { "double precision" };
+            Some(Box::new(move |raw: &str, out: &mut String| match turso_pg_parser::pg_input::pg_float_in(raw, float4) {
+                Ok(_) => {
+                    out.push_str(raw.trim());
+                    Ok(())
+                }
+                Err(true) => Err(SqlErrorMessage::classified(SqlErrorKind::NumericValueOutOfRange, format!("\"{raw}\" is out of range for type {name}"))),
+                Err(false) => Err(SqlErrorMessage::classified(SqlErrorKind::InvalidTextRepresentation, format!("invalid input syntax for type {name}: \"{raw}\""))),
+            }))
+        }
+        "NUMERIC" | "DECIMAL" => {
+            let typmod = match params.as_slice() {
+                [] => None,
+                [p] => Some((*p, 0)),
+                [p, s] => Some((*p, *s)),
+                _ => return None,
+            };
+            Some(Box::new(move |raw: &str, out: &mut String| {
+                let Some(plain) = turso_pg_parser::pg_input::pg_numeric_in(raw) else {
+                    return Err(SqlErrorMessage::classified(SqlErrorKind::InvalidTextRepresentation, format!("invalid input syntax for type numeric: \"{raw}\"")));
+                };
+                let Some((precision, scale)) = typmod else {
+                    out.push_str(&plain);
+                    return Ok(());
+                };
+                if crate::functions::numeric_overflows(&plain, precision, scale) == Some(true) {
+                    return Err(SqlErrorMessage::classified(SqlErrorKind::NumericValueOutOfRange, "numeric field overflow"));
+                }
+                out.push_str(&numeric_at_scale(&plain, scale).unwrap_or(plain));
+                Ok(())
+            }))
+        }
+        "BOOLEAN" | "BOOL" => Some(Box::new(|raw: &str, out: &mut String| match turso_pg_parser::pg_input::pg_boolin(raw) {
+            Some(v) => {
+                out.push(if v { 't' } else { 'f' });
+                Ok(())
+            }
+            None => Err(SqlErrorMessage::classified(SqlErrorKind::InvalidTextRepresentation, format!("invalid input syntax for type boolean: \"{raw}\""))),
+        })),
+        "VARCHAR" | "CHARACTER VARYING" => {
+            let [limit] = params.as_slice() else { return None };
+            let limit = usize::try_from(*limit).ok()?;
+            Some(Box::new(move |raw: &str, out: &mut String| {
+                // varchar_input under a typmod: excess spaces are cut, anything else past it is 22001.
+                let kept: String = raw.chars().take(limit).collect();
+                if raw.chars().skip(limit).any(|c| c != ' ') {
+                    return Err(SqlErrorMessage::classified(SqlErrorKind::StringDataRightTruncation, format!("value too long for type character varying({limit})")));
+                }
+                array_element_out(&kept, out);
+                Ok(())
+            }))
+        }
+        _ => None,
+    }
+}
+
 /// An integer array literal read as array_in reads it, each element by int2in/int4in/int8in
 /// (`name` is the element type's): Err with that routine's refusal of an element; Ok(Some) with the
 /// literal's canonical text when an element is spelled otherwise ('{1, 0x1F, 1_000}' is
 /// {1,31,1000}; recorded, rec41-array-domain-assign); Ok(None) when unchanged, or when it is not a
 /// literal this reads (dimension decorations, unbalanced braces), which the engine judges.
 fn integer_array_literal(text: &str, name: &str) -> Result<Option<String>, SqlErrorMessage> {
+    array_literal(text, &|raw: &str, out: &mut String| {
+        if let Some((message, kind)) = crate::functions::validate_pg_input(raw, name) {
+            return Err(SqlErrorMessage::classified(kind, message));
+        }
+        match crate::functions::pg_strtoint(raw, 64) {
+            crate::functions::PgInt::Value(v) => out.push_str(&v.to_string()),
+            _ => out.push_str(raw),
+        }
+        Ok(())
+    })
+}
+
+/// An array literal read as array_in reads it, each element (unquoted, never NULL) handed to
+/// `element`, which writes its canonical text or refuses it as the element type's input routine
+/// does: Ok(Some) with the literal's canonical text when an element is spelled otherwise, Ok(None)
+/// when unchanged, or when it is not a literal this reads (dimension decorations, unbalanced
+/// braces, a backslash or a non-ASCII unquoted element), which the engine judges.
+fn array_literal(text: &str, element: &dyn Fn(&str, &mut String) -> Result<(), SqlErrorMessage>) -> Result<Option<String>, SqlErrorMessage> {
     let b = text.as_bytes();
     let blank = |c: u8| matches!(c, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c);
     let mut out = String::with_capacity(text.len());
@@ -3485,16 +3621,6 @@ fn integer_array_literal(text: &str, name: &str) -> Result<Option<String>, SqlEr
     if b.get(i) != Some(&b'{') {
         return Ok(None);
     }
-    let element = |raw: &str, out: &mut String| -> Result<(), SqlErrorMessage> {
-        if let Some((message, kind)) = crate::functions::validate_pg_input(raw, name) {
-            return Err(SqlErrorMessage::classified(kind, message));
-        }
-        match crate::functions::pg_strtoint(raw, 64) {
-            crate::functions::PgInt::Value(v) => out.push_str(&v.to_string()),
-            _ => out.push_str(raw),
-        }
-        Ok(())
-    };
     while i < b.len() {
         match b[i] {
             c if blank(c) => i += 1,
