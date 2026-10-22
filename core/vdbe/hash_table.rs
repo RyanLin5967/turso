@@ -3286,16 +3286,98 @@ mod hashtests {
     use crate::io::Buffer;
     use crate::MemoryIO;
 
+    /// An IO over [MemoryIO] that counts every byte its files read or write: the statement's whole
+    /// temporary-storage traffic, whatever structure (hash partitions, an ephemeral b-tree) moves it.
+    struct ByteCountIo {
+        inner: Arc<MemoryIO>,
+        bytes: Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    struct ByteCountFile {
+        inner: Arc<dyn crate::io::File>,
+        bytes: Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    impl crate::io::Clock for ByteCountIo {
+        fn current_time_monotonic(&self) -> crate::io::clock::MonotonicInstant {
+            self.inner.current_time_monotonic()
+        }
+        fn current_time_wall_clock(&self) -> crate::io::clock::WallClockInstant {
+            self.inner.current_time_wall_clock()
+        }
+    }
+
+    impl crate::IO for ByteCountIo {
+        fn open_file(&self, path: &str, flags: crate::OpenFlags, direct: bool) -> crate::Result<Arc<dyn crate::io::File>> {
+            Ok(Arc::new(ByteCountFile {
+                inner: self.inner.open_file(path, flags, direct)?,
+                bytes: self.bytes.clone(),
+            }))
+        }
+        fn remove_file(&self, path: &str) -> crate::Result<()> {
+            self.inner.remove_file(path)
+        }
+        fn step(&self) -> crate::Result<()> {
+            self.inner.step()
+        }
+        fn file_id(&self, path: &str) -> crate::Result<crate::io::FileId> {
+            self.inner.file_id(path)
+        }
+        fn supports_shared_wal_coordination(&self) -> bool {
+            self.inner.supports_shared_wal_coordination()
+        }
+    }
+
+    impl crate::io::File for ByteCountFile {
+        fn lock_file(&self, exclusive: bool) -> crate::Result<()> {
+            self.inner.lock_file(exclusive)
+        }
+        fn unlock_file(&self) -> crate::Result<()> {
+            self.inner.unlock_file()
+        }
+        fn pread(&self, pos: u64, c: crate::Completion) -> crate::Result<crate::Completion> {
+            let len = c.as_read().buf().len() as u64;
+            self.bytes.fetch_add(len, std::sync::atomic::Ordering::Relaxed);
+            self.inner.pread(pos, c)
+        }
+        fn pwrite(&self, pos: u64, buffer: Arc<Buffer>, c: crate::Completion) -> crate::Result<crate::Completion> {
+            self.bytes.fetch_add(buffer.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            self.inner.pwrite(pos, buffer, c)
+        }
+        fn pwritev(&self, pos: u64, buffers: Vec<Arc<Buffer>>, c: crate::Completion) -> crate::Result<crate::Completion> {
+            let len: usize = buffers.iter().map(|b| b.len()).sum();
+            self.bytes.fetch_add(len as u64, std::sync::atomic::Ordering::Relaxed);
+            self.inner.pwritev(pos, buffers, c)
+        }
+        fn sync(&self, c: crate::Completion, sync_type: crate::io::FileSyncType) -> crate::Result<crate::Completion> {
+            self.inner.sync(c, sync_type)
+        }
+        fn size(&self) -> crate::Result<u64> {
+            self.inner.size()
+        }
+        fn truncate(&self, len: u64, c: crate::Completion) -> crate::Result<crate::Completion> {
+            self.inner.truncate(len, c)
+        }
+    }
+
     /// count(DISTINCT v::text) over N rows (fastest-wire raws artie e6a09f970e: CPU-bound for over
-    /// 14 minutes at N = 300000 through the server, a debug build, so the 32 KiB budget spills): the
-    /// spilled distinct's disk traffic (`load_bytes_read` + `spill_bytes_written`, the statement's
-    /// own hash metrics) grows linearly with N, not with N^2. Each insert into a spilled table
-    /// checked its partition by loading it from disk when it was not resident, and a run of
-    /// distinct keys hashed across the partitions evicts them in turn. Measured at 3000 and 30000
-    /// rows: ten times the rows may cost at most 20 times the bytes. The answers are N.
+    /// 14 minutes at N = 300000 through a debug server). Measured at fe-distprobe 7e4966b51 (artie
+    /// 02c8ff3f8d, the statement's hash metrics): past the 32 KiB debug budget every insert of a
+    /// new key loaded its whole spilled partition from disk, 1.30 MB at 3000 rows and 603 MB at
+    /// 30000 (464x for 10x). CLAIM: past the hash budget a DISTINCT moves at most one page of
+    /// temporary storage per row (4096 bytes, counted at the IO: any structure's reads and
+    /// writes), at 3000 and at 30000 rows. The answers are N.
     #[test]
-    fn a_spilled_count_distinct_moves_bytes_linearly_in_its_rows() {
-        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+    fn a_count_distinct_past_the_memory_budget_moves_at_most_a_page_per_row() {
+        assert!(
+            DEFAULT_MEM_BUDGET < 3000 * 8,
+            "premise: 3000 distinct keys exceed the hash budget ({DEFAULT_MEM_BUDGET} bytes; a debug build's)"
+        );
+        let bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let io: Arc<dyn crate::IO> = Arc::new(ByteCountIo {
+            inner: Arc::new(MemoryIO::new()),
+            bytes: bytes.clone(),
+        });
         let db = crate::Database::open_file_with_flags(
             io,
             ":memory:",
@@ -3306,24 +3388,20 @@ mod hashtests {
         )
         .unwrap();
         let conn = db.connect().unwrap();
-        let mut bytes = Vec::new();
+        let mut wrong = Vec::new();
         for n in [3000u64, 30000] {
             let mut stmt = conn
                 .prepare(format!("SELECT count(DISTINCT CAST(value AS TEXT)) FROM generate_series(1, {n})"))
                 .unwrap();
+            let before = bytes.load(std::sync::atomic::Ordering::Relaxed);
             let rows = stmt.run_collect_rows().unwrap();
+            let moved = bytes.load(std::sync::atomic::Ordering::Relaxed) - before;
             assert_eq!(rows[0][0].as_int(), Some(n as i64), "premise: count(DISTINCT) over {n} distinct values");
-            let m = stmt.metrics().hash_join;
-            assert!(m.spill_bytes_written > 0, "premise: the distinct spilled at {n} rows (the budget is the debug build's)");
-            bytes.push(m.load_bytes_read + m.spill_bytes_written);
+            if moved > n * 4096 {
+                wrong.push(format!("{n} rows moved {moved} bytes, {} per row", moved / n));
+            }
         }
-        assert!(
-            bytes[1] <= bytes[0] * 20,
-            "CLAIM: 10x the rows moved {}x the bytes ({} at 3000, {} at 30000): the spilled distinct is quadratic",
-            bytes[1] / bytes[0].max(1),
-            bytes[0],
-            bytes[1]
-        );
+        assert!(wrong.is_empty(), "CLAIM: at most a page (4096 bytes) per row: {wrong:?}");
     }
 
     #[test]
