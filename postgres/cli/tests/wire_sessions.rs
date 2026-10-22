@@ -2433,6 +2433,49 @@ fn an_engine_side_rollback_inside_a_block_still_aborts_it() {
     assert_eq!(code, "22003", "abs(int8 minimum) is not PostgreSQL's code");
 }
 
+/// The lead's ruling (LEAD-RULINGS 82dcec6b66, item 2): an error the ENGINE raises at execution inside a block aborts the
+/// block as PostgreSQL does, its premise asserted: the statement is parsed and bound (ParseComplete, BindComplete) and
+/// its 22003 comes at Execute, from the engine's int8 arithmetic, so no frontend refusal at prepare stands in for it
+/// (an_engine_side_rollback_inside_a_block_still_aborts_it's abs(-9223372036854775808::int8) is now refused at prepare).
+/// Every expected value is PostgreSQL 18.6's (recorded, pg18/pg18-c33-engineerr.out #13-#18, the v + 1 block).
+#[test]
+fn an_error_the_engine_raises_at_execution_aborts_the_block() {
+    let dir = Scratch::new("engine-exec-abort");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in [
+        "CREATE TABLE t(id INT PRIMARY KEY, v TEXT)",
+        "INSERT INTO t VALUES (1, 'one')",
+        "CREATE TABLE big(v BIGINT)",
+        "INSERT INTO big VALUES (9223372036854775807), (1)",
+    ] {
+        a.q(sql).ok(sql);
+    }
+    a.q("BEGIN").ok("begin");
+    a.q("INSERT INTO t VALUES (2, 'two')").ok("insert 2");
+    let (types, error) = a.bind_round("SELECT v + 1 FROM big WHERE v > 1", &[], &[], &[]);
+    let at = |m: u8| types.iter().position(|t| *t == m);
+    assert!(
+        matches!((at(b'1'), at(b'2'), at(b'E')), (Some(p), Some(b), Some(e)) if p < b && b < e),
+        "premise: the error must come at Execute, after ParseComplete and BindComplete; messages {:?}",
+        String::from_utf8_lossy(&types)
+    );
+    let error = error.expect("v + 1 past int8 raised nothing");
+    assert_eq!((error.code.as_str(), error.message.as_str()), ("22003", "bigint out of range"));
+    assert_eq!(types.last(), Some(&b'Z'));
+    let r = a.q("INSERT INTO t VALUES (3, 'three')");
+    assert_eq!(r.status, b'E');
+    let e = r.err("insert 3");
+    assert_eq!(
+        (e.code.as_str(), e.message.as_str()),
+        ("25P02", "current transaction is aborted, commands ignored until end of transaction block")
+    );
+    let r = a.q("COMMIT").ok("commit");
+    assert_eq!(r.tags, vec!["ROLLBACK".to_string()]);
+    assert_eq!(r.status, b'I');
+    assert_eq!(a.q("SELECT count(*) FROM t WHERE id IN (2, 3)").single("rows"), "0", "part of a failed block committed");
+}
+
 /// sum() over int8 is a numeric in PostgreSQL and does not overflow; int8 + and * past the int8
 /// range raise 22003 "bigint out of range" (recorded, artie raw
 /// loud-20261015/pg18-diff/pg18-c33-engineerr.out, every case of its first part). The two tests
