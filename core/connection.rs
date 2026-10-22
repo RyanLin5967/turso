@@ -3063,29 +3063,47 @@ impl Connection {
             .collect()
     }
 
-    /// The column names `table` declares in `database` (main, temp or an attached database's
-    /// name), read from this connection's in-memory schema with no catalog query. None when there
-    /// is no such database, or no such table in it.
-    pub fn resident_table_columns(&self, database: &str, table: &str) -> Option<Vec<String>> {
+    /// The B-tree table `table` names in `database` (main, temp or an attached database's name),
+    /// with its columns and their declared types, read from this connection's in-memory schema
+    /// with no catalog query. None when there is no such database, or no B-tree table of the name
+    /// in it (a view is none). Read only: the returned table is the schema's own (fastest-engine,
+    /// RESUME item 14, for fastest-wire's attached-table checks).
+    pub fn resident_btree_table(&self, database: &str, table: &str) -> Option<Arc<crate::schema::BTreeTable>> {
         let database_id = self.get_database_id_by_name(database).ok()?;
-        self.with_schema(database_id, |schema| {
-            schema
-                .get_btree_table(table)
-                .map(|t| t.columns().iter().filter_map(|c| c.name.clone()).collect())
-        })
+        self.with_schema(database_id, |schema| schema.get_btree_table(table))
     }
 
-    /// The column names of the table an unqualified `table` names, resolved as the engine's
-    /// resolver resolves it (`resolve_unqualified_existing_database_id`): TEMP first when a temp
-    /// schema exists; then, with a search path, each entry naming public (main) or an attached
-    /// database; without one, main and then the attached databases. The first schema holding any
-    /// table-like object of the name decides; None when that object is not a B-tree table (a
-    /// view), or nothing holds the name. Read from the in-memory schemas, no catalog query.
+    /// The column names `table` declares in `database` ([`Connection::resident_btree_table`]'s
+    /// table's). None when there is no such database, or no such table in it.
+    pub fn resident_table_columns(&self, database: &str, table: &str) -> Option<Vec<String>> {
+        self.resident_btree_table(database, table)
+            .map(|t| t.columns().iter().filter_map(|c| c.name.clone()).collect())
+    }
+
+    /// The column names of the table an unqualified `table` names
+    /// ([`Connection::resident_unqualified_btree_table`]'s table's).
     pub fn resident_unqualified_table_columns(
         &self,
         table: &str,
         search_path: &[String],
     ) -> Option<Vec<String>> {
+        self.resident_unqualified_btree_table(table, search_path)
+            .map(|t| t.columns().iter().filter_map(|c| c.name.clone()).collect())
+    }
+
+    /// The B-tree table an unqualified `table` names, with its columns and declared types,
+    /// resolved as the engine's resolver resolves it (`resolve_unqualified_existing_database_id`):
+    /// TEMP first when a temp schema exists; then, with a search path, each entry naming public
+    /// (main) or an attached database; without one, main and then the attached databases. The
+    /// first schema holding any table-like object of the name decides; None when that object is
+    /// not a B-tree table (a view), or nothing holds the name. Read from the in-memory schemas, no
+    /// catalog query. Mutant `resident_unqualified_skips_temp` (test builds only): TEMP is not
+    /// consulted first.
+    pub fn resident_unqualified_btree_table(
+        &self,
+        table: &str,
+        search_path: &[String],
+    ) -> Option<Arc<crate::schema::BTreeTable>> {
         let holds = |id| {
             self.with_schema(id, |schema| {
                 schema.get_table(table).is_some()
@@ -3093,14 +3111,11 @@ impl Connection {
                     || schema.get_materialized_view(table).is_some()
             })
         };
-        let columns = |id| {
-            self.with_schema(id, |schema| {
-                schema
-                    .get_btree_table(table)
-                    .map(|t| t.columns().iter().filter_map(|c| c.name.clone()).collect())
-            })
-        };
-        if self.temp.database.read().is_some() && holds(crate::TEMP_DB_ID) {
+        let columns = |id| self.with_schema(id, |schema| schema.get_btree_table(table));
+        if self.temp.database.read().is_some()
+            && !crate::branch::store::fe_mutant("resident_unqualified_skips_temp")
+            && holds(crate::TEMP_DB_ID)
+        {
             return columns(crate::TEMP_DB_ID);
         }
         // Ascending ids, as the resolver's BitSet orders them (the map's own order is a hash's).
@@ -5568,6 +5583,77 @@ mod tests {
 
     fn open_connection(path: &std::path::Path) -> Arc<Connection> {
         open_connection_with_opts(path, DatabaseOpts::new())
+    }
+
+    /// RESUME item 14: `resident_btree_table` and `resident_unqualified_btree_table` return the
+    /// schema's own B-tree table, with its declared types, for every arm the column twins cover:
+    /// main, temp and an attached database, qualified; temp before main, main before the attached
+    /// databases, and a search path's order, unqualified; None for a missing database, a missing
+    /// table and a view. Each answer agrees with its column twin. Kills
+    /// `resident_unqualified_skips_temp` (the temp arm reads main's table).
+    #[test]
+    fn the_resident_btree_table_accessors_answer_every_arm() {
+        let dir = TempDir::new().unwrap();
+        let conn = open_connection_with_opts(&dir.path().join("main.db"), DatabaseOpts::new().with_attach(true));
+        drive_attach(&conn, dir.path().join("aux.db").to_str().unwrap(), "aux").unwrap();
+        for sql in [
+            "CREATE TABLE t (a INTEGER, b TEXT)",
+            "CREATE TABLE both_t (m REAL)",
+            "CREATE VIEW v AS SELECT a FROM t",
+            "CREATE TABLE aux.u (x BLOB, y NUMERIC)",
+            "CREATE TABLE aux.both_t (aux_col TEXT)",
+            "CREATE TEMP TABLE shadow (temp_col INTEGER)",
+            "CREATE TABLE shadow (main_col INTEGER)",
+        ] {
+            conn.execute(sql).unwrap();
+        }
+        let shape = |t: Option<Arc<crate::schema::BTreeTable>>| {
+            t.map(|t| {
+                t.columns()
+                    .iter()
+                    .map(|c| (c.name.clone().unwrap_or_default(), c.ty_str.clone()))
+                    .collect::<Vec<_>>()
+            })
+        };
+        let s = |pairs: &[(&str, &str)]| Some(pairs.iter().map(|(n, t)| (n.to_string(), t.to_string())).collect::<Vec<_>>());
+        let mut wrong = Vec::new();
+        let mut check = |what: &str, got: Option<Vec<(String, String)>>, want: Option<Vec<(String, String)>>| {
+            if got != want {
+                wrong.push(format!("{what}: {got:?}, want {want:?}"));
+            }
+        };
+        // Qualified.
+        check("main.t", shape(conn.resident_btree_table("main", "t")), s(&[("a", "INTEGER"), ("b", "TEXT")]));
+        check("aux.u", shape(conn.resident_btree_table("aux", "u")), s(&[("x", "BLOB"), ("y", "NUMERIC")]));
+        check("temp.shadow", shape(conn.resident_btree_table("temp", "shadow")), s(&[("temp_col", "INTEGER")]));
+        check("main.shadow", shape(conn.resident_btree_table("main", "shadow")), s(&[("main_col", "INTEGER")]));
+        check("main.u (it is aux's)", shape(conn.resident_btree_table("main", "u")), None);
+        check("nosuch.t", shape(conn.resident_btree_table("nosuch", "t")), None);
+        check("main.nosuch", shape(conn.resident_btree_table("main", "nosuch")), None);
+        check("main.v (a view)", shape(conn.resident_btree_table("main", "v")), None);
+        // Unqualified.
+        let none: &[String] = &[];
+        check("shadow: temp first", shape(conn.resident_unqualified_btree_table("shadow", none)), s(&[("temp_col", "INTEGER")]));
+        check("both_t: main before aux", shape(conn.resident_unqualified_btree_table("both_t", none)), s(&[("m", "REAL")]));
+        check("u: found in aux", shape(conn.resident_unqualified_btree_table("u", none)), s(&[("x", "BLOB"), ("y", "NUMERIC")]));
+        let path = ["aux".to_string(), "public".to_string()];
+        check("both_t under aux, public", shape(conn.resident_unqualified_btree_table("both_t", &path)), s(&[("aux_col", "TEXT")]));
+        check("v: a view decides, no table", shape(conn.resident_unqualified_btree_table("v", none)), None);
+        check("nosuch", shape(conn.resident_unqualified_btree_table("nosuch", none)), None);
+        // The column twins agree.
+        for (db, t) in [("main", "t"), ("aux", "u"), ("temp", "shadow"), ("main", "v"), ("nosuch", "t")] {
+            let names = conn.resident_btree_table(db, t).map(|b| b.columns().iter().filter_map(|c| c.name.clone()).collect::<Vec<_>>());
+            if names != conn.resident_table_columns(db, t) {
+                wrong.push(format!("{db}.{t}: the column twin disagrees"));
+            }
+        }
+        for (t, p) in [("shadow", none), ("both_t", &path[..]), ("u", none), ("v", none)] {
+            let names = conn.resident_unqualified_btree_table(t, p).map(|b| b.columns().iter().filter_map(|c| c.name.clone()).collect::<Vec<_>>());
+            if names != conn.resident_unqualified_table_columns(t, p) {
+                wrong.push(format!("unqualified {t}: the column twin disagrees"));
+            }
+        }
+        assert!(wrong.is_empty(), "CLAIM: the resident B-tree table accessors answer every arm: {wrong:#?}");
     }
 
     fn drive_attach(conn: &Arc<Connection>, path: &str, alias: &str) -> Result<()> {
