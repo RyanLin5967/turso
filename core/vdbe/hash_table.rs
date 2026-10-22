@@ -3294,6 +3294,21 @@ mod hashtests {
     /// distinct keys hashed across the partitions evicts them in turn. Measured at 3000 and 30000
     /// rows: ten times the rows may cost at most 20 times the bytes. The answers are N.
     #[test]
+    fn probe_distinct_slope() {
+        // PROBE, not for delivery: the counters at 3k, 30k and 300k rows.
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let db = crate::Database::open_file_with_flags(io, ":memory:", crate::OpenFlags::Create, crate::DatabaseOpts::new(), None, Arc::new(crate::SqliteDialect)).unwrap();
+        let conn = db.connect().unwrap();
+        for n in [3000u64, 30000, 300000] {
+            let t = std::time::Instant::now();
+            let mut stmt = conn.prepare(format!("SELECT count(DISTINCT CAST(value AS TEXT)) FROM generate_series(1, {n})")).unwrap();
+            let rows = stmt.run_collect_rows().unwrap();
+            let m = stmt.metrics().hash_join;
+            println!("PROBE n={n} count={:?} spill_bytes_written={} spill_chunks={} load_bytes_read={} wall_ms={}", rows[0][0], m.spill_bytes_written, m.spill_chunks, m.load_bytes_read, t.elapsed().as_millis());
+        }
+    }
+
+    #[test]
     fn a_spilled_count_distinct_moves_bytes_linearly_in_its_rows() {
         let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
         let db = crate::Database::open_file_with_flags(
