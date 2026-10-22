@@ -242,7 +242,7 @@ fn load_columns(conn: &Connection) -> Result<Vec<Vec<Value>>> {
                 int(i as i64 + 1),
                 col.default
                     .as_ref()
-                    .map_or(Value::Null, |d| text(d.to_string())),
+                    .map_or(Value::Null, |d| text(crate::catalog::default_display(d))),
                 // A key column is NOT NULL, as in PostgreSQL (the engine's STRICT tables refuse a
                 // NULL key) though no NOT NULL is declared on it (wire review 2 item 9).
                 text(if col.notnull() || col.primary_key() {
