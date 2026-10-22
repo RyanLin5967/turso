@@ -3286,6 +3286,46 @@ mod hashtests {
     use crate::io::Buffer;
     use crate::MemoryIO;
 
+    /// count(DISTINCT v::text) over N rows (fastest-wire raws artie e6a09f970e: CPU-bound for over
+    /// 14 minutes at N = 300000 through the server, a debug build, so the 32 KiB budget spills): the
+    /// spilled distinct's disk traffic (`load_bytes_read` + `spill_bytes_written`, the statement's
+    /// own hash metrics) grows linearly with N, not with N^2. Each insert into a spilled table
+    /// checked its partition by loading it from disk when it was not resident, and a run of
+    /// distinct keys hashed across the partitions evicts them in turn. Measured at 3000 and 30000
+    /// rows: ten times the rows may cost at most 20 times the bytes. The answers are N.
+    #[test]
+    fn a_spilled_count_distinct_moves_bytes_linearly_in_its_rows() {
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let db = crate::Database::open_file_with_flags(
+            io,
+            ":memory:",
+            crate::OpenFlags::Create,
+            crate::DatabaseOpts::new(),
+            None,
+            Arc::new(crate::SqliteDialect),
+        )
+        .unwrap();
+        let conn = db.connect().unwrap();
+        let mut bytes = Vec::new();
+        for n in [3000u64, 30000] {
+            let mut stmt = conn
+                .prepare(format!("SELECT count(DISTINCT CAST(value AS TEXT)) FROM generate_series(1, {n})"))
+                .unwrap();
+            let rows = stmt.run_collect_rows().unwrap();
+            assert_eq!(rows[0][0].as_int(), Some(n as i64), "premise: count(DISTINCT) over {n} distinct values");
+            let m = stmt.metrics().hash_join;
+            assert!(m.spill_bytes_written > 0, "premise: the distinct spilled at {n} rows (the budget is the debug build's)");
+            bytes.push(m.load_bytes_read + m.spill_bytes_written);
+        }
+        assert!(
+            bytes[1] <= bytes[0] * 20,
+            "CLAIM: 10x the rows moved {}x the bytes ({} at 3000, {} at 30000): the spilled distinct is quadratic",
+            bytes[1] / bytes[0].max(1),
+            bytes[0],
+            bytes[1]
+        );
+    }
+
     #[test]
     fn test_hash_table_rejects_custom_collations() {
         let io = Arc::new(MemoryIO::new());
