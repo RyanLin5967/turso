@@ -17496,6 +17496,59 @@ fn a_string_parameter_assigned_to_another_category_is_42804() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// numfuzz (seeds 288 and 332 at 6e17acc9a, 432, 482, 483 and 551 at 5d2f9d25f; PG 18.6's answers in their findings,
+/// artie 9b32cd5149 and 3b3324b82e): a function or operator with no candidate is 42883 inside a cast too, and
+/// beside a cast to text or a `%` it is walked: trunc(x::text)::numeric, round(float8, -1)::numeric in a SET, text
+/// minus numeric, numeric times text, float8 % bigint and a prefix minus over text were each answered.
+#[test]
+fn a_function_or_operator_inside_a_cast_or_over_text_is_resolved_as_postgresql_does() {
+    let dir = Scratch::new("cast-resolve");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let mut wrong = Vec::new();
+    for (ddl, sql, message) in [
+        (
+            "CREATE TABLE nt (id int PRIMARY KEY, c0 numeric(38,10), c1 numeric, c2 numeric(38,10), c3 numeric(38,10))",
+            "SELECT (trunc((0.40263656853555)::text))::numeric(6,2) AS v",
+            "function trunc(text) does not exist",
+        ),
+        (
+            "CREATE TABLE nt (id int PRIMARY KEY, c0 double precision, c1 double precision)",
+            "UPDATE nt SET c0 = (round(-(c1), -1))::numeric(10,0) WHERE id = 1",
+            "function round(double precision, integer) does not exist",
+        ),
+        (
+            "CREATE TABLE nt (id int PRIMARY KEY, c0 real, c1 numeric(6,2), c2 smallint, c3 real)",
+            "UPDATE nt SET c1 = -(((c2)::text - 0.214185361151548)) WHERE id = 1",
+            "operator does not exist: text - numeric",
+        ),
+        (
+            "CREATE TABLE nt (id int PRIMARY KEY, c0 bigint, c1 int, c2 numeric(6,2), c3 numeric)",
+            "SELECT id, (345.2463 * ((c2 + c0))::text) AS v FROM nt ORDER BY id",
+            "operator does not exist: numeric * text",
+        ),
+        (
+            "CREATE TABLE nt (id int PRIMARY KEY, c0 int, c1 smallint, c2 double precision, c3 numeric(6,2))",
+            "SELECT (((c0)::float8 % 9223372036854775807))::numeric(10,0) AS u FROM (SELECT id, c0, c1, c2, c3 FROM nt) s ORDER BY id",
+            "operator does not exist: double precision % bigint",
+        ),
+        (
+            "CREATE TABLE nt (id int PRIMARY KEY, c0 real, c1 real, c2 real)",
+            "SELECT id, trunc(-((c0)::text)) AS v FROM nt ORDER BY id",
+            "operator does not exist: - text",
+        ),
+    ] {
+        for setup in ["DROP TABLE IF EXISTS nt", ddl, "INSERT INTO nt (id) VALUES (1)"] {
+            a.q(setup).ok(setup);
+        }
+        let r = a.q(sql);
+        if !r.error.as_ref().is_some_and(|e| e.code == "42883" && e.message == message) {
+            wrong.push(format!("{sql}: PG 42883 {message}; got {:?} {:?} {:?}", r.tags, r.rows, r.error));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// numfuzz (seeds 26 at e4882aaed, 249 and 328 at 6e17acc9a; artie 7ba22e107a, 9b32cd5149): a string literal
 /// assigned to an integer column is read as int2in/int4in/int8in read it, at parse analysis, so a statement
 /// matching no row is refused too, and a value of a string type assigned to a numeric or boolean column is
