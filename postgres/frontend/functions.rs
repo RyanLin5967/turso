@@ -80,7 +80,10 @@ pub(crate) fn exec_scalar(conn: &Connection, name: &str, args: &[Value]) -> Resu
         "pg_text_int" => match args.first() {
             Some(Value::Text(t)) => match validate_pg_input(t.as_str(), &text_arg(1)) {
                 Some((message, kind)) => Err(LimboError::Constraint(SqlErrorMessage::classified(kind, message))),
-                None => Ok(t.as_str().trim().parse::<i64>().map(Value::from_i64).unwrap_or_else(|_| Value::build_text(t.as_str().to_string()))),
+                None => Ok(match pg_strtoint(t.as_str(), 64) {
+                    PgInt::Value(v) => Value::from_i64(v),
+                    _ => Value::build_text(t.as_str().to_string()),
+                }),
             },
             Some(other) => Ok(other.clone()),
             None => Ok(Value::Null),
@@ -669,6 +672,88 @@ fn pg_get_indexdef(conn: &Connection, target_oid: i64) -> Option<String> {
 ///
 /// Returns `None` for valid input, or `Some((message, sql_error_code))` for invalid input.
 /// Used by both `pg_input_error_info` (table-valued) and `pg_input_is_valid` (scalar).
+/// What PostgreSQL 18.6's pg_strtoint16/32/64_safe (numutils.c) reads from `input` for an integer
+/// of `bits` bits.
+pub(crate) enum PgInt {
+    Value(i64),
+    Invalid,
+    OutOfRange,
+}
+
+/// pg_strtoint16/32/64_safe: blanks around, one sign, then decimal digits or a 0x, 0o or 0b prefix
+/// and its digits, each underscore between two digits; a value past the type met while the digits
+/// are read is out of range before any later character is judged ('21474836490.5' is 22003 for
+/// int4, '2147483649.5' is 22P02). Recorded: rec27-literal-assign (artie 0f7b0647a8).
+pub(crate) fn pg_strtoint(input: &str, bits: u32) -> PgInt {
+    let s = input.as_bytes();
+    let blank = |b: u8| matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c);
+    let mut i = 0;
+    while i < s.len() && blank(s[i]) {
+        i += 1;
+    }
+    let negative = i < s.len() && s[i] == b'-';
+    if i < s.len() && (s[i] == b'-' || s[i] == b'+') {
+        i += 1;
+    }
+    let base: u64 = match (s.get(i), s.get(i + 1)) {
+        (Some(b'0'), Some(b'x' | b'X')) => 16,
+        (Some(b'0'), Some(b'o' | b'O')) => 8,
+        (Some(b'0'), Some(b'b' | b'B')) => 2,
+        _ => 10,
+    };
+    if base != 10 {
+        i += 2;
+    }
+    let digit = |b: u8| (b as char).to_digit(base as u32).map(u64::from);
+    // -(PG_INTn_MIN / base): a value above it has no room for one more digit.
+    let room = (1u64 << (bits - 1)) / base;
+    let first = i;
+    let mut value: u64 = 0;
+    while i < s.len() {
+        if let Some(d) = digit(s[i]) {
+            if value > room {
+                return PgInt::OutOfRange;
+            }
+            value = value * base + d;
+            i += 1;
+        } else if s[i] == b'_' {
+            // Not first among decimal digits, and followed by a digit.
+            if base == 10 && i == first {
+                return PgInt::Invalid;
+            }
+            i += 1;
+            if !s.get(i).is_some_and(|b| digit(*b).is_some()) {
+                return PgInt::Invalid;
+            }
+        } else {
+            break;
+        }
+    }
+    if i == first {
+        return PgInt::Invalid;
+    }
+    while i < s.len() && blank(s[i]) {
+        i += 1;
+    }
+    if i != s.len() {
+        return PgInt::Invalid;
+    }
+    let limit = (1u64 << (bits - 1)) - u64::from(!negative);
+    if value > limit {
+        return PgInt::OutOfRange;
+    }
+    PgInt::Value(if negative { (value as i64).wrapping_neg() } else { value as i64 })
+}
+
+/// int2in/int4in/int8in's refusal of `input`, if any, with PostgreSQL's message.
+fn pg_int_input_error(input: &str, bits: u32, name: &str) -> Option<(String, SqlErrorKind)> {
+    match pg_strtoint(input, bits) {
+        PgInt::Value(_) => None,
+        PgInt::Invalid => Some((format!("invalid input syntax for type {name}: \"{input}\""), SqlErrorKind::InvalidTextRepresentation)),
+        PgInt::OutOfRange => Some((format!("value \"{input}\" is out of range for type {name}"), SqlErrorKind::NumericValueOutOfRange)),
+    }
+}
+
 pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String, SqlErrorKind)> {
     let trimmed = input.trim();
 
@@ -699,44 +784,9 @@ pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String,
                 ))
             }
         }
-        "int2" | "smallint" => match trimmed.parse::<i64>() {
-            Ok(v) if v < i16::MIN as i64 || v > i16::MAX as i64 => Some((
-                format!("value \"{input}\" is out of range for type smallint"),
-                SqlErrorKind::NumericValueOutOfRange,
-            )),
-            Ok(_) => None,
-            Err(_) => Some((
-                format!("invalid input syntax for type smallint: \"{input}\""),
-                SqlErrorKind::InvalidTextRepresentation,
-            )),
-        },
-        "int4" | "integer" | "int" => match trimmed.parse::<i64>() {
-            Ok(v) if v < i32::MIN as i64 || v > i32::MAX as i64 => Some((
-                format!("value \"{input}\" is out of range for type integer"),
-                SqlErrorKind::NumericValueOutOfRange,
-            )),
-            Ok(_) => None,
-            Err(_) => Some((
-                format!("invalid input syntax for type integer: \"{input}\""),
-                SqlErrorKind::InvalidTextRepresentation,
-            )),
-        },
-        "int8" | "bigint" => match trimmed.parse::<i64>() {
-            Ok(_) => None,
-            Err(_) => {
-                if trimmed.parse::<i128>().is_ok() {
-                    Some((
-                        format!("value \"{input}\" is out of range for type bigint"),
-                        SqlErrorKind::NumericValueOutOfRange,
-                    ))
-                } else {
-                    Some((
-                        format!("invalid input syntax for type bigint: \"{input}\""),
-                        SqlErrorKind::InvalidTextRepresentation,
-                    ))
-                }
-            }
-        },
+        "int2" | "smallint" => pg_int_input_error(input, 16, "smallint"),
+        "int4" | "integer" | "int" => pg_int_input_error(input, 32, "integer"),
+        "int8" | "bigint" => pg_int_input_error(input, 64, "bigint"),
         "float4" | "real" => match trimmed.parse::<f32>() {
             Ok(v) if v.is_infinite() => Some((
                 format!("value \"{input}\" is out of range for type real"),

@@ -17605,6 +17605,169 @@ fn a_string_parameter_assigned_to_another_category_is_42804() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// numfuzz (seeds 288 and 332 at 6e17acc9a, 432, 482, 483 and 551 at 5d2f9d25f; PG 18.6's answers in their findings,
+/// artie 9b32cd5149 and 3b3324b82e): a function or operator with no candidate is 42883 inside a cast too, and
+/// beside a cast to text or a `%` it is walked: trunc(x::text)::numeric, round(float8, -1)::numeric in a SET, text
+/// minus numeric, numeric times text, float8 % bigint and a prefix minus over text were each answered.
+#[test]
+fn a_function_or_operator_inside_a_cast_or_over_text_is_resolved_as_postgresql_does() {
+    let dir = Scratch::new("cast-resolve");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let mut wrong = Vec::new();
+    for (ddl, sql, message) in [
+        (
+            "CREATE TABLE nt (id int PRIMARY KEY, c0 numeric(38,10), c1 numeric, c2 numeric(38,10), c3 numeric(38,10))",
+            "SELECT (trunc((0.40263656853555)::text))::numeric(6,2) AS v",
+            "function trunc(text) does not exist",
+        ),
+        (
+            "CREATE TABLE nt (id int PRIMARY KEY, c0 double precision, c1 double precision)",
+            "UPDATE nt SET c0 = (round(-(c1), -1))::numeric(10,0) WHERE id = 1",
+            "function round(double precision, integer) does not exist",
+        ),
+        (
+            "CREATE TABLE nt (id int PRIMARY KEY, c0 real, c1 numeric(6,2), c2 smallint, c3 real)",
+            "UPDATE nt SET c1 = -(((c2)::text - 0.214185361151548)) WHERE id = 1",
+            "operator does not exist: text - numeric",
+        ),
+        (
+            "CREATE TABLE nt (id int PRIMARY KEY, c0 bigint, c1 int, c2 numeric(6,2), c3 numeric)",
+            "SELECT id, (345.2463 * ((c2 + c0))::text) AS v FROM nt ORDER BY id",
+            "operator does not exist: numeric * text",
+        ),
+        (
+            "CREATE TABLE nt (id int PRIMARY KEY, c0 int, c1 smallint, c2 double precision, c3 numeric(6,2))",
+            "SELECT (((c0)::float8 % 9223372036854775807))::numeric(10,0) AS u FROM (SELECT id, c0, c1, c2, c3 FROM nt) s ORDER BY id",
+            "operator does not exist: double precision % bigint",
+        ),
+        (
+            "CREATE TABLE nt (id int PRIMARY KEY, c0 real, c1 real, c2 real)",
+            "SELECT id, trunc(-((c0)::text)) AS v FROM nt ORDER BY id",
+            "operator does not exist: - text",
+        ),
+    ] {
+        for setup in ["DROP TABLE IF EXISTS nt", ddl, "INSERT INTO nt (id) VALUES (1)"] {
+            a.q(setup).ok(setup);
+        }
+        let r = a.q(sql);
+        if !r.error.as_ref().is_some_and(|e| e.code == "42883" && e.message == message) {
+            wrong.push(format!("{sql}: PG 42883 {message}; got {:?} {:?} {:?}", r.tags, r.rows, r.error));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// numfuzz (seeds 26 at e4882aaed, 249 and 328 at 6e17acc9a; artie 7ba22e107a, 9b32cd5149): a string literal
+/// assigned to an integer column is read as int2in/int4in/int8in read it, at parse analysis, so a statement
+/// matching no row is refused too, and a value of a string type assigned to a numeric or boolean column is
+/// 42804. Each was stored. Expected answers: PG 18.6, recorded (artie 0f7b0647a8,
+/// rec27-literal-assign/pg18-wirefuzz-a_string_literal_assigned_to_an_integer_column_is_read_as_its_input_reads_it.out),
+/// the text cast of a text column (wire-rev-1de981755-numeric MED-1) and pg_input_is_valid included, which share
+/// the reading: an overflow met among the digits is 22003 before a later character is judged. The numeric columns
+/// are numeric(p, s) (recorded, rec28-numeric-assign, artie 2a98f248a8): a bare NUMERIC is the registered float8
+/// class.
+#[test]
+fn a_string_literal_assigned_to_an_integer_column_is_read_as_its_input_reads_it() {
+    let dir = Scratch::new("literal-int");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let ddl = "CREATE TABLE nt (id int PRIMARY KEY, a smallint, b int, c bigint, d numeric(10,2), e boolean, f double precision, g text, h numeric(20,4))";
+    a.q(ddl).ok(ddl);
+    let mut wrong = Vec::new();
+    for (sql, code, message) in [
+        ("INSERT INTO nt (id, b) VALUES (1, '-61581827327558523.7178579001270')", "22003", r#"value "-61581827327558523.7178579001270" is out of range for type integer"#),
+        ("INSERT INTO nt (id, c) VALUES (1, '-568904564771040147.29832')", "22P02", r#"invalid input syntax for type bigint: "-568904564771040147.29832""#),
+        ("INSERT INTO nt (id, a) VALUES (1, '1e3')", "22P02", r#"invalid input syntax for type smallint: "1e3""#),
+        ("INSERT INTO nt (id, b) VALUES (1, '2147483649.5')", "22P02", r#"invalid input syntax for type integer: "2147483649.5""#),
+        ("INSERT INTO nt (id, b) VALUES (1, '21474836490.5')", "22003", r#"value "21474836490.5" is out of range for type integer"#),
+        ("INSERT INTO nt (id, b) VALUES (1, '2147483648')", "22003", r#"value "2147483648" is out of range for type integer"#),
+        ("INSERT INTO nt (id, b) VALUES (1, '-2147483648')", "", ""),
+        ("INSERT INTO nt (id, b) VALUES (2, ' 0x1F ')", "", ""),
+        ("INSERT INTO nt (id, b) VALUES (3, '1_000')", "", ""),
+        ("INSERT INTO nt (id, b) VALUES (4, '_1')", "22P02", r#"invalid input syntax for type integer: "_1""#),
+        ("INSERT INTO nt (id, b) VALUES (4, '1_')", "22P02", r#"invalid input syntax for type integer: "1_""#),
+        ("INSERT INTO nt (id, b) VALUES (4, '1__0')", "22P02", r#"invalid input syntax for type integer: "1__0""#),
+        ("INSERT INTO nt (id, b) VALUES (4, '0x_1')", "", ""),
+        ("INSERT INTO nt (id, b) VALUES (5, '0b101')", "", ""),
+        ("INSERT INTO nt (id, b) VALUES (6, '0o17')", "", ""),
+        ("INSERT INTO nt (id, b) VALUES (7, '+7')", "", ""),
+        ("INSERT INTO nt (id, b) VALUES (8, '')", "22P02", r#"invalid input syntax for type integer: """#),
+        ("INSERT INTO nt (id, b) VALUES (8, '-')", "22P02", r#"invalid input syntax for type integer: "-""#),
+        ("INSERT INTO nt (id, b) VALUES (8, '0x')", "22P02", r#"invalid input syntax for type integer: "0x""#),
+        ("INSERT INTO nt (id, b) VALUES (8, '0xFFFFFFFF')", "22003", r#"value "0xFFFFFFFF" is out of range for type integer"#),
+        ("INSERT INTO nt (id, b) VALUES (8, '-0x80000000')", "", ""),
+        ("INSERT INTO nt (id, c) VALUES (9, '-9223372036854775808')", "", ""),
+        ("INSERT INTO nt (id, c) VALUES (9, '9223372036854775808')", "22003", r#"value "9223372036854775808" is out of range for type bigint"#),
+        ("INSERT INTO nt (id, a, b) VALUES (10, '40000', 'x')", "22003", r#"value "40000" is out of range for type smallint"#),
+        ("INSERT INTO nt (id, b) VALUES (11, '1'), (12, 'x')", "22P02", r#"invalid input syntax for type integer: "x""#),
+        ("UPDATE nt SET c = '9223372036854775808' WHERE id = 1000", "22003", r#"value "9223372036854775808" is out of range for type bigint"#),
+        ("UPDATE nt SET c = (6.3e-3)::text WHERE id = 1", "42804", r#"column "c" is of type bigint but expression is of type text"#),
+        ("INSERT INTO nt (id, d) VALUES (13, 'abc'::text)", "42804", r#"column "d" is of type numeric but expression is of type text"#),
+        ("INSERT INTO nt (id, h) VALUES (13, '1.5'::varchar)", "42804", r#"column "h" is of type numeric but expression is of type character varying"#),
+        ("UPDATE nt SET h = 5::text WHERE id = 99", "42804", r#"column "h" is of type numeric but expression is of type text"#),
+        ("INSERT INTO nt (id, e) VALUES (13, 'true'::varchar)", "42804", r#"column "e" is of type boolean but expression is of type character varying"#),
+        ("INSERT INTO nt (id, f) VALUES (13, 'x'::char(3))", "42804", r#"column "f" is of type double precision but expression is of type character"#),
+        ("INSERT INTO nt (id, a) VALUES (13, 'x'::name)", "42804", r#"column "a" is of type smallint but expression is of type name"#),
+        ("INSERT INTO nt (id, g) VALUES (13, 5::text)", "", ""),
+        ("INSERT INTO nt (id, b) VALUES (1, 7) ON CONFLICT (id) DO UPDATE SET b = 'x'", "22P02", r#"invalid input syntax for type integer: "x""#),
+        ("INSERT INTO nt (id, b) VALUES (1, 7) ON CONFLICT (id) DO UPDATE SET c = 'y'::text", "42804", r#"column "c" is of type bigint but expression is of type text"#),
+    ] {
+        let r = a.q(sql);
+        let fine = if code.is_empty() {
+            r.error.is_none()
+        } else {
+            r.error.as_ref().is_some_and(|e| e.code == code && e.message == message)
+        };
+        if !fine {
+            wrong.push(format!("{sql}: PG {code:?} {message:?}; got {:?} {:?}", r.tags, r.error));
+        }
+    }
+    let rows = |v: &[(&str, Option<&str>, Option<&str>)]| -> Vec<Vec<Option<String>>> {
+        v.iter().map(|(id, b, c)| vec![Some(id.to_string()), b.map(str::to_string), c.map(str::to_string)]).collect()
+    };
+    let r = a.q("SELECT id, b, c FROM nt ORDER BY id");
+    let want = rows(&[
+        ("1", Some("-2147483648"), None),
+        ("2", Some("31"), None),
+        ("3", Some("1000"), None),
+        ("4", Some("1"), None),
+        ("5", Some("5"), None),
+        ("6", Some("15"), None),
+        ("7", Some("7"), None),
+        ("8", Some("-2147483648"), None),
+        ("9", None, Some("-9223372036854775808")),
+        ("13", None, None),
+    ]);
+    if r.error.is_some() || r.rows != want {
+        wrong.push(format!("SELECT id, b, c: PG {want:?}; got {:?} {:?}", r.rows, r.error));
+    }
+    let sql = "SELECT pg_input_is_valid('0x1F', 'int4'), pg_input_is_valid('2147483649.5', 'int4'), pg_input_is_valid('1_000', 'int8')";
+    let r = a.q(sql);
+    let want = vec![vec![Some("t".to_string()), Some("f".to_string()), Some("t".to_string())]];
+    if r.error.is_some() || r.rows != want {
+        wrong.push(format!("{sql}: PG {want:?}; got {:?} {:?}", r.rows, r.error));
+    }
+    for sql in ["CREATE TABLE tt (id int PRIMARY KEY, s text)", "INSERT INTO tt VALUES (1, ' 0x1F '), (2, '1_000'), (3, '21474836490.5'), (4, '2147483649.5')"] {
+        a.q(sql).ok(sql);
+    }
+    let r = a.q("SELECT s::int FROM tt WHERE id < 3 ORDER BY id");
+    let want = vec![vec![Some("31".to_string())], vec![Some("1000".to_string())]];
+    if r.error.is_some() || r.rows != want {
+        wrong.push(format!("SELECT s::int (ids 1, 2): PG {want:?}; got {:?} {:?}", r.rows, r.error));
+    }
+    for (sql, code, message) in [
+        ("SELECT s::int FROM tt WHERE id = 3", "22003", r#"value "21474836490.5" is out of range for type integer"#),
+        ("SELECT s::int FROM tt WHERE id = 4", "22P02", r#"invalid input syntax for type integer: "2147483649.5""#),
+    ] {
+        let r = a.q(sql);
+        if !r.error.as_ref().is_some_and(|e| e.code == code && e.message == message) {
+            wrong.push(format!("{sql}: PG {code} {message}; got {:?} {:?}", r.rows, r.error));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// numfuzz (its shard of seeds 21-220 at e4882aaed, PG 18.6's answers in its findings, artie 7ba22e107a; seeds 28, 40,
 /// 107, 155, 164): a numeric function or operator PostgreSQL has no candidate for is 42883, never answered: ceil, floor,
 /// round and trunc over an integer resolve to float8, which has no %, round and trunc with a scale take no float, and

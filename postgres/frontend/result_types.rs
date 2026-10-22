@@ -398,6 +398,9 @@ fn expression_type(node: &PgNode) -> Option<u32> {
         {
             return Some(INT8);
         }
+        // pg_input_is_valid is boolean; it was announced as the engine's integer, 1 or 0
+        // (recorded, rec27-literal-assign, artie 0f7b0647a8: t and f).
+        Node::FuncCall(call) if func_name(call).is_some_and(|n| n == "pg_input_is_valid") => true,
         Node::BoolExpr(_) | Node::NullTest(_) | Node::BooleanTest(_) => true,
         // NULLIF is its first argument's type.
         Node::AExpr(e) if e.kind() == AExprKind::AexprNullif => {
@@ -1141,7 +1144,7 @@ fn arithmetic(op: &str, a: u32, b: u32) -> Arithmetic {
 }
 
 /// A type's name as PostgreSQL writes it in "operator does not exist: a op b".
-fn type_name(t: u32) -> &'static str {
+pub(crate) fn type_name(t: u32) -> &'static str {
     match t {
         INT2 => "smallint",
         INT4 => "integer",
@@ -2794,7 +2797,14 @@ impl Infer<'_> {
                 Val::Sval(_) => Some(TEXT),
                 Val::Bsval(_) => None,
             },
-            Node::TypeCast(c) => cast_type(c),
+            // The operand is analysed for its own refusals, as PostgreSQL resolves it before the
+            // cast: trunc(x::text)::numeric is 42883 (numfuzz seed 551 at 5d2f9d25f: answered).
+            Node::TypeCast(c) => {
+                if let Some(arg) = c.arg.as_deref().filter(|a| param(a).is_none()) {
+                    self.type_of(arg, scope);
+                }
+                cast_type(c)
+            }
             Node::ParamRef(p) => u32::try_from(p.number)
                 .ok()
                 .and_then(|n| self.types.get(&n).copied()),
@@ -2930,6 +2940,11 @@ impl Infer<'_> {
                     },
                     (Some(a), None) if param(e.rexpr.as_deref()) => Some(a),
                     (None, Some(b)) if param(e.lexpr.as_deref()) => Some(b),
+                    // A prefix minus or plus has no candidate over a string type: 42883 'operator
+                    // does not exist: - text' (numfuzz seed 288 at 6e17acc9a: answered).
+                    (None, Some(b)) if e.lexpr.is_none() && matches!(op, Some("-" | "+")) && matches!(category(b), Some(('S', _))) => {
+                        self.refusal(SqlErrorKind::UndefinedFunction, format!("operator does not exist: {} {}", op.unwrap_or(""), type_name(b)))
+                    }
                     // A unary operator (`-x`) has no left side.
                     (None, Some(b)) if e.lexpr.is_none() => Some(b),
                     _ => None,

@@ -2151,10 +2151,15 @@ fn prepare_statement_parsed(
         // round(float8, 2): numfuzz at e4882aaed, answered where PostgreSQL has no candidate),
         // bounded by the text. BLIND SPOT: a CREATE VIEW is not walked for it (walking every view
         // as it is made warms the view memo, which changes how a deep chain is read later).
+        // So is one with a `%` or a cast to a string type, whose arithmetic the walk resolves
+        // (float8 % bigint, numeric * x::text: numfuzz seeds 482, 483 at 5d2f9d25f, answered).
         let numeric_call = || {
             [b"ceil(".as_slice(), b"ceiling(", b"floor(", b"round(", b"trunc(", b"abs(", b"sign(", b"sqrt(", b"exp(", b"ln(", b"log(", b"log10(", b"pow(", b"power("]
                 .iter()
                 .any(|w| may_name(w))
+                || [b"%".as_slice(), b"::text", b"::varchar", b"::char", b"::bpchar", b"::name", b"as text", b"as varchar", b"as char"]
+                    .iter()
+                    .any(|w| may_name(w))
         };
         if !used.is_empty() || aggregates.contains(&true) || min_max || unknown_call || numeric_call() || temporal() {
             // A parameter compared with something no context types is refused (42P18) by the
@@ -2364,9 +2369,13 @@ pub(crate) fn session_translation(
     // (wire-rev-1de981755-numeric MED-1); judged from the parse and the schema alone, so the engine's
     // re-prepare translates it alike.
     let text_casts = text_integer_casts(pg_conn, sql, parse_result);
+    // Each value assigned to a column is coerced as parse analysis coerces it, here so the
+    // re-prepare judges it alike; a literal an integer column reads is written as its value.
+    let integer_literals = literal_assignments(pg_conn, sql, parse_result).map_err(LimboError::InvalidArgument)?;
     let translator = || {
         let t = translator();
-        if text_casts.is_empty() { t } else { t.with_text_integer_casts(text_casts.clone()) }
+        let t = if text_casts.is_empty() { t } else { t.with_text_integer_casts(text_casts.clone()) };
+        if integer_literals.is_empty() { t } else { t.with_integer_literals(integer_literals.clone()) }
     };
     let first = translator();
     let mut translated = first
@@ -2502,6 +2511,134 @@ fn text_integer_casts(
         }
     }
     out
+}
+
+/// The values an INSERT's VALUES rows, an UPDATE's SET and an ON CONFLICT's SET assign, coerced as
+/// PostgreSQL's parse analysis coerces each to its column, in row and column order: a string
+/// literal to an integer column is read as int2in/int4in/int8in read it (22P02, 22003), and a cast
+/// to a string type to a numeric or boolean column is 42804, so a statement matching no row is
+/// refused as well (numfuzz seeds 26, 249, 328, 181; recorded, rec27-literal-assign, artie
+/// 0f7b0647a8). Each was stored. Returns the literals whose spelling the engine's integer column
+/// does not read ('0x1F', '1_000', ' 7'), by parse location, with their values. Bounded by the
+/// text: a statement with no quote and no `::` has no such value. BLIND SPOTS: a schema-qualified
+/// or attached table, an array or domain column, a column of another relation or an expression of
+/// a string type (upper('x')), INSERT ... SELECT, a DEFAULT, and a literal to a float, numeric or
+/// boolean column (stored as the engine reads it).
+fn literal_assignments(
+    pg_conn: &PgConnectionInner,
+    sql: &str,
+    parse: &turso_pg_parser::pg_query::ParseResult,
+) -> Result<std::collections::HashMap<i32, i64>, SqlErrorMessage> {
+    use turso_pg_parser::pg_query::protobuf::node::Node;
+    use turso_pg_parser::pg_query::protobuf::{a_const::Val, Node as PgNode};
+    let mut rewrites = std::collections::HashMap::new();
+    if !sql.as_bytes().contains(&b'\'') && !sql.as_bytes().windows(2).any(|w| w == b"::") {
+        return Ok(rewrites);
+    }
+    let Some(stmt) = parse.protobuf.stmts.first().and_then(|r| r.stmt.as_ref()).and_then(|s| s.node.as_ref()) else {
+        return Ok(rewrites);
+    };
+    let relation = match stmt {
+        Node::InsertStmt(i) => i.relation.as_ref(),
+        Node::UpdateStmt(u) => u.relation.as_ref(),
+        _ => return Ok(rewrites),
+    };
+    let Some(relation) = relation.filter(|r| r.schemaname.is_empty() || r.schemaname.eq_ignore_ascii_case("public")) else {
+        return Ok(rewrites);
+    };
+    let schema = pg_conn.conn.current_schema();
+    let Some(table) = schema.get_btree_table(&relation.relname) else { return Ok(rewrites) };
+    let declared = |column: &str| -> Option<u32> {
+        let (_, c) = table.get_column(column).filter(|(_, c)| c.array_dimensions() == 0)?;
+        u32::try_from(crate::catalog::sqlite_type_to_pg_oid(&c.ty_str)).ok()
+    };
+    let string_cast = |c: &turso_pg_parser::pg_query::protobuf::TypeCast| -> Option<u32> {
+        let t = c.type_name.as_ref().filter(|t| t.array_bounds.is_empty())?;
+        match t.names.last().and_then(|n| n.node.as_ref())? {
+            Node::String(s) => match s.sval.as_str() {
+                "text" => Some(25),
+                "varchar" => Some(1043),
+                "bpchar" => Some(1042),
+                "name" => Some(19),
+                _ => None,
+            },
+            _ => None,
+        }
+    };
+    // One value assigned to the column named `column`.
+    let mut coerce = |column: &str, value: &PgNode| -> Result<(), SqlErrorMessage> {
+        let Some(target) = declared(column) else { return Ok(()) };
+        match value.node.as_ref() {
+            Some(Node::AConst(c)) if !c.isnull => {
+                if let Some(Val::Sval(text)) = c.val.as_ref().filter(|_| matches!(target, 20 | 21 | 23)) {
+                    let name = crate::result_types::type_name(target);
+                    if let Some((message, kind)) = crate::functions::validate_pg_input(&text.sval, name) {
+                        return Err(SqlErrorMessage::classified(kind, message));
+                    }
+                    if let crate::functions::PgInt::Value(v) = crate::functions::pg_strtoint(&text.sval, 64) {
+                        if v.to_string() != text.sval {
+                            rewrites.insert(c.location, v);
+                        }
+                    }
+                }
+            }
+            Some(Node::TypeCast(c)) => {
+                if let Some(from) = string_cast(c).filter(|_| matches!(target, 16 | 20 | 21 | 23 | 700 | 701 | 1700)) {
+                    return Err(SqlErrorMessage::classified(
+                        SqlErrorKind::DatatypeMismatch,
+                        format!(
+                            "column \"{column}\" is of type {} but expression is of type {}",
+                            crate::result_types::type_name(target),
+                            crate::result_types::type_name(from)
+                        ),
+                    ));
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    };
+    let set_list = |targets: &[PgNode], coerce: &mut dyn FnMut(&str, &PgNode) -> Result<(), SqlErrorMessage>| -> Result<(), SqlErrorMessage> {
+        for t in targets {
+            if let Some(Node::ResTarget(r)) = t.node.as_ref() {
+                if let (Some(val), true) = (r.val.as_deref(), r.indirection.is_empty()) {
+                    coerce(&r.name, val)?;
+                }
+            }
+        }
+        Ok(())
+    };
+    match stmt {
+        Node::InsertStmt(i) => {
+            let columns: Vec<String> = if i.cols.is_empty() {
+                table.columns().iter().filter_map(|c| c.name.clone()).collect()
+            } else {
+                i.cols
+                    .iter()
+                    .filter_map(|c| match c.node.as_ref() {
+                        Some(Node::ResTarget(r)) if r.indirection.is_empty() => Some(r.name.clone()),
+                        _ => None,
+                    })
+                    .collect()
+            };
+            if let Some(Node::SelectStmt(select)) = i.select_stmt.as_deref().and_then(|s| s.node.as_ref()) {
+                for row in &select.values_lists {
+                    if let Some(Node::List(items)) = row.node.as_ref() {
+                        for (column, value) in columns.iter().zip(&items.items) {
+                            coerce(column, value)?;
+                        }
+                    }
+                }
+            }
+            if let Some(conflict) = i.on_conflict_clause.as_ref() {
+                set_list(&conflict.target_list, &mut coerce)?;
+            }
+        }
+        Node::UpdateStmt(u) => set_list(&u.target_list, &mut coerce)?,
+        _ => {}
+    }
+    drop(coerce);
+    Ok(rewrites)
 }
 
 /// A translation's refusal as the engine error it is reported with: PostgreSQL's own message, with
