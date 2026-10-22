@@ -17736,6 +17736,75 @@ fn a_constant_cast_past_numeric_p_s_is_22003_with_no_row() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// The lead's ruling (LEAD-RULINGS 3abd61b6d3 (b), float, numeric and boolean targets; numfuzz seeds 2231 at 06dab5fdd and
+/// 2436 at 51abb3860): a constant assigned to a real, double precision, numeric(p, s) or boolean column is read as its
+/// input routine or cast reads it, even when no row matches: float4in/float8in (hexadecimal included, a value past the
+/// type 22003 in the input's words, a numeric constant past it in numeric_out's), numeric(p, s) (22003 'numeric field
+/// overflow', Infinity past every p), boolin, an integer into a boolean column 42804, and a numeric NaN or Infinity
+/// into an integer column 0A000. Expected answers: PG 18.6, recorded (artie 73a27af044,
+/// rec42-float-numeric-bool-assign/pg18-wirefuzz-a_float_numeric_or_boolean_column_reads_its_literal_as_its_input_routine_does.out),
+/// but its bare numeric column (the registered float8 class) and the ' 1.5 ' PG refused as a duplicate key.
+#[test]
+fn a_float_numeric_or_boolean_column_reads_its_literal_as_its_input_routine_does() {
+    let dir = Scratch::new("float-numeric-bool-assign");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let ddl = "CREATE TABLE fb (id int PRIMARY KEY, r real, d double precision, n numeric(6,2), m numeric, b boolean, i int, s smallint)";
+    a.q(ddl).ok(ddl);
+    let expanded = format!(r#""1{}" is out of range for type double precision"#, "0".repeat(400));
+    let mut wrong = Vec::new();
+    for (sql, code, message) in [
+        ("INSERT INTO fb (id, r) VALUES (1, 'abc')", "22P02", r#"invalid input syntax for type real: "abc""#),
+        ("INSERT INTO fb (id, d) VALUES (1, '1e400')", "22003", r#""1e400" is out of range for type double precision"#),
+        ("INSERT INTO fb (id, r) VALUES (1, '1e39')", "22003", r#""1e39" is out of range for type real"#),
+        ("INSERT INTO fb (id, r) VALUES (1, '0x1F')", "", ""),
+        ("INSERT INTO fb (id, d) VALUES (2, '-inf')", "", ""),
+        ("INSERT INTO fb (id, d) VALUES (3, 'NaN')", "", ""),
+        ("INSERT INTO fb (id, r) VALUES (4, 1e39)", "22003", r#""1000000000000000000000000000000000000000" is out of range for type real"#),
+        ("INSERT INTO fb (id, d) VALUES (4, 1e400)", "22003", expanded.as_str()),
+        ("INSERT INTO fb (id, n) VALUES (4, 'abc')", "22P02", r#"invalid input syntax for type numeric: "abc""#),
+        ("INSERT INTO fb (id, n) VALUES (4, '12345.678')", "22003", "numeric field overflow"),
+        ("INSERT INTO fb (id, n) VALUES (4, 'Infinity')", "22003", "numeric field overflow"),
+        ("INSERT INTO fb (id, n) VALUES (4, ' 1.555 ')", "", ""),
+        ("INSERT INTO fb (id, b) VALUES (8, 'maybe')", "22P02", r#"invalid input syntax for type boolean: "maybe""#),
+        ("INSERT INTO fb (id, b) VALUES (8, 'yes')", "", ""),
+        ("INSERT INTO fb (id, b) VALUES (9, 1)", "42804", r#"column "b" is of type boolean but expression is of type integer"#),
+        ("INSERT INTO fb (id, b) VALUES (9, ' off ')", "", ""),
+        ("INSERT INTO fb (id, s) VALUES (10, '-Infinity'::numeric)", "0A000", "cannot convert infinity to smallint"),
+        ("INSERT INTO fb (id, i) VALUES (10, 'NaN'::numeric)", "0A000", "cannot convert NaN to integer"),
+        ("INSERT INTO fb (id, n) VALUES (10, (1.510e300)::float8)", "22003", "numeric field overflow"),
+        ("INSERT INTO fb (id, n) VALUES (10, (12.345)::float8)", "", ""),
+        ("UPDATE fb SET r = 'abc' WHERE id = 1000", "22P02", r#"invalid input syntax for type real: "abc""#),
+    ] {
+        let r = a.q(sql);
+        let fine = if code.is_empty() {
+            r.error.is_none()
+        } else {
+            r.error.as_ref().is_some_and(|e| e.code == code && e.message == message)
+        };
+        if !fine {
+            wrong.push(format!("{sql}: PG {code:?} {:?}; got {:?} {:?}", &message[..message.len().min(80)], r.tags, r.error.as_ref().map(|e| (e.code.clone(), e.message.chars().take(100).collect::<String>()))));
+        }
+    }
+    let r = a.q("SELECT id, r, d, n, b FROM fb ORDER BY id");
+    let want: Vec<Vec<Option<String>>> = [
+        ["1", "31", "", "", ""],
+        ["2", "", "-Infinity", "", ""],
+        ["3", "", "NaN", "", ""],
+        ["4", "", "", "1.56", ""],
+        ["8", "", "", "", "t"],
+        ["9", "", "", "", "f"],
+        ["10", "", "", "12.35", ""],
+    ]
+    .iter()
+    .map(|row| row.iter().map(|v| (!v.is_empty()).then(|| v.to_string())).collect())
+    .collect();
+    if r.error.is_some() || r.rows != want {
+        wrong.push(format!("SELECT: PG {want:?}; got {:?} {:?}", r.rows, r.error));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// The lead's ruling (LEAD-RULINGS 0fac7e134e), the condition on 8f49aa6f1: ALTER COLUMN SET DEFAULT, which this server
 /// does not implement, is refused loudly, 0A000, and changes nothing: the column keeps its default (none) and an
 /// INSERT omitting it stores NULL.
