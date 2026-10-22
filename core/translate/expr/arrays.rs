@@ -91,7 +91,18 @@ pub(super) fn emit_array_element_loop(
         dest: reg_elem,
     });
 
-    // Apply per-element transform expression
+    // Apply the per-element transform to a non-NULL element only: a NULL element stays NULL, as a
+    // NULL column value skips its type's ENCODE and DECODE (emit_custom_type_encode_columns).
+    // boolean's DECODE (`CASE WHEN value THEN 1 ELSE 0 END`) made a NULL element 0 (fastest-engine,
+    // the lead's SILENT HIGH: '{t,f,NULL}' read back '{1,0,0}'). Mutant
+    // `array_element_null_transformed` (test builds only): transformed, as before.
+    let label_store = program.allocate_label();
+    if !crate::branch::store::fe_mutant("array_element_null_transformed") {
+        program.emit_insn(Insn::IsNull {
+            reg: reg_elem,
+            target_pc: label_store,
+        });
+    }
     emit_type_expr(
         program,
         transform_expr,
@@ -101,6 +112,7 @@ pub(super) fn emit_array_element_loop(
         type_def,
         resolver,
     )?;
+    program.preassign_label_to_next_insn(label_store);
 
     // Store transformed element into contiguous register block at 0-based offset
     program.emit_insn(Insn::RegCopyOffset {
@@ -201,7 +213,26 @@ pub(crate) fn emit_array_decode(
     resolver: &Resolver,
 ) -> Result<()> {
     if let Some(type_def) = resolver.schema().get_type_def_unchecked(&col.ty_str) {
-        if let Some(decode_expr) = type_def.decode() {
+        if type_def.is_builtin
+            && type_def.name.eq_ignore_ascii_case("boolean")
+            && !crate::branch::store::fe_mutant("boolean_array_elements_as_integers")
+        {
+            // A boolean array's text writes each element as PostgreSQL's boolean output does,
+            // t or f (PG 18.6: '{yes,off,NULL}' reads '{t,f,NULL}'). boolean's own DECODE gives the
+            // 1/0 the engine computes with (a scalar boolean is shown t/f by the frontend from its
+            // type), and an array's text is built here, element by element, so the array writes
+            // the shown form itself (fastest-engine, the lead's SILENT HIGH). NULL elements skip
+            // the transform in the loop.
+            let shown = ast::Expr::Case {
+                base: None,
+                when_then_pairs: vec![(
+                    Box::new(ast::Expr::Id(ast::Name::exact("value".to_string()))),
+                    Box::new(ast::Expr::Literal(ast::Literal::String("'t'".to_string()))),
+                )],
+                else_expr: Some(Box::new(ast::Expr::Literal(ast::Literal::String("'f'".to_string())))),
+            };
+            emit_array_element_loop(program, reg, &shown, col, type_def, resolver)?;
+        } else if let Some(decode_expr) = type_def.decode() {
             emit_array_element_loop(program, reg, decode_expr, col, type_def, resolver)?;
         }
     }
