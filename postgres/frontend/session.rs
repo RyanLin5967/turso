@@ -2121,8 +2121,10 @@ fn prepare_statement_parsed(
         };
         // ... and for a statement calling a numeric function the walk resolves (ceil(text),
         // round(float8, 2): numfuzz at e4882aaed, answered where PostgreSQL has no candidate),
-        // bounded by the text. BLIND SPOT: a CREATE VIEW is not walked for it (walking every view
-        // as it is made warms the view memo, which changes how a deep chain is read later).
+        // bounded by the text. A CREATE VIEW that spells one is walked too (its query, for its
+        // refusals alone: a_view_whose_query_has_no_candidate_is_42883); one that spells none is not,
+        // since walking every view as it is made warms the view memo, which changes how a deep chain
+        // is read later. (5d2f9d25f called the whole of CREATE VIEW a blind spot, which was wrong.)
         // So is one with a `%` or a cast to a string type, whose arithmetic the walk resolves
         // (float8 % bigint, numeric * x::text: numfuzz seeds 482, 483 at 5d2f9d25f, answered).
         let numeric_call = || {
