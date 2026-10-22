@@ -147,8 +147,24 @@ pub(crate) fn count_barrier_fallback() {
     SYNC_COUNTS[3].fetch_add(1, crate::sync::atomic::Ordering::Relaxed);
 }
 
+/// PROBE, not for delivery: while armed (Some), every counted sync appends the issuing thread's
+/// name (libtest names a test's thread after the test) and a backtrace.
+#[cfg(test)]
+pub static SYNC_PROBE: std::sync::Mutex<Option<Vec<String>>> = std::sync::Mutex::new(None);
+
 /// Count one sync: `full` for `fcntl(F_FULLFSYNC)`, else `fsync(2)`.
 pub(crate) fn count_sync(full: bool) {
+    #[cfg(test)]
+    if let Ok(mut g) = SYNC_PROBE.lock() {
+        if let Some(log) = g.as_mut() {
+            let t = std::thread::current();
+            log.push(format!(
+                "full={full} thread={:?}\n{}",
+                t.name(),
+                std::backtrace::Backtrace::force_capture()
+            ));
+        }
+    }
     SYNC_COUNTS[usize::from(full)].fetch_add(1, crate::sync::atomic::Ordering::Relaxed);
     #[cfg(test)]
     crate::branch::store::note_sync();
