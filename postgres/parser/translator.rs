@@ -251,9 +251,13 @@ pub struct PostgreSQLTranslator {
     text_integer_casts: Option<std::collections::HashSet<i32>>,
     /// The string and numeric literals (by their parse locations) the caller read as an integer
     /// column's assignment reads them ([`PostgreSQLTranslator::with_integer_literals`]): written as
-    /// the value's decimal text, which the engine's integer column takes ('0x1F' is 31, '1_000' is
-    /// 1000, 1.5 is 2).
+    /// the value as a number, which the engine's integer column and a domain over one take ('0x1F'
+    /// is 31, '1_000' is 1000, 1.5 is 2; a text failed the domain's check, rec41).
     integer_literals: Option<std::collections::HashMap<i32, i64>>,
+    /// The string literals (by parse location) the caller rewrote as other text
+    /// ([`PostgreSQLTranslator::with_text_literals`]): an integer array literal's canonical
+    /// elements, which the engine's integer array stores.
+    text_literals: Option<std::collections::HashMap<i32, String>>,
     /// The cast targets this translation met that are neither built-in nor known, lowercased, for
     /// the caller to look up ([`PostgreSQLTranslator::unmapped_cast_types`]). A cast to a domain
     /// was dropped here, so `CAST(-5 AS dm)` skipped dm's CHECK and returned -5 (the domain CHECK
@@ -405,6 +409,11 @@ impl PostgreSQLTranslator {
     /// tell a text column from a numeric(p, s) column's decimal text).
     pub fn with_text_integer_casts(mut self, locations: std::collections::HashSet<i32>) -> Self {
         self.text_integer_casts = Some(locations);
+        self
+    }
+
+    pub fn with_text_literals(mut self, values: std::collections::HashMap<i32, String>) -> Self {
+        self.text_literals = Some(values);
         self
     }
 
@@ -3857,7 +3866,7 @@ impl PostgreSQLTranslator {
                 // A cast of a constant the caller read as an integer column's assignment reads it
                 // ([`PostgreSQLTranslator::with_integer_literals`]): its value ('2.5'::numeric is 3).
                 if let Some(v) = cast_rewrite_key(type_cast).and_then(|key| self.integer_literals.as_ref()?.get(&key)) {
-                    return Ok(ast::Expr::Literal(sql_string(&v.to_string())));
+                    return Ok(ast::Expr::Literal(ast::Literal::Numeric(v.to_string())));
                 }
                 // An explicit cast to varchar(n) cuts its value to n characters, as PostgreSQL's
                 // explicit-cast length coercion does: the cast without its length, then the cut
@@ -4629,7 +4638,10 @@ impl PostgreSQLTranslator {
                 )),
                 pg_query::protobuf::a_const::Val::Sval(s) => {
                     if let Some(v) = self.integer_literals.as_ref().and_then(|m| m.get(&a_const.location)) {
-                        return Ok(ast::Expr::Literal(sql_string(&v.to_string())));
+                        return Ok(ast::Expr::Literal(ast::Literal::Numeric(v.to_string())));
+                    }
+                    if let Some(t) = self.text_literals.as_ref().and_then(|m| m.get(&a_const.location)) {
+                        return Ok(ast::Expr::Literal(sql_string(t)));
                     }
                     // Turso's AST expects string literals to include surrounding single quotes
                     // (sanitize_string strips them during bytecode emission): sql_string.
@@ -4637,7 +4649,7 @@ impl PostgreSQLTranslator {
                 }
                 pg_query::protobuf::a_const::Val::Fval(f) => {
                     if let Some(v) = self.integer_literals.as_ref().and_then(|m| m.get(&a_const.location)) {
-                        return Ok(ast::Expr::Literal(sql_string(&v.to_string())));
+                        return Ok(ast::Expr::Literal(ast::Literal::Numeric(v.to_string())));
                     }
                     Ok(ast::Expr::Literal(ast::Literal::Numeric(decimal_numeric_literal(&f.fval))))
                 }

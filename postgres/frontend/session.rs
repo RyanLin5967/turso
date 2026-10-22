@@ -656,7 +656,7 @@ fn refuse_long_decimals(
     // seed 622 at 45de98440). One within it is exempt: literal_assignments reads it exactly and the
     // translator writes its value, never a float (the lead's ruling LEAD-RULINGS 82dcec6b66, for
     // integer columns on its paths alone; recorded, rec34-long-decimal-integer, artie afd9557309).
-    let integer = literal_assignments(pg_conn, parse).map_err(LimboError::InvalidArgument)?;
+    let (integer, _) = literal_assignments(pg_conn, parse).map_err(LimboError::InvalidArgument)?;
     let (default_values, deferred_defaults) = default_coercions(parse).map_err(LimboError::InvalidArgument)?;
     let mut exempt = float_target_literals(pg_conn, parse);
     exempt.extend(integer.keys().chain(default_values.keys()).chain(deferred_defaults.keys()).filter_map(|l| usize::try_from(*l).ok()));
@@ -2380,7 +2380,7 @@ pub(crate) fn session_translation(
     let text_casts = text_integer_casts(pg_conn, sql, parse_result);
     // Each value assigned to a column is coerced as parse analysis coerces it, here so the
     // re-prepare judges it alike; a literal an integer column reads is written as its value.
-    let integer_literals = literal_assignments(pg_conn, parse_result).map_err(LimboError::InvalidArgument)?;
+    let (integer_literals, text_literals) = literal_assignments(pg_conn, parse_result).map_err(LimboError::InvalidArgument)?;
     // ... and a CREATE TABLE's or ADD COLUMN's DEFAULT as DDL coerces it: its refusals here, its
     // values by the translator itself (integer_default), since the table's text is translated
     // again at each schema load.
@@ -2389,6 +2389,7 @@ pub(crate) fn session_translation(
     let translator = || {
         let t = translator();
         let t = if text_casts.is_empty() { t } else { t.with_text_integer_casts(text_casts.clone()) };
+        let t = if text_literals.is_empty() { t } else { t.with_text_literals(text_literals.clone()) };
         if integer_literals.is_empty() { t } else { t.with_integer_literals(integer_literals.clone()) }
     };
     let first = translator();
@@ -2536,8 +2537,10 @@ fn text_integer_casts(
 /// half away from zero and range-checked (22003 'integer out of range'); a cast to a string type
 /// to a numeric or boolean column is 42804. Returns the literals whose spelling the engine's
 /// integer column does not read ('0x1F', '1_000', ' 7', 1.5), by parse location, with their values.
-/// Every INSERT and UPDATE passes here, so nothing is allocated per value. BLIND SPOTS: an
-/// attached schema's table ([`resolves_to_main`]), an array or domain column, a column of another relation or
+/// Every INSERT and UPDATE passes here, so nothing is allocated per value of a builtin type (a
+/// domain's base is looked up). An integer array's literal is read element by element and a domain
+/// through its base type (rec41). BLIND SPOTS: an attached schema's table ([`resolves_to_main`]), an
+/// array of another element type, a domain's CHECK (the engine's), a column of another relation or
 /// an expression of a string type (upper('x')), a negated or hexadecimal constant, a set
 /// operation's branches, a DEFAULT, and a literal to a float or boolean column (stored as the
 /// engine reads it). A constant to a numeric(p, s) column past it is 22003 'numeric field
@@ -2716,26 +2719,29 @@ fn resolves_to_main(pg_conn: &PgConnectionInner, relation: &turso_pg_parser::pg_
     }
 }
 
+#[allow(clippy::type_complexity)]
 fn literal_assignments(
     pg_conn: &PgConnectionInner,
     parse: &turso_pg_parser::pg_query::ParseResult,
-) -> Result<std::collections::HashMap<i32, i64>, SqlErrorMessage> {
+) -> Result<(std::collections::HashMap<i32, i64>, std::collections::HashMap<i32, String>), SqlErrorMessage> {
     use turso_pg_parser::pg_query::protobuf::node::Node;
     use turso_pg_parser::pg_query::protobuf::{a_const::Val, Node as PgNode};
     let mut rewrites = std::collections::HashMap::new();
+    // String literals rewritten as other text: an integer array's canonical elements.
+    let mut text_rewrites: std::collections::HashMap<i32, String> = std::collections::HashMap::new();
     let Some(stmt) = parse.protobuf.stmts.first().and_then(|r| r.stmt.as_ref()).and_then(|s| s.node.as_ref()) else {
-        return Ok(rewrites);
+        return Ok((rewrites, text_rewrites));
     };
     let relation = match stmt {
         Node::InsertStmt(i) => i.relation.as_ref(),
         Node::UpdateStmt(u) => u.relation.as_ref(),
-        _ => return Ok(rewrites),
+        _ => return Ok((rewrites, text_rewrites)),
     };
     let Some(relation) = relation.filter(|r| resolves_to_main(pg_conn, r)) else {
-        return Ok(rewrites);
+        return Ok((rewrites, text_rewrites));
     };
     let schema = pg_conn.conn.current_schema();
-    let Some(table) = schema.get_btree_table(&relation.relname) else { return Ok(rewrites) };
+    let Some(table) = schema.get_btree_table(&relation.relname) else { return Ok((rewrites, text_rewrites)) };
     // An integer column's width from its declared type, read without allocating.
     let integer_bits = |ty: &str| -> u32 {
         let base = ty.split('(').next().unwrap_or("").trim();
@@ -2750,8 +2756,47 @@ fn literal_assignments(
             0
         }
     };
-    let column_type = |column: &str| -> Option<&str> {
-        table.get_column(column).filter(|(_, c)| c.array_dimensions() == 0).map(|(_, c)| c.ty_str.as_str())
+    // A declared type this server names itself (no domain lookup, so a text column pays nothing).
+    let builtin = |ty: &str| {
+        let base = ty.split('(').next().unwrap_or("").trim();
+        integer_bits(ty) > 0
+            || [
+                "TEXT", "VARCHAR", "CHAR", "BPCHAR", "NAME", "CHARACTER VARYING", "REAL", "DOUBLE", "DOUBLE PRECISION", "FLOAT",
+                "FLOAT4", "FLOAT8", "NUMERIC", "DECIMAL", "BOOLEAN", "BOOL", "BLOB", "BYTEA", "DATE", "TIME", "TIMETZ", "TIMESTAMP",
+                "TIMESTAMPTZ", "INTERVAL", "UUID", "JSON", "JSONB", "INET", "CIDR", "MACADDR", "OID",
+            ]
+            .iter()
+            .any(|n| base.eq_ignore_ascii_case(n))
+    };
+    // A domain's base type, its chain chased (a domain over a domain), for a column declared with
+    // one: an assignment to it is coerced to the base first, as PostgreSQL's coerce_to_domain
+    // coerces it (recorded, rec41-array-domain-assign, artie 3b8380247f).
+    let domain_base = |ty: &str| -> Option<String> {
+        if builtin(ty) {
+            return None;
+        }
+        let mut current = ty.to_string();
+        let mut found = false;
+        for _ in 0..8 {
+            match schema.get_type_def_unchecked(&current) {
+                Some(td) if td.is_domain => match &td.kind {
+                    turso_core::schema::TypeDefKind::Custom { base, .. } => {
+                        current = base.clone();
+                        found = true;
+                    }
+                    _ => return None,
+                },
+                _ => break,
+            }
+        }
+        found.then_some(current)
+    };
+    let column_type = |column: &str| -> Option<std::borrow::Cow<'_, str>> {
+        let (_, c) = table.get_column(column).filter(|(_, c)| c.array_dimensions() == 0)?;
+        Some(match domain_base(&c.ty_str) {
+            Some(base) => std::borrow::Cow::Owned(base),
+            None => std::borrow::Cow::Borrowed(c.ty_str.as_str()),
+        })
     };
     // A numeric(p, s) column's modifiers, from its type's parameters, read without allocating.
     let numeric_typmod = |c: &turso_core::schema::Column| -> Option<(i32, i32)> {
@@ -2781,7 +2826,10 @@ fn literal_assignments(
     let has_narrow = table
         .columns()
         .iter()
-        .any(|c| c.array_dimensions() == 0 && (integer_bits(&c.ty_str) == 16 || numeric_typmod(c).is_some()));
+        .any(|c| {
+            c.array_dimensions() == 0
+                && (integer_bits(&c.ty_str) == 16 || numeric_typmod(c).is_some() || domain_base(&c.ty_str).is_some_and(|b| integer_bits(&b) == 16))
+        });
     let string_cast = |c: &turso_pg_parser::pg_query::protobuf::TypeCast| -> Option<u32> {
         let t = c.type_name.as_ref().filter(|t| t.array_bounds.is_empty())?;
         match t.names.last().and_then(|n| n.node.as_ref())? {
@@ -2836,6 +2884,23 @@ fn literal_assignments(
         Some((target, typmods, text))
     };
     let mut coerce = |column: &str, value: &PgNode| -> Result<(), SqlErrorMessage> {
+        // A string literal to an integer array column: each element read by the element type's
+        // input routine (rec41), the literal rewritten as its canonical elements when one changes.
+        if let (Some((_, c)), Some(Node::AConst(k))) = (table.get_column(column), value.node.as_ref()) {
+            if c.array_dimensions() > 0 && integer_bits(&c.ty_str) > 0 && k.location >= 0 {
+                if let Some(Val::Sval(text)) = k.val.as_ref() {
+                    let name = crate::result_types::type_name(match integer_bits(&c.ty_str) {
+                        16 => 21,
+                        32 => 23,
+                        _ => 20,
+                    });
+                    if let Some(canonical) = integer_array_literal(&text.sval, name)? {
+                        text_rewrites.insert(k.location, canonical);
+                    }
+                }
+                return Ok(());
+            }
+        }
         // A constant to a numeric(p, s) column past it: 22003 'numeric field overflow'.
         if let Some((precision, scale)) = numeric_column(column) {
             let text = match value.node.as_ref() {
@@ -2874,7 +2939,7 @@ fn literal_assignments(
                 if !matches!(c.val, Some(Val::Ival(_) | Val::Fval(_) | Val::Sval(_))) {
                     return Ok(());
                 }
-                let bits = column_type(column).map_or(0, integer_bits);
+                let bits = column_type(column).map_or(0, |t| integer_bits(&t));
                 if bits == 0 {
                     return Ok(());
                 }
@@ -2913,7 +2978,7 @@ fn literal_assignments(
                 }
             }
             Some(Node::TypeCast(c)) if constant_cast(c).is_some() => {
-                let bits = column_type(column).map_or(0, integer_bits);
+                let bits = column_type(column).map_or(0, |t| integer_bits(&t));
                 let Some((target, typmods, text)) = constant_cast(c).filter(|_| bits > 0) else { return Ok(()) };
                 let width = |name: &str| match name {
                     "int2" => Some((16, "smallint")),
@@ -2977,13 +3042,15 @@ fn literal_assignments(
             }
             Some(Node::TypeCast(c)) => {
                 if let Some(from) = string_cast(c) {
-                    let target = column_type(column).map_or(25, |ty| crate::catalog::sqlite_type_to_pg_oid(ty) as u32);
+                    let target = column_type(column).map_or(25, |ty| crate::catalog::sqlite_type_to_pg_oid(&ty) as u32);
                     if matches!(target, 16 | 20 | 21 | 23 | 700 | 701 | 1700) {
+                        // A domain is named as declared ('column "p" is of type posint', rec41).
+                        let declared = table.get_column(column).map(|(_, c)| c.ty_str.as_str()).filter(|ty| domain_base(ty).is_some());
                         return Err(SqlErrorMessage::classified(
                             SqlErrorKind::DatatypeMismatch,
                             format!(
                                 "column \"{column}\" is of type {} but expression is of type {}",
-                                crate::result_types::type_name(target),
+                                declared.unwrap_or(crate::result_types::type_name(target)),
                                 crate::result_types::type_name(from)
                             ),
                         ));
@@ -3044,7 +3111,95 @@ fn literal_assignments(
         _ => {}
     }
     drop(coerce);
-    Ok(rewrites)
+    Ok((rewrites, text_rewrites))
+}
+
+/// An integer array literal read as array_in reads it, each element by int2in/int4in/int8in
+/// (`name` is the element type's): Err with that routine's refusal of an element; Ok(Some) with the
+/// literal's canonical text when an element is spelled otherwise ('{1, 0x1F, 1_000}' is
+/// {1,31,1000}; recorded, rec41-array-domain-assign); Ok(None) when unchanged, or when it is not a
+/// literal this reads (dimension decorations, unbalanced braces), which the engine judges.
+fn integer_array_literal(text: &str, name: &str) -> Result<Option<String>, SqlErrorMessage> {
+    let b = text.as_bytes();
+    let blank = |c: u8| matches!(c, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c);
+    let mut out = String::with_capacity(text.len());
+    let (mut i, mut depth) = (0usize, 0i32);
+    while i < b.len() && blank(b[i]) {
+        i += 1;
+    }
+    if b.get(i) != Some(&b'{') {
+        return Ok(None);
+    }
+    let element = |raw: &str, out: &mut String| -> Result<(), SqlErrorMessage> {
+        if let Some((message, kind)) = crate::functions::validate_pg_input(raw, name) {
+            return Err(SqlErrorMessage::classified(kind, message));
+        }
+        match crate::functions::pg_strtoint(raw, 64) {
+            crate::functions::PgInt::Value(v) => out.push_str(&v.to_string()),
+            _ => out.push_str(raw),
+        }
+        Ok(())
+    };
+    while i < b.len() {
+        match b[i] {
+            c if blank(c) => i += 1,
+            b'{' => {
+                depth += 1;
+                out.push('{');
+                i += 1;
+            }
+            b'}' => {
+                depth -= 1;
+                out.push('}');
+                i += 1;
+                if depth == 0 {
+                    if b[i..].iter().any(|c| !blank(*c)) {
+                        return Ok(None);
+                    }
+                    break;
+                }
+            }
+            b',' => {
+                out.push(',');
+                i += 1;
+            }
+            b'"' => {
+                let mut raw = String::new();
+                i += 1;
+                while i < b.len() && b[i] != b'"' {
+                    if b[i] == b'\\' && i + 1 < b.len() {
+                        i += 1;
+                    }
+                    raw.push(b[i] as char);
+                    i += 1;
+                }
+                if i >= b.len() {
+                    return Ok(None);
+                }
+                i += 1;
+                element(&raw, &mut out)?;
+            }
+            _ => {
+                let start = i;
+                while i < b.len() && !matches!(b[i], b',' | b'}' | b'{' | b'"') {
+                    i += 1;
+                }
+                let raw = text[start..i].trim_end_matches(|c: char| c.is_ascii_whitespace());
+                if raw.contains('\\') || !raw.is_ascii() {
+                    return Ok(None);
+                }
+                if raw.eq_ignore_ascii_case("NULL") {
+                    out.push_str("NULL");
+                } else {
+                    element(raw, &mut out)?;
+                }
+            }
+        }
+    }
+    if depth != 0 {
+        return Ok(None);
+    }
+    Ok((out != text).then_some(out))
 }
 
 /// A constant cast to numeric(p, s) past it is 22003 'numeric field overflow', as the planner's
