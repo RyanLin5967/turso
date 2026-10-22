@@ -18039,6 +18039,29 @@ fn a_from_subquery_alias_column_list_names_its_columns() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// numfuzz seeds 8054 and 8137 at f1dc48429 (SILENT; PG 18.6's answers recorded by the fuzzer on eceubuntu2, artie
+/// numfuzz-f1dc48429-s8021-8220, 5f7c6e8c89): integer + integer is computed in int4, so 2147483647 + 15 is 22003 'integer
+/// out of range', and the planner folds a constant one even over an empty table. The engine's i64 answered SELECT 0 over
+/// the empty table (8054) and a value (8137).
+#[test]
+fn integer_arithmetic_past_int4_is_out_of_range() {
+    let dir = Scratch::new("int4-arith-range");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let mut wrong = Vec::new();
+    a.q("CREATE TABLE nt (id int PRIMARY KEY, c0 numeric(20,5), c1 smallint, c2 bigint)").ok("8054 table");
+    let r = a.q("SELECT (((2147483647 + 0o17))::float8)::numeric(10,0) AS u FROM (SELECT id, c0, c1, c2 FROM nt) s ORDER BY id");
+    if !r.error.as_ref().is_some_and(|e| e.code == "22003" && e.message == "integer out of range") {
+        wrong.push(format!("8054: PG 22003 \"integer out of range\"; got {:?} {:?} {:?}", r.tags, r.rows, r.error));
+    }
+    a.q("CREATE TABLE nt2 (id int PRIMARY KEY, c0 numeric(6,2), c1 numeric(38,10))").ok("8137 table");
+    let r = a.q("WITH w AS (SELECT 0.3296671031957 AS v) SELECT v, (((2147483647 + 1) % ((-0.262040180) / v)) * '-0.000001'::numeric) AS u FROM w");
+    if !r.error.as_ref().is_some_and(|e| e.code == "22003" && e.message == "integer out of range") {
+        wrong.push(format!("8137: PG 22003 \"integer out of range\"; got {:?} {:?} {:?}", r.tags, r.rows, r.error));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// numfuzz seed 6261 at 4c7bc6102 (artie numfuzz-4c7bc6102-s6221-6420, PG 18.6's answer recorded by the fuzzer on
 /// eceubuntu2): abs of a smallint is a smallint, so abs(-32768) is 22003 'smallint out of range'; it answered 32768.
 /// The engine holds every integer as an i64, so only the declared width can refuse it.
