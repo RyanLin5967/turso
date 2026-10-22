@@ -29,6 +29,7 @@ pub(crate) fn resolve_scalar(name: &str, arg_count: usize) -> bool {
         "to_char" | "pg_input_is_valid" | "booleq" | "boolne" | "col_description" | "bpchareq"
         | "encode" | "bpcharlt" | "pg_text_int" | "pg_assign_int" => &[2],
         "pg_round_even" => &[1],
+        "pg_float_text" => &[2],
         "version" | "current_database" | "current_schema" | "pg_backend_pid" => &[0],
         "now" | "transaction_timestamp" | "statement_timestamp" => &[0],
         "make_date" => &[3],
@@ -81,6 +82,20 @@ pub(crate) fn exec_scalar(conn: &Connection, name: &str, args: &[Value]) -> Resu
             Some(Value::Numeric(turso_core::Numeric::Float(f))) => Value::from_f64(f64::from(*f).round_ties_even()),
             Some(other) => other.clone(),
             None => Value::Null,
+        }),
+        // A real or float8 value written as text as float4out or float8out writes it (the
+        // shortest text that reads back exactly), with the default extra_float_digits; written by
+        // the translator for a cast to a string type or an operand of || (its with_float_texts).
+        // Any other value passes as text unchanged.
+        "pg_float_text" => Ok(match args.first() {
+            Some(Value::Numeric(turso_core::Numeric::Float(f))) => {
+                let digits = pgwire::types::format::float_digits::ExtraFloatDigits(1);
+                let v = f64::from(*f);
+                Value::build_text(if text_arg(1) == "float4" { digits.format_f32(v as f32) } else { digits.format_f64(v) })
+            }
+            Some(Value::Numeric(turso_core::Numeric::Integer(i))) => Value::build_text(i.to_string()),
+            Some(Value::Null) | None => Value::Null,
+            Some(other) => Value::build_text(other.to_string()),
         }),
         "pg_text_int" => match args.first() {
             Some(Value::Text(t)) => match validate_pg_input(t.as_str(), &text_arg(1)) {

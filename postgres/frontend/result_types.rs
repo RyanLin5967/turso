@@ -668,6 +668,11 @@ pub struct Walked {
     /// numeric half away from zero, a float half to even) where the engine's CAST truncates
     /// (PGDIV-INT-CAST-TRUNCATES; numfuzz seed 3504; recorded, rec50-expression-int-cast).
     pub integer_casts: std::collections::BTreeMap<i32, u32>,
+    /// Each real (700) or float8 (701) value written as text: a cast to text, varchar, bpchar or
+    /// name (keyed by the cast's parse location) or an operand of || (by the operand's), so the
+    /// translator writes it as float4out or float8out does, where the engine's CAST wrote 15
+    /// significant digits (numfuzz seeds 4681, 4784; recorded, rec51-float-text-cast).
+    pub float_texts: std::collections::BTreeMap<i32, u32>,
     /// A plain SELECT's result columns' types, in order, as the walk read them (empty for any other
     /// statement): [`aggregate_types`] takes the aggregates' from these.
     pub columns: Vec<Option<u32>>,
@@ -881,6 +886,7 @@ fn parameter_types_with(
         first_refusal: Default::default(),
         operand_params: Default::default(),
         integer_casts: Default::default(),
+        float_texts: Default::default(),
         column_assignments: Vec::new(),
     };
     let mut columns = Vec::new();
@@ -904,6 +910,7 @@ fn parameter_types_with(
     let (arithmetic_operands, compared_operands) = infer.operand_params.take();
     let column_assignments = std::mem::take(&mut infer.column_assignments);
     let integer_casts = infer.integer_casts.take();
+    let float_texts = infer.float_texts.take();
     Ok(Walked {
         params: infer.types,
         untyped,
@@ -912,6 +919,7 @@ fn parameter_types_with(
         compared_operands,
         column_assignments,
         integer_casts,
+        float_texts,
         columns,
         assignments: infer.assignments,
     })
@@ -1017,6 +1025,9 @@ struct Infer<'a> {
     /// Each cast to an integer type of a compound numeric, float8 or real expression: the cast's
     /// parse location and its operand's type ([`Walked::integer_casts`]). Shared with every nested walk.
     integer_casts: std::rc::Rc<std::cell::RefCell<std::collections::BTreeMap<i32, u32>>>,
+    /// Each real or float8 value written as text: a cast to a string type (by the cast's location)
+    /// or an operand of || (by the operand's), with its type ([`Walked::float_texts`]).
+    float_texts: std::rc::Rc<std::cell::RefCell<std::collections::BTreeMap<i32, u32>>>,
     /// Each bare $n assigned to a column, in the order PostgreSQL analyses them: ($n, the column's
     /// name, its type) ([`Walked::column_assignments`]).
     column_assignments: Vec<(u32, String, u32)>,
@@ -1043,6 +1054,26 @@ pub fn integer_cast_of_compound(c: &turso_pg_parser::pg_query::protobuf::TypeCas
             Some(_) => true,
             None => false,
         }
+}
+
+/// Whether `c` casts to text, varchar, bpchar or name ([`Walked::float_texts`]).
+fn string_cast(c: &turso_pg_parser::pg_query::protobuf::TypeCast) -> bool {
+    c.type_name.as_ref().filter(|t| t.array_bounds.is_empty()).and_then(|t| t.names.last()).is_some_and(|n| {
+        matches!(&n.node, Some(Node::String(s)) if matches!(s.sval.as_str(), "text" | "varchar" | "bpchar" | "name"))
+    })
+}
+
+/// A node's parse location, for the nodes an operand of || can be ([`Walked::float_texts`]).
+pub fn node_location(node: &PgNode) -> Option<i32> {
+    match node.node.as_ref()? {
+        Node::ColumnRef(c) => Some(c.location),
+        Node::AExpr(e) => Some(e.location),
+        Node::FuncCall(f) => Some(f.location),
+        Node::TypeCast(c) => Some(c.location),
+        Node::AConst(c) => Some(c.location),
+        Node::ParamRef(p) => Some(p.location),
+        _ => None,
+    }
 }
 
 fn param(node: &PgNode) -> Option<u32> {
@@ -1724,6 +1755,7 @@ impl Infer<'_> {
             first_refusal: Default::default(),
             operand_params: Default::default(),
             integer_casts: self.integer_casts.clone(),
+            float_texts: self.float_texts.clone(),
             column_assignments: Vec::new(),
         };
         let columns = walk.select(query, &Vec::new());
@@ -2247,6 +2279,12 @@ impl Infer<'_> {
                     Some(Node::String(s)) => Some(s.sval.as_str()),
                     _ => None,
                 });
+                if matches!(kind, AExprKind::AexprOp) && op == Some("||") {
+                    for side in [l, r] {
+                        let ty = self.type_of(side, scope);
+                        self.note_float_text(node_location(side), ty);
+                    }
+                }
                 let arithmetic = matches!(kind, AExprKind::AexprOp) && matches!(op, Some("+" | "-" | "*" | "/" | "%"));
                 let comparison = !matches!(kind, AExprKind::AexprOp | AExprKind::AexprNullif)
                     || matches!(op, Some("=" | "<>" | "!=" | "<" | "<=" | ">" | ">="));
@@ -2305,6 +2343,10 @@ impl Infer<'_> {
                     if integer_cast_of_compound(c, arg) {
                         let ty = self.type_of(arg, scope);
                         self.note_integer_cast(c, arg, ty);
+                    }
+                    if string_cast(c) {
+                        let ty = self.type_of(arg, scope);
+                        self.note_float_text(Some(c.location), ty);
                     }
                     self.expr(arg, scope);
                 }
@@ -2680,6 +2722,13 @@ impl Infer<'_> {
         }
     }
 
+    /// Records a real or float8 value written as text at `location` ([`Walked::float_texts`]).
+    fn note_float_text(&self, location: Option<i32>, ty: Option<u32>) {
+        if let (Some(location), Some(ty @ (FLOAT4 | FLOAT8))) = (location.filter(|l| *l >= 0), ty) {
+            self.float_texts.borrow_mut().insert(location, ty);
+        }
+    }
+
     fn type_of(&self, node: &PgNode, scope: &Scope) -> Option<u32> {
         use turso_pg_parser::pg_query::protobuf::a_const::Val;
         use turso_pg_parser::pg_query::protobuf::{AExprKind, SubLinkType};
@@ -2855,6 +2904,7 @@ impl Infer<'_> {
                 if let Some(arg) = c.arg.as_deref().filter(|a| param(a).is_none()) {
                     let ty = self.type_of(arg, scope);
                     self.note_integer_cast(c, arg, ty);
+                    self.note_float_text(string_cast(c).then_some(c.location), ty);
                 }
                 cast_type(c)
             }
@@ -2895,6 +2945,10 @@ impl Infer<'_> {
                     return Some(BOOL);
                 }
                 if op == Some("||") {
+                    for side in [e.lexpr.as_deref(), e.rexpr.as_deref()].into_iter().flatten() {
+                        let ty = self.type_of(side, scope);
+                        self.note_float_text(node_location(side), ty);
+                    }
                     return Some(TEXT);
                 }
                 // An untyped string literal takes the other operand's type, as PostgreSQL resolves
@@ -3073,6 +3127,7 @@ impl Infer<'_> {
             first_refusal: self.first_refusal.clone(),
             operand_params: self.operand_params.clone(),
             integer_casts: self.integer_casts.clone(),
+            float_texts: self.float_texts.clone(),
             column_assignments: Vec::new(),
         };
         let level = walk.from_items(&s.from_clause, scope);

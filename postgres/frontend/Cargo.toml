@@ -33,6 +33,9 @@ turso_core = { workspace = true, default-features = true, features = [
 turso_parser = { workspace = true }
 turso_ext = { workspace = true, features = ["core_only"] }
 turso_pg_parser = { workspace = true }
+# The vendored pgwire's float4out / float8out digits (types::format::float_digits), for a float
+# written as text by pg_float_text (functions.rs); the server depends on the same crate.
+pgwire = "0.36"
 
 # F_GETPATH, the opened file's path a COPY FROM 'file' grant judges (session.rs open_server_file).
 [target.'cfg(target_os = "macos")'.dependencies]

@@ -2290,24 +2290,32 @@ fn walk_statement(
     crate::result_types::parameter_types(parse, schema, &search_path, &pg_conn.view_cache, &attached)
 }
 
-/// The parse locations of the casts to an integer type of a compound numeric, float8 or real
-/// expression, with the operand's type, for the translator to round as PostgreSQL's cast does
-/// ([`crate::result_types::Walked::integer_casts`]). Read from the parse and the schema alone, so
-/// the engine's re-prepare translates alike; the walk runs only for a statement holding such a cast.
-fn integer_cast_rounding(
-    pg_conn: &PgConnectionInner,
-    parse: &turso_pg_parser::pg_query::ParseResult,
-) -> std::result::Result<std::collections::HashMap<i32, u32>, SqlErrorMessage> {
-    use turso_pg_parser::pg_query::NodeRef;
+/// What the translator needs from the result-type walk for a statement's casts and
+/// concatenations: the casts to an integer type of a compound numeric, float8 or real expression,
+/// with the operand's type, to round as PostgreSQL's cast does
+/// ([`crate::result_types::Walked::integer_casts`]); the real and float8 values written as text,
+/// to write as float4out or float8out does ([`crate::result_types::Walked::float_texts`]). Read
+/// from the parse and the schema alone, so the engine's re-prepare translates alike; the walk runs
+/// only for a statement holding such a cast, a cast to a string type, or a ||.
+type CastWalk = (std::collections::HashMap<i32, u32>, std::collections::HashMap<i32, u32>);
+fn cast_walk(pg_conn: &PgConnectionInner, parse: &turso_pg_parser::pg_query::ParseResult) -> std::result::Result<CastWalk, SqlErrorMessage> {
+    use turso_pg_parser::pg_query::{protobuf::node::Node, NodeRef};
+    let string_target = |c: &turso_pg_parser::pg_query::protobuf::TypeCast| {
+        c.type_name.as_ref().and_then(|t| t.names.last()).is_some_and(|n| {
+            matches!(&n.node, Some(Node::String(s)) if matches!(s.sval.as_str(), "text" | "varchar" | "bpchar" | "name"))
+        })
+    };
     let any = parse.protobuf.nodes().iter().any(|(n, ..)| match n {
-        NodeRef::TypeCast(c) => c.arg.as_deref().is_some_and(|arg| crate::result_types::integer_cast_of_compound(c, arg)),
+        NodeRef::TypeCast(c) => string_target(c) || c.arg.as_deref().is_some_and(|arg| crate::result_types::integer_cast_of_compound(c, arg)),
+        NodeRef::AExpr(e) => e.name.iter().any(|n| matches!(&n.node, Some(Node::String(s)) if s.sval == "||")),
         _ => false,
     });
     if !any {
-        return Ok(std::collections::HashMap::new());
+        return Ok(Default::default());
     }
     let schema = pg_conn.conn.current_schema();
-    Ok(walk_statement(pg_conn, &schema, parse)?.integer_casts.into_iter().collect())
+    let walked = walk_statement(pg_conn, &schema, parse)?;
+    Ok((walked.integer_casts.into_iter().collect(), walked.float_texts.into_iter().collect()))
 }
 
 /// THE translation of a statement, for the session's prepare and for the engine's re-prepare of it
@@ -2364,7 +2372,7 @@ pub(crate) fn session_translation(
     let text_casts = text_integer_casts(pg_conn, sql, parse_result);
     // Each cast to an integer type of a compound numeric or float expression rounds as its type's
     // cast does (PGDIV-INT-CAST-TRUNCATES; numfuzz seed 3504): the engine's CAST truncates.
-    let rounding = integer_cast_rounding(pg_conn, parse_result).map_err(LimboError::InvalidArgument)?;
+    let (rounding, float_texts) = cast_walk(pg_conn, parse_result).map_err(LimboError::InvalidArgument)?;
     // Each value assigned to a column is coerced as parse analysis coerces it, here so the
     // re-prepare judges it alike; a literal an integer column reads is written as its value.
     let (integer_literals, text_literals, float_literals) = literal_assignments(pg_conn, parse_result).map_err(LimboError::InvalidArgument)?;
@@ -2377,6 +2385,7 @@ pub(crate) fn session_translation(
         let t = translator();
         let t = if text_casts.is_empty() { t } else { t.with_text_integer_casts(text_casts.clone()) };
         let t = if rounding.is_empty() { t } else { t.with_integer_cast_rounding(rounding.clone()) };
+        let t = if float_texts.is_empty() { t } else { t.with_float_texts(float_texts.clone()) };
         let t = if text_literals.is_empty() { t } else { t.with_text_literals(text_literals.clone()) };
         let t = if float_literals.is_empty() { t } else { t.with_float_literals(float_literals.clone()) };
         if integer_literals.is_empty() { t } else { t.with_integer_literals(integer_literals.clone()) }
@@ -3154,11 +3163,25 @@ fn literal_assignments(
                         }
                     },
                     // A numeric constant is cast through numeric_out's text, which words a refusal.
+                    // A real column holds float4's value (-683390.3 is -683390.3125), written here as
+                    // that value: the engine stored the float8 one, so r * 2 answered -1366780.6 for
+                    // PG's -1366780.625 (recorded, rec51-float-text-cast).
                     Some(Val::Fval(f)) => {
                         if let Some(out) = numeric_out(&f.fval) {
                             if pg_float_in(&out, float4) == Err(true) {
                                 return Err(SqlErrorMessage::classified(SqlErrorKind::NumericValueOutOfRange, format!("\"{out}\" is out of range for type {name}")));
                             }
+                        }
+                        if let (true, Ok(v)) = (float4 && c.location >= 0, pg_float_in(&f.fval, true)) {
+                            if f.fval.parse::<f64>().ok() != Some(v) && v.is_finite() {
+                                float_rewrites.insert(c.location, v);
+                            }
+                        }
+                    }
+                    Some(Val::Ival(i)) if float4 && c.location >= 0 => {
+                        let v = f64::from(i.ival as f32);
+                        if v != f64::from(i.ival) {
+                            float_rewrites.insert(c.location, v);
                         }
                     }
                     _ => {}
