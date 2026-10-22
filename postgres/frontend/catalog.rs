@@ -95,6 +95,12 @@ impl Dialect for PostgresDialect {
         true
     }
 
+    /// PostgreSQL rounds a numeric to an integer half away from zero and a float8 half to even;
+    /// SQLite truncates (fastest-engine, RESUME item 13, numfuzz seed 2159).
+    fn integer_cast_rounds(&self) -> bool {
+        true
+    }
+
     /// A PostgreSQL schema (an attached database here) is named as written: libpg_query has
     /// folded an unquoted name, and a quoted one keeps its case, so `"Q1"` is not `q1`
     /// (fastest-engine, lead RESUME item 10).

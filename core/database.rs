@@ -2965,6 +2965,7 @@ impl Database {
             division_by_zero_raises: self.dialect().division_by_zero_raises(),
             float_sum_naive: self.dialect().float_sum_naive(),
             integer_math_is_float8: self.dialect().integer_math_is_float8(),
+            integer_cast_rounds: self.dialect().integer_cast_rounds(),
             query_timeout_ms: AtomicU64::new(0),
             interrupt_requested: AtomicBool::new(false),
             is_mvcc_bootstrap_connection: AtomicBool::new(is_mvcc_bootstrap_connection),

@@ -642,6 +642,8 @@ pub struct Connection {
     pub(crate) float_sum_naive: bool,
     /// The dialect's `integer_math_is_float8`, read at connect.
     pub(crate) integer_math_is_float8: bool,
+    /// The dialect's `integer_cast_rounds`, read at connect.
+    pub(crate) integer_cast_rounds: bool,
     /// Maximum execution time for a single statement on this connection.
     /// `Duration::ZERO` means disabled.
     pub(super) query_timeout_ms: AtomicU64,

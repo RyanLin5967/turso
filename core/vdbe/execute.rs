@@ -6987,6 +6987,42 @@ pub fn op_decr_jump_zero(
     Ok(InsnFunctionStepResult::Step)
 }
 
+/// A cast of `value` to INTEGER under the connection's `integer_cast_rounds` (PostgreSQL): a
+/// decimal text (a numeric's value) rounds half away from zero, exactly, as numeric_int8 does; a
+/// float rounds half to even, as dtoi8's rint does; a result past an i64 is IntegerOverflow
+/// (22003). None for anything else (an integer, NULL, a blob, a text that is no number), which
+/// takes SQLite's cast. Mutant `integer_cast_truncates` (test builds only): None, as before.
+fn integer_cast_rounded(program: &Program, value: &Value) -> Result<Option<Value>> {
+    if !program.connection.integer_cast_rounds || crate::branch::store::fe_mutant("integer_cast_truncates") {
+        return Ok(None);
+    }
+    match value {
+        Value::Numeric(Numeric::Float(f)) => {
+            let r = f64::from(*f).round_ties_even();
+            // i64's range as floats: [-2^63, 2^63).
+            if r >= -9223372036854775808.0 && r < 9223372036854775808.0 {
+                Ok(Some(Value::from_i64(r as i64)))
+            } else {
+                Err(LimboError::IntegerOverflow)
+            }
+        }
+        Value::Text(t) => {
+            let text = t.as_str().trim();
+            let decimal = !text.is_empty()
+                && text.bytes().any(|b| b.is_ascii_digit())
+                && text.bytes().all(|b| b.is_ascii_digit() || matches!(b, b'.' | b'+' | b'-' | b'e' | b'E'));
+            if !decimal {
+                return Ok(None);
+            }
+            match crate::numeric::decimal::PgNumeric::parse(text) {
+                Some(Ok(n)) => n.round_to_i64().map(|i| Some(Value::from_i64(i))).ok_or(LimboError::IntegerOverflow),
+                _ => Ok(None),
+            }
+        }
+        _ => Ok(None),
+    }
+}
+
 /// The connection's `integer_math_is_float8` (the PostgreSQL dialect: trunc, floor, ceil, ceiling
 /// and sign of an integer are float8). Mutant `integer_math_stays_integer` (test builds only):
 /// SQLite's integer, as before.
@@ -16676,6 +16712,14 @@ pub fn op_cast(
     load_insn!(Cast { reg, affinity }, insn);
 
     let value = state.registers[*reg].get_value().clone();
+    // A dialect may round to an integer where SQLite truncates (PostgreSQL).
+    if matches!(affinity, Affinity::Integer) {
+        if let Some(rounded) = integer_cast_rounded(program, &value)? {
+            state.registers[*reg].set_value(rounded);
+            state.pc += 1;
+            return Ok(InsnFunctionStepResult::Step);
+        }
+    }
     // A dialect may read a text as a float in its own way (PostgreSQL's 'Infinity').
     if matches!(affinity, Affinity::Real) {
         if let Some(text) = value.to_text() {

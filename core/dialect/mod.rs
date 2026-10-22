@@ -77,6 +77,13 @@ pub trait Dialect: Send + Sync + 'static {
         false
     }
 
+    /// Whether a cast to INTEGER rounds rather than truncates: a decimal (a numeric's text) half
+    /// away from zero, a float half to even, as PostgreSQL's numeric_int8 and dtoi8 do. Default
+    /// false: SQLite's truncation. Read once per connection (`Connection::integer_cast_rounds`).
+    fn integer_cast_rounds(&self) -> bool {
+        false
+    }
+
     /// Whether an attached database's name matches only as written (PostgreSQL: a quoted schema
     /// name keeps its case, `"Q1"` is not `q1`; the frontend has already folded unquoted names),
     /// rather than in any case (SQLite). Default false. Read once per connection, by its

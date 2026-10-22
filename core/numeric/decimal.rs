@@ -371,6 +371,13 @@ impl PgNumeric {
         format_numeric(&self.0)
     }
 
+    /// The value rounded to an integer, half away from zero (PostgreSQL's numeric to integer
+    /// cast, `numeric_int8`); None when it does not fit an i64.
+    pub fn round_to_i64(&self) -> Option<i64> {
+        use bigdecimal::ToPrimitive;
+        self.0.with_scale_round(0, bigdecimal::RoundingMode::HalfUp).to_i64()
+    }
+
     pub fn is_zero(&self) -> bool {
         self.0.as_bigint_and_exponent().0.sign() == Sign::NoSign
     }
