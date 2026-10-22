@@ -17493,6 +17493,64 @@ fn a_string_parameter_assigned_to_another_category_is_42804() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// numfuzz (seeds 1442, 1458 and 1600 at 1d8a8b230; artie 00a35c0147): a constant past a numeric(p, s) column is 22003
+/// 'numeric field overflow', a constant cast past an integer type is 22003 wherever it stands, and an INSERT ... SELECT's
+/// targets are coerced to their columns as VALUES items are, each at planning, so a statement matching no row is refused
+/// too; each was answered. Expected answers: PG 18.6, recorded (artie 555adcffb6,
+/// rec33-assign-numeric-select/pg18-wirefuzz-a_constant_past_a_numeric_column_or_an_integer_cast_is_22003_and_insert_select_is_coerced.out),
+/// but its INSERT ... SELECT 3, 2.5, whose 23505 is worded by the engine here, its own class.
+#[test]
+fn a_constant_past_a_numeric_column_or_an_integer_cast_is_22003_and_insert_select_is_coerced() {
+    let dir = Scratch::new("numeric-column-constant");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let ddl = "CREATE TABLE nt (id int PRIMARY KEY, n numeric(6,2), b int, f double precision, g text)";
+    a.q(ddl).ok(ddl);
+    let mut wrong = Vec::new();
+    for (sql, code, message) in [
+        ("UPDATE nt SET n = '1e5'::numeric WHERE id = 1", "22003", "numeric field overflow"),
+        ("UPDATE nt SET n = 12345.678 WHERE id = 1", "22003", "numeric field overflow"),
+        ("UPDATE nt SET n = '9999.995' WHERE id = 1", "22003", "numeric field overflow"),
+        ("UPDATE nt SET n = 9999.994 WHERE id = 1", "", ""),
+        ("UPDATE nt SET n = 100000 WHERE id = 1", "22003", "numeric field overflow"),
+        ("INSERT INTO nt (id, n) VALUES (1, 1e4)", "22003", "numeric field overflow"),
+        ("INSERT INTO nt (id, n) VALUES (1, 'Infinity')", "22003", "numeric field overflow"),
+        ("INSERT INTO nt (id, n) VALUES (2, 9999.99)", "", ""),
+        ("SELECT id FROM nt WHERE b > (2.950255e+20)::int", "22003", "integer out of range"),
+        ("SELECT id FROM nt WHERE b > 3000000000::int", "22003", "integer out of range"),
+        ("SELECT id FROM nt WHERE b > '3000000000'::int", "22003", r#"value "3000000000" is out of range for type integer"#),
+        ("SELECT id FROM nt WHERE b > 40000::smallint", "22003", "smallint out of range"),
+        ("SELECT id FROM nt WHERE b > 2.5::int", "", ""),
+        ("INSERT INTO nt (id, f) SELECT 3, (abs(-('1.5'::numeric)))::text", "42804", r#"column "f" is of type double precision but expression is of type text"#),
+        ("INSERT INTO nt (id, b) SELECT 3, '5'", "", ""),
+        ("INSERT INTO nt (id, b) SELECT 3, 'x'", "22P02", r#"invalid input syntax for type integer: "x""#),
+        ("INSERT INTO nt (id, b) SELECT 3, 3000000000", "22003", "integer out of range"),
+        ("INSERT INTO nt (id, g) SELECT 4, 5", "", ""),
+        ("INSERT INTO nt (id, n) SELECT 5, 123456", "22003", "numeric field overflow"),
+        ("INSERT INTO nt (id, b) SELECT 6, 'x'::text WHERE false", "42804", r#"column "b" is of type integer but expression is of type text"#),
+        ("INSERT INTO nt (id, b) SELECT id + 100, 3000000000 FROM nt", "22003", "integer out of range"),
+    ] {
+        let r = a.q(sql);
+        let fine = if code.is_empty() {
+            r.error.is_none()
+        } else {
+            r.error.as_ref().is_some_and(|e| e.code == code && e.message == message)
+        };
+        if !fine {
+            wrong.push(format!("{sql}: PG {code:?} {message:?}; got {:?} {:?}", r.tags, r.error));
+        }
+    }
+    let r = a.q("SELECT id, n, b, f, g FROM nt ORDER BY id");
+    let want: Vec<Vec<Option<String>>> = [["2", "9999.99", "", "", ""], ["3", "", "5", "", ""], ["4", "", "", "", "5"]]
+        .iter()
+        .map(|row| row.iter().map(|v| (!v.is_empty()).then(|| v.to_string())).collect())
+        .collect();
+    if r.error.is_some() || r.rows != want {
+        wrong.push(format!("SELECT id, n, b, f, g: PG {want:?}; got {:?} {:?}", r.rows, r.error));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// numfuzz (seed 1237 at c8b6e2916; artie c80202ac4e): a constant cast to numeric or an integer type and assigned to an
 /// integer column is the cast's value then the assignment's, each rounded half away from zero and range-checked, so a
 /// statement matching no row is refused too: '1e5'::numeric into a smallint was answered (UPDATE 0). A typmod rounds
