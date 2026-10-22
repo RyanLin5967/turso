@@ -17995,6 +17995,42 @@ fn a_float_cast_to_text_is_written_as_its_output_routine_writes_it() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// numfuzz seeds 6789, 6673, 6700 at b46404e66 (artie fbbb5b4ce6): a cast to an integer of a constant's cast rounds as
+/// the cast does (' 2.50 '::numeric::int is 3; it truncated to 2), and a constant expression assigned to an integer or
+/// numeric(p, s) column is refused past the column even when no row matches, as PostgreSQL folds it before any row is
+/// read (it was accepted, UPDATE 0). Expected answers: PG 18.6, recorded (artie 6d2df9a3cc,
+/// rec57-cast-of-cast-and-folded-assign/pg18-wirefuzz-a_cast_of_a_cast_rounds_and_a_constant_expression_assigned_is_folded.out).
+#[test]
+fn a_cast_of_a_cast_rounds_and_a_constant_expression_assigned_is_folded() {
+    let dir = Scratch::new("cast-of-cast-folded");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE fc (id int PRIMARY KEY, s smallint, i int, n numeric(6,2))").ok("create");
+    let mut wrong = Vec::new();
+    let r = a.q("SELECT -(-((' 2.50 '::numeric)::int)) AS a, ('-2.5'::numeric)::int AS b, (('1.5'::float8))::int AS c, ('2.5'::float8)::bigint AS d");
+    let want: Vec<Vec<Option<String>>> = vec![["3", "-3", "2", "2"].iter().map(|v| Some(v.to_string())).collect()];
+    if r.error.is_some() || r.rows != want {
+        wrong.push(format!("casts of casts: PG {want:?}; got {:?} {:?}", r.rows, r.error));
+    }
+    for (sql, message) in [
+        ("UPDATE fc SET s = (9965823707318 - 32767) WHERE id = 1", "smallint out of range"),
+        ("UPDATE fc SET s = -(((0003712916.796)::int)::numeric) WHERE id = 2", "smallint out of range"),
+        ("UPDATE fc SET i = 2147483647 + 1 WHERE id = 3", "integer out of range"),
+        ("UPDATE fc SET n = 9999 * 2 WHERE id = 4", "numeric field overflow"),
+        ("INSERT INTO fc (id, s) SELECT 5, 40000 WHERE false", "smallint out of range"),
+    ] {
+        let r = a.q(sql);
+        if !r.error.as_ref().is_some_and(|e| e.code == "22003" && e.message == message) {
+            wrong.push(format!("{sql}: PG 22003 {message:?}; got {:?} {:?}", r.tags, r.error));
+        }
+    }
+    let r = a.q("UPDATE fc SET s = 7 * 3 WHERE id = 6");
+    if r.error.is_some() || r.tags != vec!["UPDATE 0".to_string()] {
+        wrong.push(format!("7 * 3: PG UPDATE 0; got {:?} {:?}", r.tags, r.error));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// numfuzz seed 4871 at 783dee075 (artie 4f001ce3aa): a value bound to an integer column is cast as PostgreSQL's
 /// custom plan casts it at Bind, even when no row matches: a declared numeric, float8 or wider integer past the column is
 /// 22003 '<type> out of range', a numeric NaN 0A000, a float infinity 22003, and an undeclared one past the column is
