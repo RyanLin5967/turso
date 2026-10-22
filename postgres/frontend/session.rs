@@ -2851,7 +2851,112 @@ fn literal_assignments(
         Some((target, typmods, text))
     };
     let mut float_rewrites: std::collections::HashMap<i32, f64> = std::collections::HashMap::new();
+    // The relation a value's column reference reads, with the names it is known by: an UPDATE's
+    // target (with no FROM), an INSERT ... SELECT's one FROM table; none for VALUES.
+    let source: Option<(std::sync::Arc<turso_core::schema::BTreeTable>, String, String)> = match stmt {
+        Node::UpdateStmt(u) if u.from_clause.is_empty() => {
+            let alias = u.relation.as_ref().and_then(|r| r.alias.as_ref()).map(|a| a.aliasname.clone()).unwrap_or_else(|| relation.relname.clone());
+            Some((table.clone(), relation.relname.clone(), alias))
+        }
+        Node::InsertStmt(i) => match i.select_stmt.as_deref().and_then(|s| s.node.as_ref()) {
+            Some(Node::SelectStmt(sel)) if sel.values_lists.is_empty() && sel.larg.is_none() => match sel.from_clause.as_slice() {
+                [only] => match only.node.as_ref() {
+                    Some(Node::RangeVar(rv)) if resolves_to_main(pg_conn, rv) => schema.get_btree_table(&rv.relname).map(|t| {
+                        let alias = rv.alias.as_ref().map(|a| a.aliasname.clone()).unwrap_or_else(|| rv.relname.clone());
+                        (t, rv.relname.clone(), alias)
+                    }),
+                    _ => None,
+                },
+                _ => None,
+            },
+            _ => None,
+        },
+        _ => None,
+    };
+    // The string type a value has when it is one PostgreSQL types as a string whatever its
+    // arguments (rec44): a text function's result, a || with a string side, a string cast, or a
+    // column of the source relation declared text, varchar or char. None for anything else,
+    // which the engine judges (an untyped literal is read as the column's input).
+    fn string_type(node: &PgNode, source: &Option<(std::sync::Arc<turso_core::schema::BTreeTable>, String, String)>) -> Option<u32> {
+        use turso_pg_parser::pg_query::protobuf::node::Node;
+        const TEXT_FUNCTIONS: &[&str] = &[
+            "upper", "lower", "concat", "concat_ws", "substr", "substring", "trim", "btrim", "ltrim", "rtrim", "replace",
+            "repeat", "lpad", "rpad", "left", "right", "md5", "to_char", "format", "initcap", "reverse", "chr", "quote_ident",
+            "quote_literal", "quote_nullable", "translate", "split_part", "regexp_replace", "to_hex",
+        ];
+        match node.node.as_ref()? {
+            Node::FuncCall(f) => {
+                let name = f.funcname.last().and_then(|n| match &n.node {
+                    Some(Node::String(s)) => Some(s.sval.as_str()),
+                    _ => None,
+                })?;
+                TEXT_FUNCTIONS.contains(&name).then_some(25)
+            }
+            Node::AExpr(e) if matches!(e.name.as_slice(), [n] if matches!(&n.node, Some(Node::String(s)) if s.sval == "||")) => {
+                let side = |x: Option<&PgNode>| {
+                    x.is_some_and(|x| matches!(x.node.as_ref(), Some(Node::AConst(c)) if matches!(c.val, Some(turso_pg_parser::pg_query::protobuf::a_const::Val::Sval(_)))) || string_type(x, source).is_some())
+                };
+                (side(e.lexpr.as_deref()) || side(e.rexpr.as_deref())).then_some(25)
+            }
+            Node::TypeCast(c) => match c.type_name.as_ref()?.names.last()?.node.as_ref()? {
+                Node::String(s) if c.type_name.as_ref()?.array_bounds.is_empty() => match s.sval.as_str() {
+                    "text" => Some(25),
+                    "varchar" => Some(1043),
+                    "bpchar" => Some(1042),
+                    "name" => Some(19),
+                    _ => None,
+                },
+                _ => None,
+            },
+            Node::ColumnRef(r) => {
+                let (table, name, alias) = source.as_ref()?;
+                let fields: Vec<&str> = r
+                    .fields
+                    .iter()
+                    .map(|f| match &f.node {
+                        Some(Node::String(s)) => Some(s.sval.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Option<Vec<_>>>()?;
+                let column = match fields.as_slice() {
+                    [c] => *c,
+                    [q, c] if q.eq_ignore_ascii_case(alias) || q.eq_ignore_ascii_case(name) => *c,
+                    _ => return None,
+                };
+                let (_, col) = table.get_column(column).filter(|(_, c)| c.array_dimensions() == 0)?;
+                let base = col.ty_str.split('(').next().unwrap_or("").trim();
+                if base.eq_ignore_ascii_case("TEXT") {
+                    Some(25)
+                } else if base.eq_ignore_ascii_case("VARCHAR") || base.eq_ignore_ascii_case("CHARACTER VARYING") {
+                    Some(1043)
+                } else if base.eq_ignore_ascii_case("BPCHAR") || base.eq_ignore_ascii_case("CHAR") {
+                    Some(1042)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
     let mut coerce = |column: &str, value: &PgNode| -> Result<(), SqlErrorMessage> {
+        // A value of a string type to a numeric or boolean column: 42804 (rec44). A bare string
+        // cast is judged below, with the domain's name.
+        if !matches!(value.node.as_ref(), Some(Node::TypeCast(_))) {
+            if let Some(from) = string_type(value, &source) {
+                let target = column_type(column).map_or(25, |ty| crate::catalog::sqlite_type_to_pg_oid(&ty) as u32);
+                if matches!(target, 16 | 20 | 21 | 23 | 700 | 701 | 1700) {
+                    let declared = table.get_column(column).map(|(_, c)| c.ty_str.as_str()).filter(|ty| domain_base(ty).is_some());
+                    return Err(SqlErrorMessage::classified(
+                        SqlErrorKind::DatatypeMismatch,
+                        format!(
+                            "column \"{column}\" is of type {} but expression is of type {}",
+                            declared.unwrap_or(crate::result_types::type_name(target)),
+                            crate::result_types::type_name(from)
+                        ),
+                    ));
+                }
+            }
+        }
         // A numeric NaN or Infinity cast into an integer column: 0A000 (rec42; numfuzz seed 2436).
         if let Some(Node::TypeCast(c)) = value.node.as_ref() {
             let bits = column_type(column).map_or(0, |t| integer_bits(&t));
