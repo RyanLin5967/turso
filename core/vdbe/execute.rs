@@ -6987,6 +6987,12 @@ pub fn op_decr_jump_zero(
     Ok(InsnFunctionStepResult::Step)
 }
 
+/// The connection's `float_sum_naive` (the PostgreSQL dialect: float sums add left to right, as
+/// PostgreSQL's do). Mutant `float_sum_compensated` (test builds only): compensated, as before.
+fn naive_float_sum(program: &Program) -> bool {
+    program.connection.float_sum_naive && !crate::branch::store::fe_mutant("float_sum_compensated")
+}
+
 /// Add one floating-point value to a running sum using Kahan–Babuška–
 /// Neumaier summation (KBN, referred to throughout the sum/avg code).
 /// Adding many floats the naive way loses low-order bits; KBN keeps a
@@ -7006,8 +7012,9 @@ fn apply_kbn_step(acc: &mut Value, r: f64, state: &mut SumAggState) {
         return;
     }
     // When t is infinite, the KBN correction computes inf - inf = NaN,
-    // which is meaningless. Skip compensation in that case.
-    if t.is_finite() {
+    // which is meaningless. Skip compensation in that case. A naive sum
+    // (`state.naive`, the PostgreSQL dialect) keeps no compensation.
+    if t.is_finite() && !state.naive {
         let correction = if s.abs() > r.abs() {
             (s - t) + r
         } else {
@@ -7043,7 +7050,11 @@ fn apply_kbn_step_int(acc: &mut Value, i: i64, state: &mut SumAggState) {
 fn kbn_init_from_int(acc: &mut Value, i: i64, state: &mut SumAggState) {
     const THRESHOLD: i64 = 4503599627370496; // 2^52
 
-    if i <= -THRESHOLD || i >= THRESHOLD {
+    if state.naive {
+        // A naive sum converts the integer total to the nearest float, as a plain add would.
+        *acc = Value::from_f64(i as f64);
+        state.r_err = 0.0;
+    } else if i <= -THRESHOLD || i >= THRESHOLD {
         let i_sm = i % 16384;
         *acc = Value::from_f64((i - i_sm) as f64);
         state.r_err = i_sm as f64;
@@ -7175,6 +7186,20 @@ fn update_agg_payload(
     collation: CollationSeq,
     comparator: impl FnOnce() -> Result<Option<crate::vdbe::sorter::SortComparator>>,
 ) -> Result<()> {
+    update_agg_payload_summing(func, arg, maybe_arg2, payload, collation, comparator, false)
+}
+
+/// [update_agg_payload], with float sums naive when `naive_float_sum` (the connection's
+/// `float_sum_naive`, the PostgreSQL dialect) and Kahan-Babuska-Neumaier compensated otherwise.
+fn update_agg_payload_summing(
+    func: &AggFunc,
+    arg: &Value,
+    maybe_arg2: Option<&Value>,
+    payload: &mut crate::alloc::Vec<Value>,
+    collation: CollationSeq,
+    comparator: impl FnOnce() -> Result<Option<crate::vdbe::sorter::SortComparator>>,
+    naive_float_sum: bool,
+) -> Result<()> {
     match func {
         AggFunc::Count => {
             // COUNT(column) increments only when arg is not NULL. Empty args treated as non-NULL
@@ -7223,6 +7248,7 @@ fn update_agg_payload(
             };
             let mut sum_state = SumAggState {
                 r_err,
+                naive: naive_float_sum,
                 ..Default::default()
             };
             match classify_numeric_arg(arg) {
@@ -7283,6 +7309,7 @@ fn update_agg_payload(
                 r_err: r_err_f,
                 approx: *approx_i != 0,
                 ovrfl: *ovrfl_i != 0,
+                naive: naive_float_sum,
             };
             if !matches!(arg, Value::Null) {
                 *count = count.checked_add(1).ok_or(LimboError::IntegerOverflow)?;
@@ -8351,7 +8378,7 @@ fn op_window_inverse(
 }
 
 pub fn op_agg_inverse(
-    _program: &Program,
+    program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
@@ -8383,7 +8410,7 @@ pub fn op_agg_inverse(
         )));
     };
     let payload = agg.payload_mut();
-    inverse_agg_payload(func, arg, payload)?;
+    inverse_agg_payload(func, arg, payload, naive_float_sum(program))?;
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -8446,7 +8473,7 @@ fn kbn_step_int_neg(acc: &mut Value, i: i64, state: &mut SumAggState) {
 /// Subtract the contribution of a single row from the aggregate state,
 /// undoing a previous `update_agg_payload` call. Mirrors SQLite's
 /// xInverse implementations at `func.c:1859-1986`.
-fn inverse_agg_payload(func: &AggFunc, arg: Value, payload: &mut [Value]) -> Result<()> {
+fn inverse_agg_payload(func: &AggFunc, arg: Value, payload: &mut [Value], naive_float_sum: bool) -> Result<()> {
     match func {
         AggFunc::Count => {
             if !matches!(arg, Value::Null) {
@@ -8506,6 +8533,7 @@ fn inverse_agg_payload(func: &AggFunc, arg: Value, payload: &mut [Value]) -> Res
                 r_err,
                 approx: true,
                 ovrfl,
+                naive: naive_float_sum,
             };
             // Undo a row's contribution with an exact integer subtract,
             // but only while the total is still an exact integer (sum()
@@ -8561,6 +8589,7 @@ fn inverse_agg_payload(func: &AggFunc, arg: Value, payload: &mut [Value]) -> Res
             debug_assert!(*count > 0, "Avg xInverse without matching xStep");
             let mut sum_state = SumAggState {
                 r_err,
+                naive: naive_float_sum,
                 ..Default::default()
             };
             match parsed {
@@ -8841,13 +8870,14 @@ pub fn op_agg_step(
                 )));
             };
             let payload = agg.payload_vec_mut();
-            update_agg_payload(
+            update_agg_payload_summing(
                 func,
                 arg,
                 maybe_arg2.as_ref(),
                 payload,
                 current_collation,
                 comparator_factory,
+                naive_float_sum(program),
             )?;
         }
     };

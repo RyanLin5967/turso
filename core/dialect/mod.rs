@@ -63,6 +63,13 @@ pub trait Dialect: Send + Sync + 'static {
         false
     }
 
+    /// Whether sum, total and avg over floats add naively, left to right (PostgreSQL's float8pl
+    /// and float8_accum), rather than with SQLite's Kahan-Babuska-Neumaier compensation. Default
+    /// false: SQLite's rule. Read once per connection (`Connection::float_sum_naive`).
+    fn float_sum_naive(&self) -> bool {
+        false
+    }
+
     /// Whether an attached database's name matches only as written (PostgreSQL: a quoted schema
     /// name keeps its case, `"Q1"` is not `q1`; the frontend has already folded unquoted names),
     /// rather than in any case (SQLite). Default false. Read once per connection, by its

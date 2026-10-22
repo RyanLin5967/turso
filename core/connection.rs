@@ -638,6 +638,8 @@ pub struct Connection {
     pub(crate) integer_overflow_raises: bool,
     /// The dialect's `division_by_zero_raises`, read at connect.
     pub(crate) division_by_zero_raises: bool,
+    /// The dialect's `float_sum_naive`, read at connect.
+    pub(crate) float_sum_naive: bool,
     /// Maximum execution time for a single statement on this connection.
     /// `Duration::ZERO` means disabled.
     pub(super) query_timeout_ms: AtomicU64,

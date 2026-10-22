@@ -2963,6 +2963,7 @@ impl Database {
             progress_handler: ProgressHandler::new(),
             integer_overflow_raises: self.dialect().integer_overflow_raises(),
             division_by_zero_raises: self.dialect().division_by_zero_raises(),
+            float_sum_naive: self.dialect().float_sum_naive(),
             query_timeout_ms: AtomicU64::new(0),
             interrupt_requested: AtomicBool::new(false),
             is_mvcc_bootstrap_connection: AtomicBool::new(is_mvcc_bootstrap_connection),

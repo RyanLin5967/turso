@@ -82,6 +82,12 @@ impl Dialect for PostgresDialect {
         true
     }
 
+    /// PostgreSQL's float sum and avg add left to right, uncompensated (float8pl, float8_accum);
+    /// SQLite compensates (fastest-engine, LEAD-RULINGS 8b41cde54c item 1).
+    fn float_sum_naive(&self) -> bool {
+        true
+    }
+
     /// A PostgreSQL schema (an attached database here) is named as written: libpg_query has
     /// folded an unquoted name, and a quoted one keeps its case, so `"Q1"` is not `q1`
     /// (fastest-engine, lead RESUME item 10).

@@ -878,6 +878,10 @@ pub struct SumAggState {
     pub r_err: f64,   // Error term for Kahan-Babushka-Neumaier summation
     pub approx: bool, // True if any non-integer value was input to the sum
     pub ovrfl: bool,  // Integer overflow seen
+    /// Add floats naively, left to right, keeping no compensation term (`r_err` stays 0): the
+    /// dialect's `float_sum_naive` (PostgreSQL's float8pl and float8_accum). False: SQLite's
+    /// Kahan-Babuska-Neumaier sum.
+    pub naive: bool,
 }
 impl Default for SumAggState {
     fn default() -> Self {
@@ -885,6 +889,7 @@ impl Default for SumAggState {
             r_err: 0.0,
             approx: false,
             ovrfl: false,
+            naive: false,
         }
     }
 }
