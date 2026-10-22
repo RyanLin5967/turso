@@ -18976,6 +18976,32 @@ fn a_default_is_coerced_to_its_column_as_postgresql_coerces_it() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// The engine's RESUME item 15, the frontend's part (1): trunc, floor, ceil, round and sign of an integer are float8 to
+/// PostgreSQL, so their RowDescription OID is 701 (and so is a division of one); abs keeps the integer's 23. sign(int)
+/// was announced int4. Expected OIDs: PG 18.6, recorded by fastest-engine (artie frontier/fastest/lanes/engine/raw/
+/// uw-pg18-int_math_float-rec15-iccad11.txt). The values (trunc(7) / 2 is 3.5) are the engine's fix f1aa2d45d, not on
+/// this line yet, so they are not asserted here.
+#[test]
+fn integer_math_functions_are_announced_float8() {
+    let dir = Scratch::new("int-math-float8");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE t (id int PRIMARY KEY, x int)").ok("create");
+    let mut wrong = Vec::new();
+    for (sql, want) in [
+        ("SELECT trunc(7) / 2, floor(7) / 2, ceil(7) / 2, round(7) / 2, sign(5) / 2, abs(5) / 2", vec![701, 701, 701, 701, 701, 23]),
+        ("SELECT trunc(5::bigint) / 2, floor(5::smallint) / 2, ceiling(-7) / 2, trunc(-7) / 2", vec![701, 701, 701, 701]),
+        ("SELECT id, trunc(x) / 2, floor(x) / 2, ceil(x) / 2 FROM t ORDER BY id", vec![23, 701, 701, 701]),
+        ("SELECT sign(x) FROM t", vec![701]),
+    ] {
+        let r = a.q(sql);
+        if r.error.is_some() || r.oids.as_deref() != Some(want.as_slice()) {
+            wrong.push(format!("{sql}: PG oids {want:?}; got {:?} {:?}", r.oids, r.error));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// (b1), attached tables (LEAD-RULINGS 0fac7e134e; unblocked by the engine's resident_btree_table, item 14): an assignment
 /// to a table of another schema (an attached database) is judged as one to a main table, qualified or through the search
 /// path. literal_assignments judged main's tables alone, so 40000 into s.t's smallint was stored silently. Expected
