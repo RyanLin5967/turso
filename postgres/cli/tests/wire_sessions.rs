@@ -17796,6 +17796,62 @@ fn a_float_numeric_or_boolean_column_reads_its_literal_as_its_input_routine_does
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// numfuzz seed 3269 at d5600475b (artie 5be9a9ed6b): a view's and a CHECK constraint's expressions keep their operands'
+/// nesting as written, before and after a restart: a - (b - c) is not a - b - c, a / (b / c) not a / b / c, -(a - b)
+/// not -a - b. A view read answered -5826 for PG's 5828: the stored text dropped the parentheses the parse tree
+/// implies. Expected answers: PG 18.6, recorded (artie a7962e881d,
+/// rec48-stored-expression-nesting/pg18-wirefuzz-a_stored_expression_keeps_its_nesting.out).
+#[test]
+fn a_stored_expression_keeps_its_operands_nesting() {
+    let dir = Scratch::new("stored-nesting");
+    let views = "SELECT id, s, q, m, n, r, x, l, g, u, w FROM pv ORDER BY id";
+    let want_views: Vec<Vec<Option<String>>> =
+        vec![["1", "6", "5", "-2", "-2", "1", "40", "-2", "1.5", "yyz", "14"].iter().map(|v| Some(v.to_string())).collect()];
+    let mut wrong = Vec::new();
+    {
+        let server = Server::start(&dir.db(), &[]);
+        let mut a = server.connect();
+        for sql in [
+            "CREATE TABLE p (id int PRIMARY KEY, a int, b int, c int, f float8, t text, CHECK (a - (b - c) >= 0))",
+            "CREATE VIEW pv AS SELECT id, a - (b - c) AS s, a / (b / c) AS q, a - (b + c) AS m, -(a - b) AS n, a % (b % c + 3) AS r, a * (b - c) AS x, (a - b) - c AS l, f - (f - 1.5) AS g, t || (t || 'z') AS u, a - -(b - c) AS w FROM p",
+            "CREATE VIEW pw AS SELECT id FROM p WHERE a - (b - c) = 6 AND NOT (a < b OR c > b)",
+            "INSERT INTO p (id, a, b, c, f, t) VALUES (1, 10, 8, 4, 2.5, 'y')",
+        ] {
+            a.q(sql).ok(sql);
+        }
+        let r = a.q("INSERT INTO p (id, a, b, c, f, t) VALUES (2, 1, 8, 4, 0.5, 'q')");
+        if r.error.as_ref().map(|e| e.code.as_str()) != Some("23514") {
+            wrong.push(format!("row 2: PG 23514; got {:?} {:?}", r.tags, r.error));
+        }
+        let r = a.q(views);
+        if r.error.is_some() || r.rows != want_views {
+            wrong.push(format!("before restart, {views}: PG {want_views:?}; got {:?} {:?}", r.rows, r.error));
+        }
+        drop(a);
+        server.kill();
+    }
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let r = a.q(views);
+    if r.error.is_some() || r.rows != want_views {
+        wrong.push(format!("after restart, {views}: PG {want_views:?}; got {:?} {:?}", r.rows, r.error));
+    }
+    let r = a.q("SELECT id FROM pw ORDER BY id");
+    if r.error.is_some() || r.rows != vec![vec![Some("1".to_string())]] {
+        wrong.push(format!("after restart, pw: PG [[1]]; got {:?} {:?}", r.rows, r.error));
+    }
+    // a - (b - c) is 2 here, a - b - c is -10: PG's CHECK admits the row.
+    let r = a.q("INSERT INTO p (id, a, b, c, f, t) VALUES (3, 5, 9, 6, 1, 'k')");
+    if r.error.is_some() {
+        wrong.push(format!("after restart, row 3: PG INSERT 0 1; got {:?} {:?}", r.tags, r.error));
+    }
+    let r = a.q("SELECT id FROM p ORDER BY id");
+    if r.rows != vec![vec![Some("1".to_string())], vec![Some("3".to_string())]] {
+        wrong.push(format!("after restart, ids: PG [[1], [3]]; got {:?} {:?}", r.rows, r.error));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// numfuzz seed 2952 at d5600475b (artie 5b9cc1446d): a text value cast to smallint, integer or bigint is read by
 /// int2in/int4in/int8in, whatever produced the text (a column, a function, a cast of another type): a spelling the
 /// routine refuses ('Infinity', '1.5', '', 'abc') is 22P02 and one past the type 22003, never a number; a 0x prefix,
