@@ -3369,9 +3369,11 @@ mod hashtests {
     /// writes), at 3000 and at 30000 rows. The answers are N.
     #[test]
     fn a_count_distinct_past_the_memory_budget_moves_at_most_a_page_per_row() {
+        // The smallest key's budgeted size, by the table's own accounting.
+        let smallest = HashEntry::size_from_values(&[Value::build_text("1")], &[]);
         assert!(
-            DEFAULT_MEM_BUDGET < 3000 * 8,
-            "premise: 3000 distinct keys exceed the hash budget ({DEFAULT_MEM_BUDGET} bytes; a debug build's)"
+            3000 * smallest > DEFAULT_MEM_BUDGET,
+            "premise: 3000 distinct keys of {smallest} bytes exceed the hash budget ({DEFAULT_MEM_BUDGET} bytes; a debug build's)"
         );
         let bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let io: Arc<dyn crate::IO> = Arc::new(ByteCountIo {
