@@ -1641,11 +1641,13 @@ fn under_sustained_creates_the_fill_completes() {
         assert!(cuts >= 1, "{rows} rows: premise: the log was never cut under {creates} creates");
         assert_eq!(prefilled, 1, "{rows} rows: under {creates} sustained creates the fill never completed ({batches} batches over {cuts} hard-limit cycles, K = {k} creates each)");
         // The bound, from the fill's scheduling: at least one batch per hard-limit cycle, a cycle at most
-        // 3 x the threshold of log (to the hard limit, 2 x, plus the deferral's one), so at most
-        // 3 x 4 KiB / (bytes per create) creates; and the fill's rows are the store's at the horizon,
-        // rows + 50 children. So it completes within (ceil((rows + 50) / 64) + 1) cycles of such creates.
+        // 4 x the threshold of log (to the hard limit, 2 x, plus the deferral's one, plus one for the tail a cut
+        // keeps and the creates its flight admits; amendment 35 measured 300-320 creates per cycle against
+        // 3 x 4 KiB / 42 B = 292, so the tail term is not negligible), so at most 4 x 4 KiB / (bytes per
+        // create) creates; and the fill's rows are the store's at the horizon, rows + 50 children. So it
+        // completes within (ceil((rows + 50) / 64) + 1) cycles of such creates.
         let n: u64 = rows.parse().unwrap();
-        let cycle = (3 * (4u64 << 10)) / per_create.max(1);
+        let cycle = (4 * (4u64 << 10)) / per_create.max(1);
         let bound = ((n + 50).div_ceil(64) + 1) * cycle;
         assert!(creates <= bound, "{rows} rows: the fill took {creates} creates to complete, past its bound {bound} ({cycle} creates per cycle)");
         let l = readings(&text, "LS-LIVE-LINKS ");
