@@ -17797,6 +17797,62 @@ fn a_float_numeric_or_boolean_column_reads_its_literal_as_its_input_routine_does
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// The lead's ruling (LEAD-RULINGS 9d87841628, 2): a value of a string type assigned to a numeric or boolean column (a
+/// text function's result, a || of strings, a text or varchar column) is 42804, even when no row matches; each was
+/// stored or answered. Expected answers: PG 18.6, recorded (artie e139983801,
+/// rec44-string-expression-assign/pg18-wirefuzz-a_string_expression_assigned_to_a_numeric_or_boolean_column_is_42804.out).
+#[test]
+fn a_string_expression_assigned_to_a_numeric_or_boolean_column_is_42804() {
+    let dir = Scratch::new("string-expression-assign");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in [
+        "CREATE TABLE se (id int PRIMARY KEY, b int, n numeric(6,2), f double precision, t boolean, s text, v varchar(5))",
+        "INSERT INTO se (id, s, v) VALUES (1, '5', '6')",
+    ] {
+        a.q(sql).ok(sql);
+    }
+    let m = |col: &str, ty: &str, from: &str| format!(r#"column "{col}" is of type {ty} but expression is of type {from}"#);
+    let mut wrong = Vec::new();
+    for (sql, message) in [
+        ("INSERT INTO se (id, b) VALUES (2, upper('x'))", m("b", "integer", "text")),
+        ("INSERT INTO se (id, b) VALUES (2, 'a' || 'b')", m("b", "integer", "text")),
+        ("INSERT INTO se (id, b) VALUES (2, lower('5'))", m("b", "integer", "text")),
+        ("INSERT INTO se (id, b) VALUES (2, concat(1, 2))", m("b", "integer", "text")),
+        ("INSERT INTO se (id, b) VALUES (2, substr('123', 1, 2))", m("b", "integer", "text")),
+        ("INSERT INTO se (id, b) VALUES (2, length('abc'))", String::new()),
+        ("INSERT INTO se (id, n) VALUES (3, md5('a'))", m("n", "numeric", "text")),
+        ("INSERT INTO se (id, t) VALUES (3, upper('t'))", m("t", "boolean", "text")),
+        ("INSERT INTO se (id, f) VALUES (3, 'x'::varchar || 'y')", m("f", "double precision", "text")),
+        ("INSERT INTO se (id, b) VALUES (3, to_char(5, '9'))", m("b", "integer", "text")),
+        ("UPDATE se SET b = s WHERE id = 1000", m("b", "integer", "text")),
+        ("UPDATE se SET b = v WHERE id = 1000", m("b", "integer", "character varying")),
+        ("UPDATE se SET b = se.s WHERE id = 1000", m("b", "integer", "text")),
+        ("INSERT INTO se (id, b) SELECT 4, s FROM se", m("b", "integer", "text")),
+        ("INSERT INTO se (id, b) VALUES (5, trim(' 7 '))", m("b", "integer", "text")),
+        ("INSERT INTO se (id, s) VALUES (6, upper('x'))", String::new()),
+    ] {
+        let r = a.q(sql);
+        let fine = if message.is_empty() {
+            r.error.is_none()
+        } else {
+            r.error.as_ref().is_some_and(|e| e.code == "42804" && e.message == message)
+        };
+        if !fine {
+            wrong.push(format!("{sql}: PG {message:?}; got {:?} {:?}", r.tags, r.error));
+        }
+    }
+    let r = a.q("SELECT id, b, s FROM se ORDER BY id");
+    let want: Vec<Vec<Option<String>>> = [["1", "", "5"], ["2", "3", ""], ["6", "", "X"]]
+        .iter()
+        .map(|row| row.iter().map(|v| (!v.is_empty()).then(|| v.to_string())).collect())
+        .collect();
+    if r.error.is_some() || r.rows != want {
+        wrong.push(format!("SELECT: PG {want:?}; got {:?} {:?}", r.rows, r.error));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// The lead's ruling (LEAD-RULINGS 9d87841628, 1): a hexadecimal, octal or binary constant and a negated cast constant
 /// assigned to an integer column are range-checked and rounded as any constant is, even when no row matches, and a
 /// prefix minus over an untyped literal is 42725. Expected answers: PG 18.6, recorded (artie a85d2e2a20,
