@@ -17917,6 +17917,137 @@ fn a_float_numeric_or_boolean_column_reads_its_literal_as_its_input_routine_does
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// numfuzz seeds 4703, 3659 (artie f1fec7d3cc, 77b6087556), PGDIV-INT-RANGE's "an expression's value assigned to one is
+/// not (the engine stores it)": an expression's value assigned to a smallint, integer or bigint column is cast as
+/// PostgreSQL's assignment cast casts it, on INSERT ... SELECT and UPDATE: a numeric rounds half away from zero, a
+/// float8 half to even, and a value past the column is 22003 with the column type's message. The engine stored NULL
+/// for 87.343 % -0.6767537 (now a REAL it refuses), and 2147483648000000 in a smallint. Expected answers: PG 18.6,
+/// recorded (artie ff6aef8911,
+/// rec53-expression-assign-int/pg18-wirefuzz-an_expression_assigned_to_an_integer_column_is_cast_as_postgresql_assigns_it.out);
+/// its UPDATE matching no row is refused by PG's constant folding and is not asserted here.
+#[test]
+fn an_expression_assigned_to_an_integer_column_is_cast_as_postgresql_assigns_it() {
+    let dir = Scratch::new("expression-assign-int");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in [
+        "CREATE TABLE ea (id int PRIMARY KEY, s smallint, i int, b bigint, n numeric(6,2), f float8)",
+        "INSERT INTO ea (id, n, f) VALUES (1, 2.5, 2.5), (2, -2.5, -2.5), (3, 1.25, 1.75)",
+    ] {
+        a.q(sql).ok(sql);
+    }
+    let mut wrong = Vec::new();
+    for sql in [
+        "INSERT INTO ea (id, s) SELECT 4, (00087.343 % (-0.6767537))",
+        "INSERT INTO ea (id, s) SELECT 5, n * 1 FROM ea WHERE id = 1",
+        "INSERT INTO ea (id, i) SELECT 6, f * 1 FROM ea WHERE id = 1",
+        "UPDATE ea SET s = n * 1, i = f * 1 WHERE id IN (2, 3)",
+    ] {
+        let r = a.q(sql);
+        if r.error.is_some() {
+            wrong.push(format!("{sql}: PG succeeds; got {:?}", r.error));
+        }
+    }
+    for (sql, message) in [
+        ("UPDATE ea SET s = -((1000000 * ((-1) * 2147483648))) WHERE id = 1", "smallint out of range"),
+        ("UPDATE ea SET i = i + 2147483647 WHERE id = 6", "integer out of range"),
+        ("INSERT INTO ea (id, s) SELECT 7, 40000 + id FROM ea WHERE id = 1", "smallint out of range"),
+    ] {
+        let r = a.q(sql);
+        if !r.error.as_ref().is_some_and(|e| e.code == "22003" && e.message == message) {
+            wrong.push(format!("{sql}: PG 22003 {message:?}; got {:?} {:?}", r.tags, r.error));
+        }
+    }
+    let r = a.q("SELECT id, s, i FROM ea ORDER BY id");
+    let cell = |v: &str| (!v.is_empty()).then(|| v.to_string());
+    let want: Vec<Vec<Option<String>>> = [["1", "", ""], ["2", "-3", "-2"], ["3", "1", "2"], ["4", "0", ""], ["5", "3", ""], ["6", "", "2"]]
+        .iter()
+        .map(|row| row.iter().map(|v| cell(v)).collect())
+        .collect();
+    if r.error.is_some() || r.rows != want {
+        wrong.push(format!("SELECT: PG {want:?}; got {:?} {:?}", r.rows, r.error));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// numfuzz seeds 4703, 5316 (artie f1fec7d3cc, d0d756b0b5): a numeric modulo is the remainder PostgreSQL computes (a
+/// fraction, its sign the dividend's), and a numeric modulo by zero is 22012; the engine's % reads both sides as
+/// integers, so 87.343 % -0.6767537 was a modulo by zero, NULL (and so the smallint it was assigned), and
+/// -(24165.9 % 2570.14) answered -1035 for PG's -1034.64. Expected answers: PG 18.6, recorded (artie de48459f69,
+/// rec52-numeric-modulo/pg18-wirefuzz-a_numeric_modulo_is_the_remainder_postgresql_computes.out); the rows whose text
+/// carries a numeric(p, s) column's scale (1034.640) are the engine's NUMERIC class and are not asserted here, and the
+/// remainder assigned to a smallint is asserted by an_expression_assigned_to_an_integer_column_is_cast_as_postgresql_assigns_it.
+#[test]
+fn a_numeric_modulo_is_the_remainder_postgresql_computes() {
+    let dir = Scratch::new("numeric-modulo");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in [
+        "CREATE TABLE nm (id int PRIMARY KEY, n numeric(10,3), i int, s smallint)",
+        "INSERT INTO nm VALUES (1, 24165.9, 7, 3), (2, -24165.9, -7, 0), (3, 0.5, 0, 2)",
+    ] {
+        a.q(sql).ok(sql);
+    }
+    let mut wrong = Vec::new();
+    let r = a.q("SELECT 87.343 % -0.6767537 AS a, -(24165.9 % 2570.14) AS b, 7.5 % 2 AS c, -7.5 % 2 AS d, 10 % 3.3 AS e");
+    let want: Vec<Vec<Option<String>>> = vec![["0.0417727", "-1034.64", "1.5", "-1.5", "0.1"].iter().map(|v| Some(v.to_string())).collect()];
+    if r.error.is_some() || r.rows != want {
+        wrong.push(format!("literal modulos: PG {want:?}; got {:?} {:?}", r.rows, r.error));
+    }
+    for sql in ["SELECT n % i FROM nm WHERE id = 3", "SELECT 5.5 % 0 AS v"] {
+        let r = a.q(sql);
+        if !r.error.as_ref().is_some_and(|e| e.code == "22012" && e.message == "division by zero") {
+            wrong.push(format!("{sql}: PG 22012 'division by zero'; got {:?} {:?}", r.rows, r.error));
+        }
+    }
+    // The remainder assigned to a smallint (PG stores 0) is an_expression_assigned_to_an_integer_column_is_cast_as_postgresql_assigns_it's.
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// numfuzz seeds 4681 and 4784 at 783dee075 (artie f1fec7d3cc): a real or double precision value cast to text, varchar or
+/// concatenated with || is written as float4out or float8out writes it (the shortest text that reads back exactly):
+/// a real column's -683390.3 was written -683390.3125, a float8 expression's -2837.7029749885614 as -2837.70297498856.
+/// Expected answers: PG 18.6, recorded (artie 31bae8c279,
+/// rec51-float-text-cast/pg18-wirefuzz-a_float_cast_to_text_is_written_as_its_output_routine_writes_it.out).
+#[test]
+fn a_float_cast_to_text_is_written_as_its_output_routine_writes_it() {
+    let dir = Scratch::new("float-text-cast");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in [
+        "CREATE TABLE ft (id int PRIMARY KEY, r real, f float8)",
+        "INSERT INTO ft VALUES (1, -683390.3, 0.1), (2, 0.75318, 1e20), (3, 1.1, 1e-5), (4, 100, 2837.7029749885614)",
+    ] {
+        a.q(sql).ok(sql);
+    }
+    let rows = |rows: &[&[&str]]| -> Vec<Vec<Option<String>>> { rows.iter().map(|r| r.iter().map(|v| Some(v.to_string())).collect()).collect() };
+    let columns = rows(&[&["1", "-683390.3", "0.1"], &["2", "0.75318", "1e+20"], &["3", "1.1", "1e-05"], &["4", "100", "2837.7029749885614"]]);
+    let mut wrong = Vec::new();
+    for (sql, want) in [
+        ("SELECT id, r::text, f::text FROM ft ORDER BY id", columns.clone()),
+        ("SELECT id, CAST(r AS text), CAST(f AS varchar) FROM ft ORDER BY id", columns.clone()),
+        (
+            "SELECT id, (r * 2)::text, (f + f)::text, (f / 3)::text FROM ft ORDER BY id",
+            rows(&[
+                &["1", "-1366780.625", "0.2", "0.03333333333333333"],
+                &["2", "1.5063600540161133", "2e+20", "3.333333333333333e+19"],
+                &["3", "2.200000047683716", "2e-05", "3.3333333333333337e-06"],
+                &["4", "200", "5675.405949977123", "945.9009916628538"],
+            ]),
+        ),
+        ("SELECT (((32767)::float8 / ((-3.5840e0) - 7.963015416626570000)))::text AS v", rows(&[&["-2837.7029749885614"]])),
+        ("SELECT (0.1::float8 + 0.2::float8)::text AS v, (1.1::real)::text AS w, ('1e300'::float8 * 10)::text AS x", rows(&[&["0.30000000000000004", "1.1", "1e+301"]])),
+        ("SELECT id, r || 'x', f || '' FROM ft ORDER BY id", rows(&[&["1", "-683390.3x", "0.1"], &["2", "0.75318x", "1e+20"], &["3", "1.1x", "1e-05"], &["4", "100x", "2837.7029749885614"]])),
+        ("SELECT length(f::text) FROM ft WHERE id = 4", rows(&[&["18"]])),
+    ] {
+        let r = a.q(sql);
+        if r.error.is_some() || r.rows != want {
+            wrong.push(format!("{sql}: PG {want:?}; got {:?} {:?}", r.rows, r.error));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// numfuzz seed 3504 at d5600475b (artie c098a7ed4d), PGDIV-INT-CAST-TRUNCATES: an expression cast to an integer type
 /// rounds as its type's cast rounds, in a target list, a WHERE and a view: a numeric half away from zero, a float8 or
 /// real half to even, where the engine's CAST truncated (-((-('1.5'::numeric))::bigint) answered 1 for PG's 2).

@@ -253,6 +253,15 @@ pub struct PostgreSQLTranslator {
     /// (701) or real (700) expression, with the operand's type
     /// ([`PostgreSQLTranslator::with_integer_cast_rounding`]).
     integer_cast_rounding: Option<std::collections::HashMap<i32, u32>>,
+    /// The real (700) and float8 (701) values written as text: casts to a string type (by the
+    /// cast's location) and operands of || (by the operand's)
+    /// ([`PostgreSQLTranslator::with_float_texts`]).
+    float_texts: Option<std::collections::HashMap<i32, u32>>,
+    /// The % over a numeric, by their parse locations ([`PostgreSQLTranslator::with_numeric_mods`]).
+    numeric_mods: Option<std::collections::HashSet<i32>>,
+    /// The expressions assigned to integer columns, by their parse locations: the column's bits and
+    /// the rounding ([`PostgreSQLTranslator::with_integer_assignments`]).
+    integer_assignments: Option<std::collections::HashMap<i32, (u32, &'static str)>>,
     /// The string and numeric literals (by their parse locations) the caller read as an integer
     /// column's assignment reads them ([`PostgreSQLTranslator::with_integer_literals`]): written as
     /// the value as a number, which the engine's integer column and a domain over one take ('0x1F'
@@ -375,6 +384,21 @@ fn integer_default(col_def: &pg_query::protobuf::ColumnDef, expr: &pg_query::pro
 /// at its AND boundaries); a unary operator's operand binding looser than it; and a unary under a
 /// unary always, so `- -x` never reads as a comment. `parent` is None under a unary or postfix
 /// operator, whose level is `unary_level`.
+/// A node's parse location, for the nodes an operand of || can be (the walk keys
+/// [`PostgreSQLTranslator::with_float_texts`] by it).
+fn pg_location(node: &pg_query::protobuf::Node) -> Option<i32> {
+    use pg_query::protobuf::node::Node;
+    match node.node.as_ref()? {
+        Node::ColumnRef(c) => Some(c.location),
+        Node::AExpr(e) => Some(e.location),
+        Node::FuncCall(f) => Some(f.location),
+        Node::TypeCast(c) => Some(c.location),
+        Node::AConst(c) => Some(c.location),
+        Node::ParamRef(p) => Some(p.location),
+        _ => None,
+    }
+}
+
 fn nested(e: Box<ast::Expr>, parent: Option<&ast::Operator>) -> Box<ast::Expr> {
     nested_at(e, parent, false, 11)
 }
@@ -486,6 +510,50 @@ impl PostgreSQLTranslator {
     /// where the engine's CAST truncates (PGDIV-INT-CAST-TRUNCATES; numfuzz seed 3504; recorded,
     /// rec50-expression-int-cast): a numeric half away from zero (round), a float8 or real half to
     /// even (pg_round_even). The operand is evaluated once.
+    /// Writes each listed real or float8 value as text as float4out or float8out does (the shortest
+    /// text that reads back exactly: -683390.3, 0.30000000000000004, 1e+20), through pg_float_text,
+    /// where the engine's CAST wrote 15 significant digits (numfuzz seeds 4681, 4784; recorded,
+    /// rec51-float-text-cast).
+    pub fn with_float_texts(mut self, texts: std::collections::HashMap<i32, u32>) -> Self {
+        self.float_texts = Some(texts);
+        self
+    }
+
+    /// The value of `arg`, a real or float8 one per [`PostgreSQLTranslator::with_float_texts`],
+    /// written as its output routine writes it; None when `location` is not listed.
+    fn float_text(&self, location: i32, arg: &pg_query::protobuf::Node) -> Result<Option<ast::Expr>, ParseError> {
+        let Some(ty) = self.float_texts.as_ref().and_then(|m| m.get(&location)).copied() else { return Ok(None) };
+        Ok(Some(ast::Expr::FunctionCall {
+            name: pg_name("pg_float_text"),
+            distinctness: None,
+            args: vec![
+                Box::new(self.translate_expr(arg)?),
+                Box::new(ast::Expr::Literal(sql_string(if ty == 700 { "float4" } else { "float8" }))),
+            ],
+            order_by: vec![],
+            within_group: vec![],
+            filter_over: ast::FunctionTail { filter_clause: None, over_clause: None },
+        }))
+    }
+
+    /// Computes each listed % as PostgreSQL's numeric remainder through pg_numeric_mod (a fraction,
+    /// the dividend's sign, 22012 for a zero divisor), where the engine's % reads both sides as
+    /// integers (numfuzz seeds 4703, 5316; recorded, rec52-numeric-modulo).
+    /// Casts each listed expression's value as PostgreSQL's assignment cast to its integer column
+    /// casts it, through pg_assign_int_value: rounded ("numeric" half away from zero, "float" half to
+    /// even) and range-checked (22003 with the column type's message; NaN and infinity as PostgreSQL
+    /// refuses them), where the engine refused a REAL or stored a value past a smallint (recorded,
+    /// rec53-expression-assign-int).
+    pub fn with_integer_assignments(mut self, assignments: std::collections::HashMap<i32, (u32, &'static str)>) -> Self {
+        self.integer_assignments = Some(assignments);
+        self
+    }
+
+    pub fn with_numeric_mods(mut self, mods: std::collections::HashSet<i32>) -> Self {
+        self.numeric_mods = Some(mods);
+        self
+    }
+
     pub fn with_integer_cast_rounding(mut self, casts: std::collections::HashMap<i32, u32>) -> Self {
         self.integer_cast_rounding = Some(casts);
         self
@@ -3792,6 +3860,27 @@ impl PostgreSQLTranslator {
     }
 
     fn translate_expr(&self, node: &pg_query::protobuf::Node) -> Result<ast::Expr, ParseError> {
+        if let Some((bits, kind)) = self.integer_assignments.as_ref().and_then(|m| pg_location(node).and_then(|l| m.get(&l))) {
+            let name = match bits {
+                16 => "smallint",
+                32 => "integer",
+                _ => "bigint",
+            };
+            let inner = self.translate_expr_unassigned(node)?;
+            return Ok(ast::Expr::FunctionCall {
+                name: pg_name("pg_assign_int_value"),
+                distinctness: None,
+                args: vec![Box::new(inner), Box::new(ast::Expr::Literal(sql_string(name))), Box::new(ast::Expr::Literal(sql_string(kind)))],
+                order_by: vec![],
+                within_group: vec![],
+                filter_over: ast::FunctionTail { filter_clause: None, over_clause: None },
+            });
+        }
+        self.translate_expr_unassigned(node)
+    }
+
+    /// [`PostgreSQLTranslator::translate_expr`] without an assignment's cast.
+    fn translate_expr_unassigned(&self, node: &pg_query::protobuf::Node) -> Result<ast::Expr, ParseError> {
         // Stack-guard class (fastest-engine): a recursive entry is a nested step (`turso_stack_guard::NestGuard`).
         let _nest = crate::nest()?;
         match &node.node {
@@ -4199,6 +4288,11 @@ impl PostgreSQLTranslator {
                         arg.node.as_ref(),
                         Some(pg_query::protobuf::node::Node::ColumnRef(_) | pg_query::protobuf::node::Node::ParamRef(_))
                     );
+                    if t.typmods.is_empty() {
+                        if let Some(text) = self.float_text(type_cast.location, arg)? {
+                            return Ok(text);
+                        }
+                    }
                     if let Some(ty) = self.integer_cast_rounding.as_ref().and_then(|m| m.get(&type_cast.location)).filter(|_| integer) {
                         let round = if *ty == 1700 { "round" } else { "pg_round_even" };
                         return Ok(ast::Expr::Cast {
@@ -4764,11 +4858,24 @@ impl PostgreSQLTranslator {
         if a_const.isnull {
             return Ok(ast::Expr::Literal(ast::Literal::Null));
         }
+        // A constant the caller read as a real or double precision column's assignment reads it
+        // ([`PostgreSQLTranslator::with_float_literals`]), written as that number: a string's float4in
+        // or float8in value, a numeric or integer constant's float4 value (-683390.3 is -683390.3125).
+        let float_literal = |location: i32| {
+            self.float_literals.as_ref().and_then(|m| m.get(&location)).map(|v| {
+                let magnitude = if v.is_infinite() { "1e999".to_string() } else { format!("{:?}", v.abs()) };
+                let literal = ast::Expr::Literal(ast::Literal::Numeric(magnitude));
+                if v.is_sign_negative() { ast::Expr::Unary(ast::UnaryOperator::Negative, Box::new(literal)) } else { literal }
+            })
+        };
         if let Some(val) = &a_const.val {
             match val {
-                pg_query::protobuf::a_const::Val::Ival(i) => Ok(ast::Expr::Literal(
-                    ast::Literal::Numeric(i.ival.to_string()),
-                )),
+                pg_query::protobuf::a_const::Val::Ival(i) => {
+                    if let Some(literal) = float_literal(a_const.location) {
+                        return Ok(literal);
+                    }
+                    Ok(ast::Expr::Literal(ast::Literal::Numeric(i.ival.to_string())))
+                }
                 pg_query::protobuf::a_const::Val::Sval(s) => {
                     if let Some(v) = self.integer_literals.as_ref().and_then(|m| m.get(&a_const.location)) {
                         return Ok(ast::Expr::Literal(ast::Literal::Numeric(v.to_string())));
@@ -4776,10 +4883,8 @@ impl PostgreSQLTranslator {
                     if let Some(t) = self.text_literals.as_ref().and_then(|m| m.get(&a_const.location)) {
                         return Ok(ast::Expr::Literal(sql_string(t)));
                     }
-                    if let Some(v) = self.float_literals.as_ref().and_then(|m| m.get(&a_const.location)) {
-                        let magnitude = if v.is_infinite() { "1e999".to_string() } else { format!("{:?}", v.abs()) };
-                        let literal = ast::Expr::Literal(ast::Literal::Numeric(magnitude));
-                        return Ok(if v.is_sign_negative() { ast::Expr::Unary(ast::UnaryOperator::Negative, Box::new(literal)) } else { literal });
+                    if let Some(literal) = float_literal(a_const.location) {
+                        return Ok(literal);
                     }
                     // Turso's AST expects string literals to include surrounding single quotes
                     // (sanitize_string strips them during bytecode emission): sql_string.
@@ -4788,6 +4893,9 @@ impl PostgreSQLTranslator {
                 pg_query::protobuf::a_const::Val::Fval(f) => {
                     if let Some(v) = self.integer_literals.as_ref().and_then(|m| m.get(&a_const.location)) {
                         return Ok(ast::Expr::Literal(ast::Literal::Numeric(v.to_string())));
+                    }
+                    if let Some(literal) = float_literal(a_const.location) {
+                        return Ok(literal);
                     }
                     Ok(ast::Expr::Literal(ast::Literal::Numeric(decimal_numeric_literal(&f.fval))))
                 }
@@ -5036,11 +5144,22 @@ impl PostgreSQLTranslator {
             };
         }
 
-        // Translate left and right expressions
-        let left = Box::new(self.translate_expr(a_expr.lexpr.as_ref().unwrap())?);
+        // Translate left and right expressions; a real or float8 operand of || is written as its
+        // output routine writes it ([`PostgreSQLTranslator::with_float_texts`]).
+        let operand = |node: &pg_query::protobuf::Node| -> Result<Box<ast::Expr>, ParseError> {
+            if op_name == "||" {
+                if let Some(location) = pg_location(node) {
+                    if let Some(text) = self.float_text(location, node)? {
+                        return Ok(Box::new(text));
+                    }
+                }
+            }
+            Ok(Box::new(self.translate_expr(node)?))
+        };
+        let left = operand(a_expr.lexpr.as_ref().unwrap())?;
 
         let right = if let Some(rexpr) = &a_expr.rexpr {
-            Box::new(self.translate_expr(rexpr)?)
+            operand(rexpr)?
         } else {
             return Err(ParseError::ParseError(
                 "Missing right expression".to_string().into(),
@@ -5139,6 +5258,16 @@ impl PostgreSQLTranslator {
             }
         };
 
+        if op_name == "%" && self.numeric_mods.as_ref().is_some_and(|m| m.contains(&a_expr.location)) {
+            return Ok(ast::Expr::FunctionCall {
+                name: pg_name("pg_numeric_mod"),
+                distinctness: None,
+                args: vec![left, right],
+                order_by: vec![],
+                within_group: vec![],
+                filter_over: ast::FunctionTail { filter_clause: None, over_clause: None },
+            });
+        }
         Ok(ast::Expr::Binary(nested(left, Some(&binary_op)), binary_op, nested_at(right, Some(&binary_op), true, 11)))
     }
 

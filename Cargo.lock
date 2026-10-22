@@ -7476,6 +7476,7 @@ dependencies = [
  "compact_str",
  "libc",
  "parking_lot",
+ "pgwire",
  "rustc-hash 2.1.1",
  "smallvec",
  "stacker",
