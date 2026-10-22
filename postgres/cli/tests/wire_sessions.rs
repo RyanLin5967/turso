@@ -17796,6 +17796,52 @@ fn a_float_numeric_or_boolean_column_reads_its_literal_as_its_input_routine_does
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// numfuzz seed 3504 at d5600475b (artie c098a7ed4d), PGDIV-INT-CAST-TRUNCATES: an expression cast to an integer type
+/// rounds as its type's cast rounds, in a target list, a WHERE and a view: a numeric half away from zero, a float8 or
+/// real half to even, where the engine's CAST truncated (-((-('1.5'::numeric))::bigint) answered 1 for PG's 2).
+/// Expected answers: PG 18.6, recorded (artie 0de472ed9d,
+/// rec50-expression-int-cast/pg18-wirefuzz-an_expression_cast_to_an_integer_rounds_as_its_type_rounds.out).
+#[test]
+fn an_expression_cast_to_an_integer_rounds_as_its_type_rounds() {
+    let dir = Scratch::new("expression-int-cast");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in [
+        "CREATE TABLE ec (id int PRIMARY KEY, n numeric, f float8, r real)",
+        "INSERT INTO ec VALUES (1, 2.5, 2.5, 2.5), (2, -2.5, -2.5, -2.5), (3, 1.5, 1.5, 1.5), (4, 0.5, 0.5, 0.5)",
+        "CREATE VIEW ecv AS SELECT id, (n * 1)::int AS ni, (f / 1)::int AS fi FROM ec",
+    ] {
+        a.q(sql).ok(sql);
+    }
+    let rows = |rows: &[&[&str]]| -> Vec<Vec<Option<String>>> { rows.iter().map(|r| r.iter().map(|v| Some(v.to_string())).collect()).collect() };
+    let mut wrong = Vec::new();
+    for (sql, want) in [
+        ("SELECT -((-('1.5'::numeric))::bigint) AS v", rows(&[&["2"]])),
+        (
+            "SELECT (('2.5'::numeric) + 0)::int AS a, ((2.5)::float8 + 0)::int AS b, ((3.5)::float8 * 1)::int AS c, (-(2.5::float8) * 1)::int AS d",
+            rows(&[&["3", "2", "4", "-2"]]),
+        ),
+        (
+            "SELECT id, (n * 1)::int AS ni, (f * 1)::int AS fi, (r + 0)::int AS ri, (n + 0)::int8 AS n8, (f + 0)::smallint AS f2 FROM ec ORDER BY id",
+            rows(&[&["1", "3", "2", "2", "3", "2"], &["2", "-3", "-2", "-2", "-3", "-2"], &["3", "2", "2", "2", "2", "2"], &["4", "1", "0", "0", "1", "0"]]),
+        ),
+        ("SELECT id FROM ec WHERE (n * 1)::int = 3 ORDER BY id", rows(&[&["1"]])),
+        ("SELECT id FROM ec WHERE (f * 1)::int = 2 ORDER BY id", rows(&[&["1"], &["3"]])),
+        ("SELECT id, ni, fi FROM ecv ORDER BY id", rows(&[&["1", "3", "2"], &["2", "-3", "-2"], &["3", "2", "2"], &["4", "1", "0"]])),
+        ("SELECT (abs(n) * 1)::int AS v FROM ec WHERE id = 2", rows(&[&["3"]])),
+    ] {
+        let r = a.q(sql);
+        if r.error.is_some() || r.rows != want {
+            wrong.push(format!("{sql}: PG {want:?}; got {:?} {:?}", r.rows, r.error));
+        }
+    }
+    let r = a.q("SELECT (round(f, 1) + 0)::int FROM ec WHERE id = 1");
+    if !r.error.as_ref().is_some_and(|e| e.code == "42883" && e.message == "function round(double precision, integer) does not exist") {
+        wrong.push(format!("round(f, 1): PG 42883; got {:?} {:?}", r.rows, r.error));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// numfuzz seeds 4029, 4207, 4074 and 4252 (artie d101e52932, f7f5e008d0): numeric Infinity assigned to a numeric(p, s)
 /// column is 22003 'numeric field overflow' on every assignment path, even when no row matches (it was stored), and an
 /// integer of more than 15 significant digits written as text and read as a numeric is refused 0A000 as the same
