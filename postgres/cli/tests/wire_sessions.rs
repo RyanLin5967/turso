@@ -17736,6 +17736,35 @@ fn a_constant_cast_past_numeric_p_s_is_22003_with_no_row() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// The lead's ruling (LEAD-RULINGS 82dcec6b66 item 5; the float8 blind spot of c8b6e2916): a double is written in the
+/// shortest digits that read back as it from strictly inside its rounding interval, as float8out writes it (d2s.c
+/// without STRICTLY_SHORTEST): 20197275871653528's 16-digit form 2.019727587165353e+16 is the halfway point to its
+/// neighbour, read back only by ties-to-even, and PostgreSQL writes 2.0197275871653528e+16. Expected answers: PG 18.6,
+/// recorded (artie 021bdded45, rec36-float8-ties/pg18-wirefuzz-a_double_is_written_in_the_shortest_digits_strictly_inside_its_interval.out),
+/// but its v::numeric (the engine's numeric).
+#[test]
+fn a_double_is_written_in_the_shortest_digits_strictly_inside_its_interval() {
+    let dir = Scratch::new("float8-ties");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in [
+        "CREATE TABLE d (id int PRIMARY KEY, v double precision)",
+        "INSERT INTO d VALUES (1, 20197275871653528), (2, 35152180762487008), (3, 23204398328858688), (4, 69924194935583344), (5, 37949282877879376), (6, 37220404050695536), (7, -20197275871653528), (8, 9007199254740993), (9, 0.1), (10, 1e22), (11, 123456789012345680), (12, 5e-324)",
+    ] {
+        a.q(sql).ok(sql);
+    }
+    let want: Vec<Vec<Option<String>>> = [
+        "2.0197275871653528e+16", "3.5152180762487008e+16", "2.3204398328858688e+16", "6.9924194935583344e+16",
+        "3.7949282877879376e+16", "3.7220404050695536e+16", "-2.0197275871653528e+16", "9.007199254740992e+15", "0.1",
+        "1e+22", "1.2345678901234568e+17", "5e-324",
+    ]
+    .iter()
+    .map(|v| vec![Some(v.to_string())])
+    .collect();
+    let r = a.q("SELECT v FROM d ORDER BY id");
+    assert!(r.error.is_none() && r.rows == want, "PG {want:?}; got {:?} {:?}", r.rows, r.error);
+}
+
 /// numfuzz (seeds 343 at 6e17acc9a, 1144 at 45de98440; artie 9b32cd5149, 52ca04164d): a real is written in the
 /// shortest digits that read back as it from strictly inside its rounding interval, as float4out writes it: a decimal on
 /// the interval's edge reads back only by ties-to-even, and PostgreSQL passes over it (-337198016 is -3.3719802e+08,
