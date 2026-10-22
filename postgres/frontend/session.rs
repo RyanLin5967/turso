@@ -2957,8 +2957,9 @@ fn text_integer_casts(
 /// integer column does not read ('0x1F', '1_000', ' 7', 1.5), by parse location, with their values.
 /// Every INSERT and UPDATE passes here, so nothing is allocated per value of a builtin type (a
 /// domain's base is looked up). An integer array's literal is read element by element and a domain
-/// through its base type (rec41). BLIND SPOTS: an attached schema's table ([`resolves_to_main`]), an
-/// array of another element type, a domain's CHECK (the engine's), a column of another relation or
+/// through its base type (rec41); the table is the one the name resolves to, in any schema
+/// ([`assignment_table`]). BLIND SPOTS: a domain is looked up in main's schema, so one declared in
+/// another schema's database is not read through its base; an array of another element type, a domain's CHECK (the engine's), a column of another relation or
 /// an expression of a string type (upper('x')), a negated or hexadecimal constant, a set
 /// operation's branches, a DEFAULT, and a literal to a float or boolean column (stored as the
 /// engine reads it). A constant to a numeric(p, s) column past it is 22003 'numeric field
@@ -3096,46 +3097,23 @@ fn default_coercions(
     Ok((values, deferred))
 }
 
-/// Whether an INSERT's or UPDATE's relation is main's table, resolved as the engine resolves it:
-/// public or main by name; unqualified, a temp table first, then the search path's entries in order
-/// (public is main, another is an attached schema; with no path, main first), the first holding
-/// the name deciding, a view there included (the engine's own resolver, which answers None for one,
-/// is asked last). literal_assignments judges main's tables alone: under search_path s, public an
-/// unqualified t is s.t (recorded, rec38-search-path-assign, artie 8d9065d8e9), and it judged
-/// public.t. BLIND SPOT: an attached schema's table, whose declared types no public core accessor
-/// gives (its column names alone), is not judged.
-fn resolves_to_main(pg_conn: &PgConnectionInner, relation: &turso_pg_parser::pg_query::protobuf::RangeVar) -> bool {
+/// The B-tree table an INSERT's or UPDATE's `relation` names, as the engine resolves it: a
+/// qualified name in main or its attached database, an unqualified one through the session's
+/// search path, temp first (the engine's resident_btree_table and resident_unqualified_btree_table,
+/// RESUME item 14). None for another database's name (refused elsewhere), a view, or no table.
+/// Only main's tables were judged, so an assignment to another schema's was stored unchecked
+/// ((b1); 40000 into s.t's smallint).
+fn assignment_table(pg_conn: &PgConnectionInner, relation: &turso_pg_parser::pg_query::protobuf::RangeVar) -> Option<Arc<turso_core::schema::BTreeTable>> {
     use turso_pg_parser::SchemaQualifier;
-    let conn = &pg_conn.conn;
-    let table = relation.relname.as_str();
     if !relation.catalogname.is_empty() {
-        return false;
+        return None;
     }
+    let conn = &pg_conn.conn;
     match turso_pg_parser::schema_qualifier(&relation.schemaname) {
-        SchemaQualifier::Main => true,
-        SchemaQualifier::Unqualified => {
-            if conn.resident_table_columns("temp", table).is_some() {
-                return false;
-            }
-            let path = written_search_path(pg_conn);
-            let main_holds = || conn.current_schema().get_btree_table(table).is_some() && conn.resident_unqualified_table_columns(table, &path).is_some();
-            // With no path the engine reads main after temp, and main cannot hold a view and a
-            // table of one name: no resolver call (which allocates) on the common INSERT.
-            if path.is_empty() {
-                return conn.current_schema().get_btree_table(table).is_some();
-            }
-            let attached = conn.attached_database_names();
-            for entry in &path {
-                if entry == "public" || entry == "main" {
-                    return main_holds();
-                }
-                if attached.iter().any(|a| a == entry) && conn.resident_table_columns(entry, table).is_some() {
-                    return false;
-                }
-            }
-            false
-        }
-        _ => false,
+        SchemaQualifier::Main => conn.resident_btree_table("main", &relation.relname),
+        SchemaQualifier::Unqualified => conn.resident_unqualified_btree_table(&relation.relname, &written_search_path(pg_conn)),
+        SchemaQualifier::Attached(database) => conn.resident_btree_table(database, &relation.relname),
+        _ => None,
     }
 }
 
@@ -3157,11 +3135,11 @@ fn literal_assignments(
         Node::UpdateStmt(u) => u.relation.as_ref(),
         _ => return Ok((rewrites, text_rewrites, Default::default(), Default::default(), Default::default())),
     };
-    let Some(relation) = relation.filter(|r| resolves_to_main(pg_conn, r)) else {
+    let Some(relation) = relation else {
         return Ok((rewrites, text_rewrites, Default::default(), Default::default(), Default::default()));
     };
     let schema = pg_conn.conn.current_schema();
-    let Some(table) = schema.get_btree_table(&relation.relname) else { return Ok((rewrites, text_rewrites, Default::default(), Default::default(), Default::default())) };
+    let Some(table) = assignment_table(pg_conn, relation) else { return Ok((rewrites, text_rewrites, Default::default(), Default::default(), Default::default())) };
     // An integer column's width from its declared type, read without allocating.
     let integer_bits = |ty: &str| -> u32 {
         let base = ty.split('(').next().unwrap_or("").trim();
@@ -3321,7 +3299,7 @@ fn literal_assignments(
         Node::InsertStmt(i) => match i.select_stmt.as_deref().and_then(|s| s.node.as_ref()) {
             Some(Node::SelectStmt(sel)) if sel.values_lists.is_empty() && sel.larg.is_none() => match sel.from_clause.as_slice() {
                 [only] => match only.node.as_ref() {
-                    Some(Node::RangeVar(rv)) if resolves_to_main(pg_conn, rv) => schema.get_btree_table(&rv.relname).map(|t| {
+                    Some(Node::RangeVar(rv)) => assignment_table(pg_conn, rv).map(|t| {
                         let alias = rv.alias.as_ref().map(|a| a.aliasname.clone()).unwrap_or_else(|| rv.relname.clone());
                         (t, rv.relname.clone(), alias)
                     }),
