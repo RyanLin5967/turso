@@ -17808,12 +17808,66 @@ fn a_float_numeric_or_boolean_column_reads_its_literal_as_its_input_routine_does
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// numfuzz seeds 4703, 3659 (artie f1fec7d3cc, 77b6087556), PGDIV-INT-RANGE's "an expression's value assigned to one is
+/// not (the engine stores it)": an expression's value assigned to a smallint, integer or bigint column is cast as
+/// PostgreSQL's assignment cast casts it, on INSERT ... SELECT and UPDATE: a numeric rounds half away from zero, a
+/// float8 half to even, and a value past the column is 22003 with the column type's message. The engine stored NULL
+/// for 87.343 % -0.6767537 (now a REAL it refuses), and 2147483648000000 in a smallint. Expected answers: PG 18.6,
+/// recorded (artie ff6aef8911,
+/// rec53-expression-assign-int/pg18-wirefuzz-an_expression_assigned_to_an_integer_column_is_cast_as_postgresql_assigns_it.out);
+/// its UPDATE matching no row is refused by PG's constant folding and is not asserted here.
+#[test]
+fn an_expression_assigned_to_an_integer_column_is_cast_as_postgresql_assigns_it() {
+    let dir = Scratch::new("expression-assign-int");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in [
+        "CREATE TABLE ea (id int PRIMARY KEY, s smallint, i int, b bigint, n numeric(6,2), f float8)",
+        "INSERT INTO ea (id, n, f) VALUES (1, 2.5, 2.5), (2, -2.5, -2.5), (3, 1.25, 1.75)",
+    ] {
+        a.q(sql).ok(sql);
+    }
+    let mut wrong = Vec::new();
+    for sql in [
+        "INSERT INTO ea (id, s) SELECT 4, (00087.343 % (-0.6767537))",
+        "INSERT INTO ea (id, s) SELECT 5, n * 1 FROM ea WHERE id = 1",
+        "INSERT INTO ea (id, i) SELECT 6, f * 1 FROM ea WHERE id = 1",
+        "UPDATE ea SET s = n * 1, i = f * 1 WHERE id IN (2, 3)",
+    ] {
+        let r = a.q(sql);
+        if r.error.is_some() {
+            wrong.push(format!("{sql}: PG succeeds; got {:?}", r.error));
+        }
+    }
+    for (sql, message) in [
+        ("UPDATE ea SET s = -((1000000 * ((-1) * 2147483648))) WHERE id = 1", "smallint out of range"),
+        ("UPDATE ea SET i = i + 2147483647 WHERE id = 6", "integer out of range"),
+        ("INSERT INTO ea (id, s) SELECT 7, 40000 + id FROM ea WHERE id = 1", "smallint out of range"),
+    ] {
+        let r = a.q(sql);
+        if !r.error.as_ref().is_some_and(|e| e.code == "22003" && e.message == message) {
+            wrong.push(format!("{sql}: PG 22003 {message:?}; got {:?} {:?}", r.tags, r.error));
+        }
+    }
+    let r = a.q("SELECT id, s, i FROM ea ORDER BY id");
+    let cell = |v: &str| (!v.is_empty()).then(|| v.to_string());
+    let want: Vec<Vec<Option<String>>> = [["1", "", ""], ["2", "-3", "-2"], ["3", "1", "2"], ["4", "0", ""], ["5", "3", ""], ["6", "", "2"]]
+        .iter()
+        .map(|row| row.iter().map(|v| cell(v)).collect())
+        .collect();
+    if r.error.is_some() || r.rows != want {
+        wrong.push(format!("SELECT: PG {want:?}; got {:?} {:?}", r.rows, r.error));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// numfuzz seeds 4703, 5316 (artie f1fec7d3cc, d0d756b0b5): a numeric modulo is the remainder PostgreSQL computes (a
 /// fraction, its sign the dividend's), and a numeric modulo by zero is 22012; the engine's % reads both sides as
 /// integers, so 87.343 % -0.6767537 was a modulo by zero, NULL (and so the smallint it was assigned), and
 /// -(24165.9 % 2570.14) answered -1035 for PG's -1034.64. Expected answers: PG 18.6, recorded (artie de48459f69,
 /// rec52-numeric-modulo/pg18-wirefuzz-a_numeric_modulo_is_the_remainder_postgresql_computes.out); the rows whose text
-/// carries a numeric(p, s) column's scale (1034.640) are the engine's NUMERIC class and are not asserted here.
+/// carries a numeric(p, s) column's scale (1034.640) are the engine's NUMERIC class and are not asserted here, and the
+/// remainder assigned to a smallint is asserted by an_expression_assigned_to_an_integer_column_is_cast_as_postgresql_assigns_it.
 #[test]
 fn a_numeric_modulo_is_the_remainder_postgresql_computes() {
     let dir = Scratch::new("numeric-modulo");
@@ -17837,11 +17891,7 @@ fn a_numeric_modulo_is_the_remainder_postgresql_computes() {
             wrong.push(format!("{sql}: PG 22012 'division by zero'; got {:?} {:?}", r.rows, r.error));
         }
     }
-    a.q("INSERT INTO nm (id, s) SELECT 4, (00087.343 % (-0.6767537))").ok("insert select");
-    let r = a.q("SELECT id, s FROM nm WHERE id = 4");
-    if r.rows != vec![vec![Some("4".to_string()), Some("0".to_string())]] {
-        wrong.push(format!("smallint assigned 87.343 % -0.6767537: PG [[4, 0]]; got {:?} {:?}", r.rows, r.error));
-    }
+    // The remainder assigned to a smallint (PG stores 0) is an_expression_assigned_to_an_integer_column_is_cast_as_postgresql_assigns_it's.
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
