@@ -12422,7 +12422,7 @@ replays_postgresql!(
     pg18_wirefuzz_an_expression_cast_to_an_integer_rounds_replays_as_postgresql_answered,
     "pg18-wirefuzz-an_expression_cast_to_an_integer_rounds.out",
     [
-        (3, "PGDIV-INT-CAST-TRUNCATES value [wire]: SILENT: (f * 1)::int and (f + 0)::int8 over 1.5 and 2.75 answer 1, 1 and 2, 2 (the engine's CAST truncates) where PG rounds to 2, 2 and 3, 3; the int8 column is also announced 23 (PGDIV-INT8-CAST-TYPE)"),
+        (3, "PGDIV-INT-CAST-TRUNCATES value [wire]: SILENT: (f * 1)::int and (f + 0)::int8 over 1.5 and 2.75 answer 1, 1 and 2, 2 (the engine's CAST truncates) where PG rounds to 2, 2 and 3, 3"),
     ]
 );
 // wire-rev-7128c6f73 MED-4 and MED-5: a column cast to an integer is the engine's truncating CAST (a literal is rounded
