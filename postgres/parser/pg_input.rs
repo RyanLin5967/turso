@@ -121,3 +121,184 @@ pub fn round_decimal(text: &str) -> Option<i128> {
     }
     Some(if negative { -value } else { value })
 }
+
+/// What float4in/float8in (C's strtod) read from `text`: blanks around; NaN, Infinity and inf in any
+/// case and sign; a hexadecimal mantissa with an optional binary exponent (0x1F, 0x1.8p3); a
+/// decimal. `Err(true)` for a value past the type (overflow, or a nonzero one that reads as 0),
+/// `Err(false)` for a spelling it refuses (recorded, rec42-float-numeric-bool-assign).
+pub fn pg_float_in(text: &str, float4: bool) -> Result<f64, bool> {
+    let t = text.trim_matches(|c: char| matches!(c, ' ' | '\t' | '\n' | '\r' | '\u{b}' | '\u{c}'));
+    let (negative, unsigned) = match t.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, t.strip_prefix('+').unwrap_or(t)),
+    };
+    let sign = if negative { -1.0 } else { 1.0 };
+    if unsigned.eq_ignore_ascii_case("nan") {
+        return Ok(f64::NAN);
+    }
+    if unsigned.eq_ignore_ascii_case("inf") || unsigned.eq_ignore_ascii_case("infinity") {
+        return Ok(sign * f64::INFINITY);
+    }
+    let value = if let Some(hex) = unsigned.strip_prefix("0x").or_else(|| unsigned.strip_prefix("0X")) {
+        let (mantissa, exponent) = match hex.find(['p', 'P']) {
+            Some(i) => (&hex[..i], hex[i + 1..].parse::<i32>().map_err(|_| false)?),
+            None => (hex, 0),
+        };
+        let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+        if whole.is_empty() && fraction.is_empty() {
+            return Err(false);
+        }
+        let mut v = 0f64;
+        for c in whole.chars() {
+            v = v * 16.0 + f64::from(c.to_digit(16).ok_or(false)?);
+        }
+        let mut scale = 1.0 / 16.0;
+        for c in fraction.chars() {
+            v += f64::from(c.to_digit(16).ok_or(false)?) * scale;
+            scale /= 16.0;
+        }
+        v * 2f64.powi(exponent)
+    } else {
+        if !unsigned.bytes().all(|b| b.is_ascii_digit() || matches!(b, b'.' | b'e' | b'E' | b'+' | b'-')) || !unsigned.bytes().any(|b| b.is_ascii_digit()) {
+            return Err(false);
+        }
+        unsigned.parse::<f64>().map_err(|_| false)?
+    };
+    // A nonzero mantissa that reads as 0 underflowed: strtod's ERANGE, PostgreSQL's 22003.
+    let hex_digits = unsigned.get(..2).is_some_and(|p| p.eq_ignore_ascii_case("0x"));
+    let mantissa_digits: &str = if hex_digits {
+        unsigned[2..].split(['p', 'P']).next().unwrap_or("")
+    } else {
+        unsigned.split(['e', 'E']).next().unwrap_or("")
+    };
+    let nonzero = mantissa_digits.bytes().any(|b| if hex_digits { b.is_ascii_hexdigit() && b != b'0' } else { matches!(b, b'1'..=b'9') });
+    let stored = if float4 { f64::from(value as f32) } else { value };
+    if stored.is_infinite() || (stored == 0.0 && nonzero) {
+        return Err(true);
+    }
+    Ok(sign * stored)
+}
+
+/// numeric_out's text of a decimal constant's spelling (1e39 is 1 and 39 zeros, 1e-50 is 0.0...01,
+/// 1.50 keeps its scale), for the messages PostgreSQL words with it; None for one it is not.
+pub fn numeric_out(text: &str) -> Option<String> {
+    let t = text.trim();
+    let (negative, unsigned) = match t.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, t.strip_prefix('+').unwrap_or(t)),
+    };
+    let (mantissa, exponent) = match unsigned.find(['e', 'E']) {
+        Some(i) => (&unsigned[..i], unsigned[i + 1..].parse::<i64>().ok()?),
+        None => (unsigned, 0),
+    };
+    let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    if (whole.is_empty() && fraction.is_empty()) || !whole.bytes().chain(fraction.bytes()).all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if exponent.abs() > 100_000 {
+        return None;
+    }
+    let digits = format!("{whole}{fraction}");
+    // The point sits `point` digits into `digits`.
+    let point = whole.len() as i64 + exponent;
+    let scale = (fraction.len() as i64 - exponent).max(0);
+    let (int_part, frac_part) = if point <= 0 {
+        (String::from("0"), format!("{}{}", "0".repeat((-point) as usize), digits))
+    } else if point as usize >= digits.len() {
+        (format!("{digits}{}", "0".repeat(point as usize - digits.len())), String::new())
+    } else {
+        (digits[..point as usize].to_string(), digits[point as usize..].to_string())
+    };
+    let int_part = int_part.trim_start_matches('0');
+    let int_part = if int_part.is_empty() { "0" } else { int_part };
+    let mut frac = frac_part;
+    frac.truncate(scale as usize);
+    while (frac.len() as i64) < scale {
+        frac.push('0');
+    }
+    let body = if frac.is_empty() { int_part.to_string() } else { format!("{int_part}.{frac}") };
+    let zero = body.bytes().all(|b| b == b'0' || b == b'.');
+    Some(if negative && !zero { format!("-{body}") } else { body })
+}
+
+/// What boolin reads from `text`: blanks around, then a unique prefix of true, false, yes or no,
+/// on or off (two letters at least), or 1 or 0, in any case; None for one it refuses.
+pub fn pg_boolin(text: &str) -> Option<bool> {
+    let t = text.trim_matches(|c: char| c.is_ascii_whitespace()).to_ascii_lowercase();
+    let prefix = |word: &str| !t.is_empty() && word.starts_with(t.as_str());
+    match t.as_bytes().first()? {
+        b't' if prefix("true") => Some(true),
+        b'y' if prefix("yes") => Some(true),
+        b'f' if prefix("false") => Some(false),
+        b'n' if prefix("no") => Some(false),
+        b'o' if t.len() >= 2 && prefix("on") => Some(true),
+        b'o' if t.len() >= 2 && prefix("off") => Some(false),
+        b'1' if t == "1" => Some(true),
+        b'0' if t == "0" => Some(false),
+        _ => None,
+    }
+}
+
+/// What numeric_in reads from `text`, as the plain decimal text the engine's numeric takes: blanks
+/// around, NaN or Infinity (inf, any case or sign), a 0x, 0o or 0b integer, underscores between
+/// digits, a decimal with an exponent; None for a spelling it refuses (rec42).
+pub fn pg_numeric_in(text: &str) -> Option<String> {
+    let t = text.trim_matches(|c: char| c.is_ascii_whitespace());
+    let (sign, unsigned) = match t.strip_prefix('-') {
+        Some(rest) => ("-", rest),
+        None => ("", t.strip_prefix('+').unwrap_or(t)),
+    };
+    if unsigned.eq_ignore_ascii_case("nan") {
+        return (sign.is_empty()).then(|| "NaN".to_string());
+    }
+    if unsigned.eq_ignore_ascii_case("inf") || unsigned.eq_ignore_ascii_case("infinity") {
+        return Some(format!("{sign}Infinity"));
+    }
+    let radix = match unsigned.get(..2).map(|p| p.to_ascii_lowercase()) {
+        Some(p) if p == "0x" => Some(16),
+        Some(p) if p == "0o" => Some(8),
+        Some(p) if p == "0b" => Some(2),
+        _ => None,
+    };
+    let underscores_ok = |s: &str, digit: &dyn Fn(char) -> bool| {
+        let parts: Vec<&str> = s.split('_').collect();
+        parts.iter().all(|p| !p.is_empty() && p.chars().all(digit))
+    };
+    if let Some(radix) = radix {
+        let body = &unsigned[2..];
+        if !underscores_ok(body, &|c: char| c.is_digit(radix)) {
+            return None;
+        }
+        let v = u128::from_str_radix(&body.replace('_', ""), radix).ok()?;
+        return Some(format!("{sign}{v}"));
+    }
+    let (mantissa, exponent) = match unsigned.find(['e', 'E']) {
+        Some(i) => (&unsigned[..i], Some(&unsigned[i + 1..])),
+        None => (unsigned, None),
+    };
+    let (whole, fraction) = match mantissa.split_once('.') {
+        Some((w, f)) => (w, Some(f)),
+        None => (mantissa, None),
+    };
+    let digit = |c: char| c.is_ascii_digit();
+    let whole_ok = whole.is_empty() || underscores_ok(whole, &digit);
+    let fraction_ok = fraction.is_none_or(|f| f.is_empty() || underscores_ok(f, &digit));
+    if !whole_ok || !fraction_ok || (whole.is_empty() && fraction.is_none_or(|f| f.is_empty())) {
+        return None;
+    }
+    let exponent_text = match exponent {
+        Some(e) => {
+            let (es, ed) = match e.strip_prefix('-') {
+                Some(r) => ("-", r),
+                None => ("", e.strip_prefix('+').unwrap_or(e)),
+            };
+            if ed.is_empty() || !underscores_ok(ed, &digit) {
+                return None;
+            }
+            format!("e{es}{}", ed.replace('_', ""))
+        }
+        None => String::new(),
+    };
+    let fraction_text = fraction.map(|f| format!(".{}", f.replace('_', ""))).unwrap_or_default();
+    Some(format!("{sign}{}{fraction_text}{exponent_text}", whole.replace('_', "")))
+}

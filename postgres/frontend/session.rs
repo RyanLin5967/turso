@@ -656,7 +656,7 @@ fn refuse_long_decimals(
     // seed 622 at 45de98440). One within it is exempt: literal_assignments reads it exactly and the
     // translator writes its value, never a float (the lead's ruling LEAD-RULINGS 82dcec6b66, for
     // integer columns on its paths alone; recorded, rec34-long-decimal-integer, artie afd9557309).
-    let (integer, _) = literal_assignments(pg_conn, parse).map_err(LimboError::InvalidArgument)?;
+    let (integer, _, _) = literal_assignments(pg_conn, parse).map_err(LimboError::InvalidArgument)?;
     let (default_values, deferred_defaults) = default_coercions(parse).map_err(LimboError::InvalidArgument)?;
     let mut exempt = float_target_literals(pg_conn, parse);
     exempt.extend(integer.keys().chain(default_values.keys()).chain(deferred_defaults.keys()).filter_map(|l| usize::try_from(*l).ok()));
@@ -2380,7 +2380,7 @@ pub(crate) fn session_translation(
     let text_casts = text_integer_casts(pg_conn, sql, parse_result);
     // Each value assigned to a column is coerced as parse analysis coerces it, here so the
     // re-prepare judges it alike; a literal an integer column reads is written as its value.
-    let (integer_literals, text_literals) = literal_assignments(pg_conn, parse_result).map_err(LimboError::InvalidArgument)?;
+    let (integer_literals, text_literals, float_literals) = literal_assignments(pg_conn, parse_result).map_err(LimboError::InvalidArgument)?;
     // ... and a CREATE TABLE's or ADD COLUMN's DEFAULT as DDL coerces it: its refusals here, its
     // values by the translator itself (integer_default), since the table's text is translated
     // again at each schema load.
@@ -2390,6 +2390,7 @@ pub(crate) fn session_translation(
         let t = translator();
         let t = if text_casts.is_empty() { t } else { t.with_text_integer_casts(text_casts.clone()) };
         let t = if text_literals.is_empty() { t } else { t.with_text_literals(text_literals.clone()) };
+        let t = if float_literals.is_empty() { t } else { t.with_float_literals(float_literals.clone()) };
         if integer_literals.is_empty() { t } else { t.with_integer_literals(integer_literals.clone()) }
     };
     let first = translator();
@@ -2723,25 +2724,25 @@ fn resolves_to_main(pg_conn: &PgConnectionInner, relation: &turso_pg_parser::pg_
 fn literal_assignments(
     pg_conn: &PgConnectionInner,
     parse: &turso_pg_parser::pg_query::ParseResult,
-) -> Result<(std::collections::HashMap<i32, i64>, std::collections::HashMap<i32, String>), SqlErrorMessage> {
+) -> Result<(std::collections::HashMap<i32, i64>, std::collections::HashMap<i32, String>, std::collections::HashMap<i32, f64>), SqlErrorMessage> {
     use turso_pg_parser::pg_query::protobuf::node::Node;
     use turso_pg_parser::pg_query::protobuf::{a_const::Val, Node as PgNode};
     let mut rewrites = std::collections::HashMap::new();
     // String literals rewritten as other text: an integer array's canonical elements.
     let mut text_rewrites: std::collections::HashMap<i32, String> = std::collections::HashMap::new();
     let Some(stmt) = parse.protobuf.stmts.first().and_then(|r| r.stmt.as_ref()).and_then(|s| s.node.as_ref()) else {
-        return Ok((rewrites, text_rewrites));
+        return Ok((rewrites, text_rewrites, Default::default()));
     };
     let relation = match stmt {
         Node::InsertStmt(i) => i.relation.as_ref(),
         Node::UpdateStmt(u) => u.relation.as_ref(),
-        _ => return Ok((rewrites, text_rewrites)),
+        _ => return Ok((rewrites, text_rewrites, Default::default())),
     };
     let Some(relation) = relation.filter(|r| resolves_to_main(pg_conn, r)) else {
-        return Ok((rewrites, text_rewrites));
+        return Ok((rewrites, text_rewrites, Default::default()));
     };
     let schema = pg_conn.conn.current_schema();
-    let Some(table) = schema.get_btree_table(&relation.relname) else { return Ok((rewrites, text_rewrites)) };
+    let Some(table) = schema.get_btree_table(&relation.relname) else { return Ok((rewrites, text_rewrites, Default::default())) };
     // An integer column's width from its declared type, read without allocating.
     let integer_bits = |ty: &str| -> u32 {
         let base = ty.split('(').next().unwrap_or("").trim();
@@ -2883,7 +2884,29 @@ fn literal_assignments(
         }
         Some((target, typmods, text))
     };
+    let mut float_rewrites: std::collections::HashMap<i32, f64> = std::collections::HashMap::new();
     let mut coerce = |column: &str, value: &PgNode| -> Result<(), SqlErrorMessage> {
+        // A numeric NaN or Infinity cast into an integer column: 0A000 (rec42; numfuzz seed 2436).
+        if let Some(Node::TypeCast(c)) = value.node.as_ref() {
+            let bits = column_type(column).map_or(0, |t| integer_bits(&t));
+            let numeric = c.type_name.as_ref().and_then(|t| t.names.last()).is_some_and(|n| matches!(&n.node, Some(Node::String(s)) if s.sval == "numeric"));
+            if let (true, true, Some(Node::AConst(k))) = (bits > 0, numeric, c.arg.as_deref().and_then(|a| a.node.as_ref())) {
+                if let Some(Val::Sval(s)) = k.val.as_ref() {
+                    let word = s.sval.trim().trim_start_matches(['-', '+']);
+                    let name = match bits {
+                        16 => "smallint",
+                        32 => "integer",
+                        _ => "bigint",
+                    };
+                    if word.eq_ignore_ascii_case("nan") {
+                        return Err(SqlErrorMessage::classified(SqlErrorKind::FeatureNotSupported, format!("cannot convert NaN to {name}")));
+                    }
+                    if word.eq_ignore_ascii_case("infinity") || word.eq_ignore_ascii_case("inf") {
+                        return Err(SqlErrorMessage::classified(SqlErrorKind::FeatureNotSupported, format!("cannot convert infinity to {name}")));
+                    }
+                }
+            }
+        }
         // A string literal to an integer array column: each element read by the element type's
         // input routine (rec41), the literal rewritten as its canonical elements when one changes.
         if let (Some((_, c)), Some(Node::AConst(k))) = (table.get_column(column), value.node.as_ref()) {
@@ -2907,9 +2930,38 @@ fn literal_assignments(
                 Some(Node::AConst(c)) if !c.isnull => match c.val.as_ref() {
                     Some(Val::Ival(i)) => Some(i.ival.to_string()),
                     Some(Val::Fval(f)) => Some(f.fval.clone()),
-                    Some(Val::Sval(s)) => Some(s.sval.clone()),
+                    // numeric_in's reading (rec42): its refusal in its words, the literal rewritten
+                    // as plain decimal text when spelled otherwise (' 1.555 ', '1_000', '0x1F').
+                    Some(Val::Sval(s)) => match turso_pg_parser::pg_input::pg_numeric_in(&s.sval) {
+                        Some(plain) => {
+                            if plain != s.sval && c.location >= 0 {
+                                text_rewrites.insert(c.location, plain.clone());
+                            }
+                            Some(plain)
+                        }
+                        None => {
+                            return Err(SqlErrorMessage::classified(
+                                SqlErrorKind::InvalidTextRepresentation,
+                                format!("invalid input syntax for type numeric: \"{}\"", s.sval),
+                            ))
+                        }
+                    },
                     _ => None,
                 },
+                // A float cast of a constant: its value's text (1.510e300::float8; numfuzz seed
+                // 2231 at 06dab5fdd).
+                Some(Node::TypeCast(c))
+                    if c.type_name.as_ref().and_then(|t| t.names.last()).is_some_and(|n| matches!(&n.node, Some(Node::String(s)) if s.sval == "float8" || s.sval == "float4")) =>
+                {
+                    match c.arg.as_deref().and_then(|a| a.node.as_ref()) {
+                        Some(Node::AConst(k)) if !k.isnull => match k.val.as_ref() {
+                            Some(Val::Ival(i)) => Some(i.ival.to_string()),
+                            Some(Val::Fval(f)) => Some(f.fval.clone()),
+                            _ => None,
+                        },
+                        _ => None,
+                    }
+                }
                 Some(Node::TypeCast(c)) => match constant_cast(c) {
                     Some(("numeric", typmods, text)) => {
                         if let Some(p) = typmods.first() {
@@ -2930,6 +2982,84 @@ fn literal_assignments(
                 }
             }
             // A cast to a string type is judged below (42804).
+        }
+        // A real, double precision or boolean column (rec42): the constant read as float4in,
+        // float8in or boolin reads it.
+        if let (Some(Node::AConst(c)), Some(ty)) = (value.node.as_ref(), column_type(column)) {
+            let base = ty.split('(').next().unwrap_or("").trim();
+            let is = |names: &[&str]| names.iter().any(|n| base.eq_ignore_ascii_case(n));
+            let float = if is(&["REAL", "FLOAT4"]) {
+                Some((true, "real"))
+            } else if is(&["DOUBLE", "DOUBLE PRECISION", "FLOAT8", "FLOAT"]) {
+                Some((false, "double precision"))
+            } else {
+                None
+            };
+            if c.isnull {
+                return Ok(());
+            }
+            if let Some((float4, name)) = float {
+                use turso_pg_parser::pg_input::{numeric_out, pg_float_in};
+                match c.val.as_ref() {
+                    Some(Val::Sval(s)) => match pg_float_in(&s.sval, float4) {
+                        Ok(v) => {
+                            // The engine reads a decimal; a hexadecimal, an infinity or blanks are
+                            // written as the value.
+                            if c.location >= 0 && (v.is_infinite() || s.sval.parse::<f64>().ok() != Some(v)) && !v.is_nan() {
+                                float_rewrites.insert(c.location, v);
+                            }
+                        }
+                        Err(range) => {
+                            return Err(if range {
+                                SqlErrorMessage::classified(SqlErrorKind::NumericValueOutOfRange, format!("\"{}\" is out of range for type {name}", s.sval))
+                            } else {
+                                SqlErrorMessage::classified(SqlErrorKind::InvalidTextRepresentation, format!("invalid input syntax for type {name}: \"{}\"", s.sval))
+                            })
+                        }
+                    },
+                    // A numeric constant is cast through numeric_out's text, which words a refusal.
+                    Some(Val::Fval(f)) => {
+                        if let Some(out) = numeric_out(&f.fval) {
+                            if pg_float_in(&out, float4) == Err(true) {
+                                return Err(SqlErrorMessage::classified(SqlErrorKind::NumericValueOutOfRange, format!("\"{out}\" is out of range for type {name}")));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                return Ok(());
+            }
+            if is(&["BOOLEAN", "BOOL"]) {
+                match c.val.as_ref() {
+                    Some(Val::Sval(s)) => match turso_pg_parser::pg_input::pg_boolin(&s.sval) {
+                        Some(b) => {
+                            let canonical = if b { "t" } else { "f" };
+                            if s.sval != canonical && c.location >= 0 {
+                                text_rewrites.insert(c.location, canonical.to_string());
+                            }
+                        }
+                        None => {
+                            return Err(SqlErrorMessage::classified(
+                                SqlErrorKind::InvalidTextRepresentation,
+                                format!("invalid input syntax for type boolean: \"{}\"", s.sval),
+                            ))
+                        }
+                    },
+                    Some(Val::Ival(_) | Val::Fval(_)) => {
+                        let from = match c.val.as_ref() {
+                            Some(Val::Ival(_)) => "integer",
+                            Some(Val::Fval(f)) if crate::functions::round_decimal(&f.fval).is_some_and(|v| v.to_string() == f.fval && v.abs() < 1i128 << 63) => "bigint",
+                            _ => "numeric",
+                        };
+                        return Err(SqlErrorMessage::classified(
+                            SqlErrorKind::DatatypeMismatch,
+                            format!("column \"{column}\" is of type boolean but expression is of type {from}"),
+                        ));
+                    }
+                    _ => {}
+                }
+                return Ok(());
+            }
         }
         match value.node.as_ref() {
             Some(Node::AConst(c)) if !c.isnull => {
@@ -3111,7 +3241,7 @@ fn literal_assignments(
         _ => {}
     }
     drop(coerce);
-    Ok((rewrites, text_rewrites))
+    Ok((rewrites, text_rewrites, float_rewrites))
 }
 
 /// An integer array literal read as array_in reads it, each element by int2in/int4in/int8in

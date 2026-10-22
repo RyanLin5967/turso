@@ -258,6 +258,10 @@ pub struct PostgreSQLTranslator {
     /// ([`PostgreSQLTranslator::with_text_literals`]): an integer array literal's canonical
     /// elements, which the engine's integer array stores.
     text_literals: Option<std::collections::HashMap<i32, String>>,
+    /// The string literals (by parse location) a float column's input read as a value
+    /// ([`PostgreSQLTranslator::with_float_literals`]): written as that number (1e999 for an
+    /// infinity), since the engine reads neither a hexadecimal nor an infinity's spelling.
+    float_literals: Option<std::collections::HashMap<i32, f64>>,
     /// The cast targets this translation met that are neither built-in nor known, lowercased, for
     /// the caller to look up ([`PostgreSQLTranslator::unmapped_cast_types`]). A cast to a domain
     /// was dropped here, so `CAST(-5 AS dm)` skipped dm's CHECK and returned -5 (the domain CHECK
@@ -409,6 +413,11 @@ impl PostgreSQLTranslator {
     /// tell a text column from a numeric(p, s) column's decimal text).
     pub fn with_text_integer_casts(mut self, locations: std::collections::HashSet<i32>) -> Self {
         self.text_integer_casts = Some(locations);
+        self
+    }
+
+    pub fn with_float_literals(mut self, values: std::collections::HashMap<i32, f64>) -> Self {
+        self.float_literals = Some(values);
         self
     }
 
@@ -4642,6 +4651,11 @@ impl PostgreSQLTranslator {
                     }
                     if let Some(t) = self.text_literals.as_ref().and_then(|m| m.get(&a_const.location)) {
                         return Ok(ast::Expr::Literal(sql_string(t)));
+                    }
+                    if let Some(v) = self.float_literals.as_ref().and_then(|m| m.get(&a_const.location)) {
+                        let magnitude = if v.is_infinite() { "1e999".to_string() } else { format!("{:?}", v.abs()) };
+                        let literal = ast::Expr::Literal(ast::Literal::Numeric(magnitude));
+                        return Ok(if v.is_sign_negative() { ast::Expr::Unary(ast::UnaryOperator::Negative, Box::new(literal)) } else { literal });
                     }
                     // Turso's AST expects string literals to include surrounding single quotes
                     // (sanitize_string strips them during bytecode emission): sql_string.

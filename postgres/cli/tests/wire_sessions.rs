@@ -13375,11 +13375,6 @@ replays_postgresql!(
         (19, "PGDIV-NEG-ZERO value [engine]: SILENT: SELECT -0.0 answers '-0' typed 701; PG numeric '0.0'"),
         (20, "PGDIV-NEG-ZERO value [engine]: SILENT: SELECT -0.0::float8 answers '0'; PG '-0' (cast binds before unary minus)"),
         (22, "PGDIV-NEG-ZERO value [engine]: SILENT: '-0'::numeric answers '-0' typed 701; PG '0' typed 1700"),
-        (25, "PGDIV-REAL-RANGE value [engine]: SILENT: insert 1e39 into a real column succeeds (stored as Infinity); PG 22003 out of range for type real"),
-        (26, "PGDIV-REAL-RANGE value [engine]: SILENT: insert '1e39' into real succeeds (Infinity); PG 22003"),
-        (27, "PGDIV-REAL-RANGE value [engine]: SILENT: insert -1e39 into real succeeds (-Infinity); PG 22003"),
-        (28, "PGDIV-REAL-RANGE value [engine]: SILENT: insert 1e-50 into real succeeds (stored 0); PG 22003 underflow"),
-        (29, "PGDIV-REAL-RANGE cascade [engine]: select * from rr returns Infinity, Infinity, -Infinity, 0 where PG has 0 rows (cascade of #25-#28)"),
         (30, "PGDIV-REAL-RANGE value [engine]: SILENT: CAST(1e39 AS real) answers 'Infinity'; PG 22003"),
         (31, "PGDIV-REAL-RANGE value [engine]: SILENT: 1e39::real answers 'Infinity'; PG 22003"),
     ]
@@ -13403,8 +13398,6 @@ replays_postgresql!(
     pg18_float_replays_as_postgresql_answered,
     "pg18-float.out",
     [
-        (21, "PGDIV-REAL-RANGE value [engine]: SILENT: INSERT of 1.7976931348623157e308 into a real column succeeds (stored Infinity); PG 22003 out of range for type real"),
-        (22, "PGDIV-REAL-RANGE value [engine]: SILENT: INSERT of 5e-324 into a real column succeeds (stored 0); PG 22003 out of range for type real"),
         (27, "PGDIV-NEG-ZERO value [engine]: SILENT: row 25 (-0.0 numeric literal) reads '-0','-0' where PG stores '0','0'; extra rows 20 and 21 are a cascade of #21/#22"),
     ]
 );
@@ -17843,6 +17836,112 @@ fn a_constant_cast_past_numeric_p_s_is_22003_with_no_row() {
         }
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// The lead's ruling (LEAD-RULINGS 3abd61b6d3 (b), float, numeric and boolean targets; numfuzz seeds 2231 at 06dab5fdd and
+/// 2436 at 51abb3860): a constant assigned to a real, double precision, numeric(p, s) or boolean column is read as its
+/// input routine or cast reads it, even when no row matches: float4in/float8in (hexadecimal included, a value past the
+/// type 22003 in the input's words, a numeric constant past it in numeric_out's), numeric(p, s) (22003 'numeric field
+/// overflow', Infinity past every p), boolin, an integer into a boolean column 42804, and a numeric NaN or Infinity
+/// into an integer column 0A000. Expected answers: PG 18.6, recorded (artie 73a27af044,
+/// rec42-float-numeric-bool-assign/pg18-wirefuzz-a_float_numeric_or_boolean_column_reads_its_literal_as_its_input_routine_does.out),
+/// but its bare numeric column (the registered float8 class), the ' 1.5 ' PG refused as a duplicate key, and its 'NaN'
+/// into a double precision column and that row (the engine's REAL stores no NaN, its own class).
+#[test]
+fn a_float_numeric_or_boolean_column_reads_its_literal_as_its_input_routine_does() {
+    let dir = Scratch::new("float-numeric-bool-assign");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let ddl = "CREATE TABLE fb (id int PRIMARY KEY, r real, d double precision, n numeric(6,2), m numeric, b boolean, i int, s smallint)";
+    a.q(ddl).ok(ddl);
+    let expanded = format!(r#""1{}" is out of range for type double precision"#, "0".repeat(400));
+    let mut wrong = Vec::new();
+    for (sql, code, message) in [
+        ("INSERT INTO fb (id, r) VALUES (1, 'abc')", "22P02", r#"invalid input syntax for type real: "abc""#),
+        ("INSERT INTO fb (id, d) VALUES (1, '1e400')", "22003", r#""1e400" is out of range for type double precision"#),
+        ("INSERT INTO fb (id, r) VALUES (1, '1e39')", "22003", r#""1e39" is out of range for type real"#),
+        ("INSERT INTO fb (id, r) VALUES (1, '0x1F')", "", ""),
+        ("INSERT INTO fb (id, d) VALUES (2, '-inf')", "", ""),
+        ("INSERT INTO fb (id, r) VALUES (4, 1e39)", "22003", r#""1000000000000000000000000000000000000000" is out of range for type real"#),
+        ("INSERT INTO fb (id, d) VALUES (4, 1e400)", "22003", expanded.as_str()),
+        ("INSERT INTO fb (id, n) VALUES (4, 'abc')", "22P02", r#"invalid input syntax for type numeric: "abc""#),
+        ("INSERT INTO fb (id, n) VALUES (4, '12345.678')", "22003", "numeric field overflow"),
+        ("INSERT INTO fb (id, n) VALUES (4, 'Infinity')", "22003", "numeric field overflow"),
+        ("INSERT INTO fb (id, n) VALUES (4, ' 1.555 ')", "", ""),
+        ("INSERT INTO fb (id, b) VALUES (8, 'maybe')", "22P02", r#"invalid input syntax for type boolean: "maybe""#),
+        ("INSERT INTO fb (id, b) VALUES (8, 'yes')", "", ""),
+        ("INSERT INTO fb (id, b) VALUES (9, 1)", "42804", r#"column "b" is of type boolean but expression is of type integer"#),
+        ("INSERT INTO fb (id, b) VALUES (9, ' off ')", "", ""),
+        ("INSERT INTO fb (id, s) VALUES (10, '-Infinity'::numeric)", "0A000", "cannot convert infinity to smallint"),
+        ("INSERT INTO fb (id, i) VALUES (10, 'NaN'::numeric)", "0A000", "cannot convert NaN to integer"),
+        ("INSERT INTO fb (id, n) VALUES (10, (1.510e300)::float8)", "22003", "numeric field overflow"),
+        ("INSERT INTO fb (id, n) VALUES (10, (12.345)::float8)", "", ""),
+        ("UPDATE fb SET r = 'abc' WHERE id = 1000", "22P02", r#"invalid input syntax for type real: "abc""#),
+    ] {
+        let r = a.q(sql);
+        let fine = if code.is_empty() {
+            r.error.is_none()
+        } else {
+            r.error.as_ref().is_some_and(|e| e.code == code && e.message == message)
+        };
+        if !fine {
+            wrong.push(format!("{sql}: PG {code:?} {:?}; got {:?} {:?}", &message[..message.len().min(80)], r.tags, r.error.as_ref().map(|e| (e.code.clone(), e.message.chars().take(100).collect::<String>()))));
+        }
+    }
+    let r = a.q("SELECT id, r, d, n, b FROM fb ORDER BY id");
+    let want: Vec<Vec<Option<String>>> = [
+        ["1", "31", "", "", ""],
+        ["2", "", "-Infinity", "", ""],
+        ["4", "", "", "1.56", ""],
+        ["8", "", "", "", "t"],
+        ["9", "", "", "", "f"],
+        ["10", "", "", "12.35", ""],
+    ]
+    .iter()
+    .map(|row| row.iter().map(|v| (!v.is_empty()).then(|| v.to_string())).collect())
+    .collect();
+    if r.error.is_some() || r.rows != want {
+        wrong.push(format!("SELECT: PG {want:?}; got {:?} {:?}", r.rows, r.error));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// The lead's ruling (LEAD-RULINGS 0fac7e134e), the condition on 8f49aa6f1: ALTER COLUMN SET DEFAULT, which this server
+/// does not implement, is refused loudly, 0A000, and changes nothing: the column keeps its default (none) and an
+/// INSERT omitting it stores NULL.
+#[test]
+fn alter_column_set_default_is_refused_and_changes_nothing() {
+    let dir = Scratch::new("set-default-refused");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE sd (id int PRIMARY KEY, b int)").ok("create");
+    for sql in ["ALTER TABLE sd ALTER COLUMN b SET DEFAULT 40", "ALTER TABLE sd ALTER COLUMN b SET DEFAULT 'y'"] {
+        let r = a.q(sql);
+        assert_eq!(r.error.as_ref().map(|e| e.code.as_str()), Some("0A000"), "{sql}: {:?} {:?}", r.tags, r.error);
+    }
+    a.q("INSERT INTO sd (id) VALUES (1)").ok("insert");
+    let r = a.q("SELECT b IS NULL FROM sd WHERE id = 1");
+    assert_eq!(r.rows, vec![vec![Some("t".to_string())]], "SET DEFAULT changed the column: {:?}", r.rows);
+}
+
+/// The lead's ruling (LEAD-RULINGS 0fac7e134e), the condition on cbe01fb3a: a two-dimensional literal into an integer
+/// array column (PostgreSQL stores {{1,2},{3,4}}; the engine's arrays have one dimension) is refused loudly, never
+/// stored flattened or truncated: no row is written.
+#[test]
+fn a_two_dimensional_literal_into_an_integer_array_is_refused_not_flattened() {
+    let dir = Scratch::new("array-2d-refused");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE a2 (id int PRIMARY KEY, xs int[])").ok("create");
+    for (id, literal) in [(1, "{{1,2},{3,4}}"), (2, "{{1},{2}}"), (3, "{{0x1F,1_000},{3,4}}")] {
+        let sql = format!("INSERT INTO a2 VALUES ({id}, '{literal}')");
+        let r = a.q(&sql);
+        assert!(r.error.is_some(), "{sql} was stored: {:?}", r.tags);
+        let r = a.q(&format!("UPDATE a2 SET xs = '{literal}' WHERE id = 0"));
+        let _ = r;
+    }
+    let r = a.q("SELECT count(*) FROM a2");
+    assert_eq!(r.rows, vec![vec![Some("0".to_string())]], "a two-dimensional literal left a row: {:?}", r.rows);
 }
 
 /// The lead's ruling (LEAD-RULINGS 3abd61b6d3 (b), arrays and domains): an integer array column reads a string literal
