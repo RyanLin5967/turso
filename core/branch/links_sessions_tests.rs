@@ -563,6 +563,16 @@ fn ls_hard_limit_child() {
         let _ = trunk.fork_branch().unwrap().into_id();
         peak = peak.max(log_bytes(&path));
     }
+    // FLAGGED harness repair, the ruled pattern of 01a02150d/ce77ead23 (lead ruling 2026-10-21T17:58:38Z: a
+    // checkpoint the gate or a running WAL truncation defers past the hard limit starts at the next operation):
+    // core-integrator, eceubuntu1 at merge f86f69356 (raw 6ad088d13b), "8776 B at the end, 8776 B at its peak": the
+    // last of the 600 creates raised the peak and no operation followed it. Operations go on, one per 50 ms, until the
+    // log is under that peak (30 s at most); the claim is unchanged.
+    let t = std::time::Instant::now();
+    while log_present(&path) >= peak && t.elapsed() < std::time::Duration::from_secs(30) {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let _ = trunk.fork_branch().unwrap().into_id();
+    }
     db.branch_checkpoint_wait();
     // Observing only (l4-rev-h1 LOW 4, measured, no assertion): busy catalog WAL truncations meanwhile.
     let busy = db.branches.wal_truncate_busy_for_test() - busy0;
