@@ -16543,7 +16543,6 @@ fn a_decimal_past_15_digits_is_refused_on_every_path() {
         "UPDATE nm SET (n, t) = (12345678901234567.88, 'y') WHERE id = 1",
         "INSERT INTO nm (id, n) VALUES (1, 2) ON CONFLICT (id) DO UPDATE SET n = 12345678901234567.87",
         "INSERT INTO nm (id, t) VALUES (4, 12345678901234567.89)",
-        "INSERT INTO nm (id, b) VALUES (5, 12345678901234567.00)",
         "INSERT INTO nm (id, n) VALUES (6, 1234567890123456789012345678)",
         "INSERT INTO nm (id, n) VALUES (7, 1.234567890123456789e10)",
         "INSERT INTO nm (id, n) VALUES (8, 12_345_678_901_234_567.89)",
@@ -16583,9 +16582,21 @@ fn a_decimal_past_15_digits_is_refused_on_every_path() {
             wrong.push(format!("bound '12345678901234567.89' (declared {declared}): tags {:?} error {:?}, refused 0A000", r.tags, r.error));
         }
     }
+    // The lead's ruling LEAD-RULINGS 82dcec6b66 lifts the refusal for an integer column on the assignment paths: a
+    // bigint takes 12345678901234567.00 exactly, as PostgreSQL 18.6 stores it (recorded, artie b6b2626a77,
+    // rec35-long-decimal-bigint-case).
+    let sql = "INSERT INTO nm (id, b) VALUES (5, 12345678901234567.00)";
+    let r = a.q(sql);
+    if r.error.is_some() {
+        wrong.push(format!("{sql}: error {:?}, PostgreSQL INSERT 0 1", r.error));
+    }
+    let r = a.q("SELECT b FROM nm WHERE id = 5");
+    if r.rows != vec![vec![Some("12345678901234567".to_string())]] {
+        wrong.push(format!("id 5 holds {:?}, PostgreSQL 12345678901234567", r.rows));
+    }
     let r = a.q("SELECT count(*) FROM nm");
-    if r.rows != vec![vec![Some("1".to_string())]] {
-        wrong.push(format!("nm holds {:?} rows after the refusals, want 1", r.rows));
+    if r.rows != vec![vec![Some("2".to_string())]] {
+        wrong.push(format!("nm holds {:?} rows after the refusals and id 5, want 2", r.rows));
     }
     for (sql, want) in [
         ("SELECT 1234567890123.45", "1234567890123.45"),
