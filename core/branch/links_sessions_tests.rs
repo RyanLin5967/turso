@@ -1605,47 +1605,37 @@ fn ls_fill_live_child() {
     drop(db);
     let (rows, wrong) = ls_wrong_links(&path).unwrap_or((0, 9999));
     println!("LS-LIVE-LINKS meta={} rows={rows} wrong={wrong}", meta_version(&path));
-    println!(
-        "LS-LIVE-DEFER by_batches={} by_log={} b_sum={}",
-        super::store::DEFER_RELEASES[0].load(Ordering::Acquire),
-        super::store::DEFER_RELEASES[1].load(Ordering::Acquire),
-        super::store::DEFER_B_SUM.load(Ordering::Acquire)
-    );
     println!("LS-LIVE creates={creates} cuts={cuts} starts={starts} empty={empty} batches={batches} prefilled={} per_create={per_create}", u64::from(prefilled));
 }
 
-/// Lead ruling 2026-10-21T18:01:45Z (fill LIVENESS), fixed by its option (a) ruling (the bounded deferral). A
-/// cut stopped the fill at once, so it gained about one batch (64 rows) per hard-limit cycle while the catalog
-/// gained the cycle's creates, K = (2 x the threshold) / (log bytes per create), about 195: under sustained
-/// creates the store never upgraded (amendment 30, both kinds). The gate now defers each cut for at most
-/// B = ceil(K / 64) + 1 committed batches (or one more threshold of log), so the fill gains on the catalog
-/// every cycle. CLAIM (FLAGGED spec change of 3440b3aad's red, per that ruling): under sustained creates the fill
-/// completes (prefilled) within 60,000 creates, at 1,000 and at 4,000 rows. Premises: the log was cut at least
-/// twice and the fill started more than once. Mutant `l4_fill_defer_none` (B = 0) and `l4_fill_starved` must
-/// fail it.
+/// Lead ruling 2026-10-21T18:01:45Z (fill LIVENESS). A cut stopped the fill at once, so it gained about one
+/// batch (64 rows) per hard-limit cycle while the catalog gained the cycle's creates, about 195: under sustained
+/// creates the store never upgraded (amendment 30, both kinds). Fixed by the fill's HORIZON (dfcee5b8d; the
+/// bounded deferral first tried with it is removed as dead code, lead ruling: B = 0 changed no outcome). CLAIM
+/// (FLAGGED spec change of 3440b3aad's red): under sustained creates the fill completes, flips, and leaves every
+/// row's links right, within the registered bound below, at 1,000 and 4,000 rows (FE_LS_LIVE_ROWS overrides the
+/// row counts: the held-out check). Premise: the log was cut. Mutants `l4_fill_starved`,
+/// `l4_fill_horizon_ignored` and `l4_fill_horizon_low` must fail it.
 #[test]
 fn under_sustained_creates_the_fill_completes() {
     if in_child() {
         return;
     }
-    for rows in ["1000", "4000"] {
+    let list = std::env::var("FE_LS_LIVE_ROWS").unwrap_or_else(|_| "1000,4000".to_string());
+    for rows in list.split(',') {
         let text = child("ls_fill_live_child", &[("FE_LS_ROWS", rows)]);
         let r = readings(&text, "LS-LIVE ");
         assert_eq!(r.len(), 1, "premise: the child reported:\n{text}");
         let (creates, cuts, starts, empty, batches, prefilled, per_create) = (r[0][0], r[0][1], r[0][2], r[0][3], r[0][4], r[0][5], r[0][6]);
         let k = (2 * (4u64 << 10)) / per_create.max(1);
-        for l in text.lines().filter(|l| l.contains("LS-LIVE-DEFER ")) {
-            println!("{l}");
-        }
         println!("LS live: {rows} rows: creates {creates} cuts {cuts} starts {starts} empty spawns {empty} batches {batches} prefilled {prefilled}; {per_create} B per create, K = {k}");
         assert!(cuts >= 1, "{rows} rows: premise: the log was never cut under {creates} creates");
         assert_eq!(prefilled, 1, "{rows} rows: under {creates} sustained creates the fill never completed ({batches} batches over {cuts} hard-limit cycles, K = {k} creates each)");
-        // The bound, from the fill's scheduling: at least one batch per hard-limit cycle, a cycle at most
-        // 4 x the threshold of log (to the hard limit, 2 x, plus the deferral's one, plus one for the tail a cut
-        // keeps and the creates its flight admits; amendment 35 measured 300-320 creates per cycle against
-        // 3 x 4 KiB / 42 B = 292, so the tail term is not negligible), so at most 4 x 4 KiB / (bytes per
-        // create) creates; and the fill's rows are the store's at the horizon, rows + 50 children. So it
-        // completes within (ceil((rows + 50) / 64) + 1) cycles of such creates.
+        // The bound: at least one batch per hard-limit cycle; the fill's rows are the store's at the horizon,
+        // rows + 50 children; so (ceil((rows + 50) / 64) + 1) cycles. A cycle's length is NOT derived: its 3 x
+        // threshold form was under amendment 35's 300-320 creates per cycle, and the term it missed is not
+        // named. The 4 x threshold / bytes-per-create cycle is REGISTERED (linksh1run amendment 37) and held out
+        // on hosts and row counts not used to choose it (lead ruling 2026-10-21).
         let n: u64 = rows.parse().unwrap();
         let cycle = (4 * (4u64 << 10)) / per_create.max(1);
         let bound = ((n + 50).div_ceil(64) + 1) * cycle;
@@ -1657,8 +1647,8 @@ fn under_sustained_creates_the_fill_completes() {
     }
 }
 
-/// Lead ruling 2026-10-21 (option (a)): the deferral is BOUNDED. A fill that never commits a batch (held at its
-/// start) defers the cut past the hard limit by at most one more threshold of log: the largest log before the
+/// Lead ruling 2026-10-21 (MED-3 restated; the deferral is removed, so this holds with room): a fill that never
+/// commits a batch (held at its start) does not hold the cut past the hard limit beyond one more threshold of log: the largest log before the
 /// cut is at most the log at the limit plus 4 KiB plus 2 KiB of slack (the creates that land while the cut's
 /// flight runs). Premises: past the hard limit with the fill held, and a cut. Mutant
 /// `l4_fill_waits_past_hard_limit` (the gate waits for the fill, unbounded) must fail it.

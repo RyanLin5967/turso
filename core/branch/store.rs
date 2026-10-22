@@ -241,8 +241,7 @@ pub(crate) struct BranchStore {
     flights: Mutex<Vec<crate::thread::JoinHandle<()>>>,
     /// Links adversary L4: the upgrade's fill thread (`run_links_fill`), joined with the flights.
     links_fill: Mutex<Option<crate::thread::JoinHandle<()>>>,
-    /// The fill gate's B (lead ruling 2026-10-21, option (a)): forks since the gate last let a cut go.
-    forks_since_cut: AtomicU64,
+
     /// h1-rev-72bfb0127 LOW-3: fill threads a later spawn superseded (each ends before its next batch),
     /// joined with the flights too, so none outlives the store.
     links_fill_old: Mutex<Vec<crate::thread::JoinHandle<()>>>,
@@ -1990,11 +1989,6 @@ struct CatState {
     /// committed batch recorded only under the mutex was starved of it by a foreground that takes it
     /// on every operation, and past the hard limit the gate went on waiting for columns that existed).
     links_columns_made: Arc<AtomicBool>,
-    /// The lead's fill-LIVENESS ruling (option (a), the bounded deferral): fill batches committed, counted
-    /// lock-free by the fill as each commits; and, while a cut past the hard limit is deferred for the fill,
-    /// `(batches at the deferral's start, log bytes then, B)`.
-    links_batches: Arc<AtomicU64>,
-    links_defer: Option<(u64, u64, u64)>,
     /// The fill's HORIZON (amendments 32/33: under sustained creates the fill never completed, each cycle's
     /// deferral ending on its log bound with one batch filled, while the catalog grew a cycle's creates): the
     /// last children-index key when this process's first fill began, after its columns exist. Every row created
@@ -2320,8 +2314,6 @@ impl CatState {
             links_fill_starts: 0,
             // l4-rev-h1 MED-3: a catalog reopened with its columns already made starts recorded.
             links_columns_made: Arc::new(AtomicBool::new(catalog.links())),
-            links_batches: Arc::new(AtomicU64::new(0)),
-            links_defer: None,
             links_horizon: None,
             links_fill_stop: Arc::new(AtomicBool::new(false)),
             ckpt: CkptCounters::default(),
@@ -3854,14 +3846,7 @@ impl Drop for CutGate<'_> {
 /// the writer only: left to the flipping checkpoint, that work (O(rows), a pragma the probe's row
 /// count does not see) ran under the store mutex in a sharp store (red a722957c4). Mutant
 /// `l4_fill_wal_left` (test builds only): not truncated here.
-fn run_links_fill(
-    shared: &StoreMutex,
-    writer: &Mutex<Catalog>,
-    group: &Group,
-    made: &AtomicBool,
-    stop: &AtomicBool,
-    batches: &AtomicU64,
-) {
+fn run_links_fill(shared: &StoreMutex, writer: &Mutex<Catalog>, group: &Group, made: &AtomicBool, stop: &AtomicBool) {
     // Test builds (h1gap-rev-c MED-1): the fill thread panics at its start.
     #[cfg(test)]
     if LINKS_FILL_PANICS.load(Ordering::Acquire) {
@@ -4083,10 +4068,6 @@ fn run_links_fill(
         if batch.is_ok() && !fe_mutant("l4_columns_recorded_under_mutex") {
             made.store(true, Ordering::Release);
         }
-        // Counted lock-free, so a batch starved of the store mutex still counts toward the gate's bound.
-        if batch.is_ok() {
-            batches.fetch_add(1, Ordering::AcqRel);
-        }
         // Test builds (links H1 reopened): a committed batch held back from the store mutex before
         // it is recorded, as the fill was starved of it by a foreground that takes it on every
         // operation (diagnostic 4, ecetesla1 and iccad6: the batch committed, and the gate never saw
@@ -4159,12 +4140,6 @@ pub(crate) static LINKS_FILL_PAUSE_MS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static LINKS_FILL_COLUMN_TXNS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 #[cfg(test)]
 pub(crate) static LINKS_FILL_COLUMN_ERROR: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
-/// Test builds (the bounded deferral, observing): deferrals ended by B batches (0) and by one threshold of log
-/// (1), and the sum of their B.
-#[cfg(test)]
-pub(crate) static DEFER_RELEASES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
-#[cfg(test)]
-pub(crate) static DEFER_B_SUM: AtomicU64 = AtomicU64::new(0);
 /// Test builds (the lead's fill-LIVENESS ruling): fill spawns that ended stopped or superseded having committed
 /// no batch.
 #[cfg(test)]
@@ -4542,7 +4517,6 @@ impl BranchStore {
             flights: Mutex::new(Vec::new()),
             links_fill: Mutex::new(None),
             links_fill_old: Mutex::new(Vec::new()),
-            forks_since_cut: AtomicU64::new(0),
             confirm_writer: Mutex::new(None),
             name_filter_build: Mutex::new(None),
             name_filter_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -4851,7 +4825,6 @@ impl BranchStore {
             flights: Mutex::new(Vec::new()),
             links_fill: Mutex::new(None),
             links_fill_old: Mutex::new(Vec::new()),
-            forks_since_cut: AtomicU64::new(0),
             confirm_writer: Mutex::new(None),
             name_filter_build: Mutex::new(None),
             name_filter_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -6570,37 +6543,16 @@ impl BranchStore {
         // later checkpoint starts the fill again from its carried cursor. Mutant
         // `l4_fill_waits_past_hard_limit` (test builds only): it waits, as before.
         let past_hard = inner.journal.as_ref().is_some_and(Journal::past_hard_limit);
-        let (log_len, threshold) = inner.journal.as_ref().map_or((0, 0), Journal::log_len_and_threshold);
-        let forks = self.forks_since_cut.load(Ordering::Acquire);
         let Some(cat) = inner.cat.as_mut() else {
             return false;
         };
         // Only once a batch has made the link columns (and the cursor's table): the checkpoint then
         // changes no schema, which in a fuzzy flight would fail the store's pinned reads ("Database
         // schema changed", the oracle's in-flight check, raw ls-green2_131f8832a).
-        // The lead's fill-LIVENESS ruling, option (a) (LEAD-RULINGS.md 2026-10-21): a cut stopped the fill at once,
-        // so under sustained creates the fill gained about one batch (64 rows) per hard-limit cycle while the
-        // catalog gained a cycle's creates (about 195), and the store never upgraded (amendment 30). Now the cut
-        // is deferred for the running fill by at most B = ceil(forks this cycle / 64) + 1 committed batches, or
-        // at most one more threshold of log, whichever comes first, then cut regardless: constant work per
-        // cycle, never the fill's whole (62c11ec63d), and a fill starved beyond the bound (MED-3, restated)
-        // does not hold the cut. Mutant `l4_fill_defer_none` (test builds only): B = 0, cut at once, as before.
+        // The lead's ruling 2026-10-21 (LEAD-RULINGS.md): the bounded deferral that stood here (0406ca35c) is
+        // REMOVED as dead code: B = 0 changed no outcome (amendments 35-37); liveness comes from the fill's
+        // horizon (`run_links_fill`).
         if past_hard && cat.links_columns_made.load(Ordering::Acquire) && !fe_mutant("l4_fill_waits_past_hard_limit") {
-            if cat.filling && !fe_mutant("l4_fill_defer_none") {
-                let done = cat.links_batches.load(Ordering::Acquire);
-                let (from, at_log, b) = *cat.links_defer.get_or_insert((done, log_len, forks.div_ceil(64) + 1));
-                if done.saturating_sub(from) < b && log_len < at_log + threshold {
-                    return true;
-                }
-                // Test builds (observing): which bound ended the deferral (0: B batches, 1: the log), and the B.
-                #[cfg(test)]
-                {
-                    DEFER_RELEASES[usize::from(done.saturating_sub(from) < b)].fetch_add(1, Ordering::AcqRel);
-                    DEFER_B_SUM.fetch_add(b, Ordering::AcqRel);
-                }
-            }
-            cat.links_defer = None;
-            self.forks_since_cut.store(0, Ordering::Release);
             cat.filling = false;
             return false;
         }
@@ -6619,17 +6571,11 @@ impl BranchStore {
         // l4-rev-h1 LOW-3: a token per spawn, never one flag reset: a fill of an earlier spawn that is still
         // finishing keeps its own (stopped) token, and a stop reaches only the fill it was meant for.
         cat.links_fill_stop = Arc::new(AtomicBool::new(false));
-        let (shared, writer, group, made, stop, batches) = (
-            self.inner.clone(),
-            cat.writer.clone(),
-            self.group.clone(),
-            cat.links_columns_made.clone(),
-            cat.links_fill_stop.clone(),
-            cat.links_batches.clone(),
-        );
+        let (shared, writer, group, made, stop) =
+            (self.inner.clone(), cat.writer.clone(), self.group.clone(), cat.links_columns_made.clone(), cat.links_fill_stop.clone());
         let spawned = crate::thread::Builder::new()
             .name("branch-links-fill".to_string())
-            .spawn(move || run_links_fill(&shared, &writer, &group, &made, &stop, &batches));
+            .spawn(move || run_links_fill(&shared, &writer, &group, &made, &stop));
         match spawned {
             Ok(handle) => {
                 if let Some(old) = self.links_fill.lock().replace(handle) {
@@ -7149,8 +7095,6 @@ impl BranchStore {
         }
         let id = BranchId(inner.next_id);
         let (records, lease) = inner.fork_records(id, BranchId::TRUNK, now, name);
-        // The fill gate's B (the bounded deferral past the hard limit): the forks since the last cut.
-        self.forks_since_cut.fetch_add(1, Ordering::AcqRel);
         if let Some((_, stamped)) = lease {
             inner.lease.queued(stamped);
         }
@@ -7240,8 +7184,6 @@ impl BranchStore {
         }
         let id = BranchId(inner.next_id);
         let (records, lease) = inner.fork_records(id, parent, now, name);
-        // The fill gate's B (the bounded deferral past the hard limit): the forks since the last cut.
-        self.forks_since_cut.fetch_add(1, Ordering::AcqRel);
         if let Some((_, stamped)) = lease {
             inner.lease.queued(stamped);
         }
