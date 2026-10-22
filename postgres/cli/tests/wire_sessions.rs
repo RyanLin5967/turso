@@ -12424,6 +12424,17 @@ replays_postgresql!(
     [
     ]
 );
+// rec40 (artie f55e14738b): a coerced DEFAULT as the catalog shows it (information_schema.columns, pg_get_expr).
+replays_postgresql!(
+    pg18_wirefuzz_a_coerced_default_shows_in_the_catalog_as_postgresql_stores_it_replays_as_postgresql_answered,
+    "pg18-wirefuzz-a_coerced_default_shows_in_the_catalog_as_postgresql_stores_it.out",
+    [
+        (2, "PGDIV-DEFAULT-DISPLAY value [wire]: information_schema.columns shows a coerced DEFAULT as the value the table stores: 2.5 into an int as 3, 12345678901234567.00 into a bigint without its scale, ' 7 ' into a smallint as 7, where PG shows '2.5', '12345678901234567.00' and '7'::smallint; its columns are typed 25 where PG types them name (19) and varchar (1043)"),
+        (3, "PGDIV-DEFAULT-DISPLAY value [wire]: pg_get_expr over pg_attrdef shows the stored values as in #2; the columns are typed 25 where PG types attname name (19)"),
+        (5, "PGDIV-SET-DEFAULT-REFUSED error [wire]: ALTER COLUMN SET DEFAULT is refused 0A000 and changes nothing (the lead's ruling LEAD-RULINGS 0fac7e134e), where PG sets the default"),
+        (8, "PGDIV-SET-DEFAULT-REFUSED value [wire]: b keeps no default after the refused SET DEFAULT (PG shows 16), and ADD COLUMN e int DEFAULT 4.5 shows 5 (PGDIV-DEFAULT-DISPLAY) where PG shows 4.5"),
+    ]
+);
 // numfuzz seed 3504 (artie c098a7ed4d): an expression cast to an integer rounds as its operand's type's cast rounds
 // (de900873a). A bare numeric column is stored and announced float8 here, so an expression over one rounds half to
 // even as a float8 does, where PG's numeric rounds half away from zero (registered from rec50, artie 0de472ed9d).

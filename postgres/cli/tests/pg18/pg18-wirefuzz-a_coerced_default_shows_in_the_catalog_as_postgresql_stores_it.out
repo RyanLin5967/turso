@@ -1,0 +1,44 @@
+>> Q CREATE TABLE d3 (id int PRIMARY KEY, b int DEFAULT '0x1F', c int DEFAULT 2.5, e bigint DEFAULT 12345678901234567.00, f smallint DEFAULT ' 7 ', g int DEFAULT 3000000000, h int DEFAULT '7')
+   C CREATE TABLE
+   Z I
+>> Q SELECT column_name, column_default FROM information_schema.columns WHERE table_name = 'd3' ORDER BY ordinal_position
+   T oids=[19, 1043]
+   D ['id', None]
+   D ['b', '31']
+   D ['c', '2.5']
+   D ['e', '12345678901234567.00']
+   D ['f', "'7'::smallint"]
+   D ['g', "'3000000000'::bigint"]
+   D ['h', '7']
+   C SELECT 7
+   Z I
+>> Q SELECT a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attrdef d JOIN pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum WHERE d.adrelid = 'd3'::regclass ORDER BY a.attnum
+   T oids=[19, 25]
+   D ['b', '31']
+   D ['c', '2.5']
+   D ['e', '12345678901234567.00']
+   D ['f', "'7'::smallint"]
+   D ['g', "'3000000000'::bigint"]
+   D ['h', '7']
+   C SELECT 6
+   Z I
+>> Q CREATE TABLE d6 (id int PRIMARY KEY, b int)
+   C CREATE TABLE
+   Z I
+>> Q ALTER TABLE d6 ALTER COLUMN b SET DEFAULT '0x10'
+   C ALTER TABLE
+   Z I
+>> Q ALTER TABLE d6 ADD COLUMN c int DEFAULT ' 9 '
+   C ALTER TABLE
+   Z I
+>> Q ALTER TABLE d6 ADD COLUMN e int DEFAULT 4.5
+   C ALTER TABLE
+   Z I
+>> Q SELECT column_name, column_default FROM information_schema.columns WHERE table_name = 'd6' ORDER BY ordinal_position
+   T oids=[19, 1043]
+   D ['id', None]
+   D ['b', '16']
+   D ['c', '9']
+   D ['e', '4.5']
+   C SELECT 4
+   Z I
