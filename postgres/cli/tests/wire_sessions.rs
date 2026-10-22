@@ -17995,6 +17995,39 @@ fn a_float_cast_to_text_is_written_as_its_output_routine_writes_it() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// numfuzz seeds 7472, 7552 at b46404e66 (artie 875b49ec51): a constant expression with integer functions (abs, floor,
+/// ceil, round, trunc) or a numeric(p, s) cast inside, assigned to an integer or numeric(p, s) column, is refused past
+/// the column or the cast even when no row matches, as PostgreSQL folds it before any row is read (it answered UPDATE
+/// 0). Expected answers: PG 18.6, recorded on eceubuntu2 (artie d50082cd8d, rec58-folded-assign-functions/
+/// pg18-wirefuzz-a_constant_with_integer_functions_assigned_is_folded.out).
+#[test]
+fn a_constant_with_integer_functions_assigned_is_folded() {
+    let dir = Scratch::new("folded-assign-functions");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE ff (id int PRIMARY KEY, s smallint, b bigint, n numeric(10,2))").ok("create");
+    let mut wrong = Vec::new();
+    for (sql, message) in [
+        ("UPDATE ff SET b = floor(-(((-9223372036854775808) - 1_000_000))) WHERE id = 3", "bigint out of range"),
+        ("UPDATE ff SET s = ceil((floor((-32768)))::numeric(6,2)) WHERE id = 1", "numeric field overflow"),
+        ("UPDATE ff SET s = abs(-40000) WHERE id = 1", "smallint out of range"),
+        ("UPDATE ff SET s = trunc(70000) WHERE id = 1", "smallint out of range"),
+        ("UPDATE ff SET n = round(123456789012) WHERE id = 1", "numeric field overflow"),
+    ] {
+        let r = a.q(sql);
+        if !r.error.as_ref().is_some_and(|e| e.code == "22003" && e.message == message) {
+            wrong.push(format!("{sql}: PG 22003 {message:?}; got {:?} {:?}", r.tags, r.error));
+        }
+    }
+    for sql in ["UPDATE ff SET s = abs(-300) WHERE id = 1", "UPDATE ff SET s = (floor(5))::int WHERE id = 1"] {
+        let r = a.q(sql);
+        if r.error.is_some() || r.tags != vec!["UPDATE 0".to_string()] {
+            wrong.push(format!("{sql}: PG UPDATE 0; got {:?} {:?}", r.tags, r.error));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// numfuzz seeds 6789, 6673, 6700 at b46404e66 (artie fbbb5b4ce6): a cast to an integer of a constant's cast rounds as
 /// the cast does (' 2.50 '::numeric::int is 3; it truncated to 2), and a constant expression assigned to an integer or
 /// numeric(p, s) column is refused past the column even when no row matches, as PostgreSQL folds it before any row is
