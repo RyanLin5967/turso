@@ -481,6 +481,39 @@ pub(crate) fn user_tables_sorted(schema: &Schema) -> Vec<(&String, &Arc<Table>)>
 
 /// Map a SQLite type string to a PostgreSQL type OID.
 /// Strips parenthesized parameters (e.g. `varchar(100)` -> `VARCHAR`) before matching.
+/// A column default as the catalog shows it (pg_attrdef.adbin through pg_get_expr,
+/// information_schema.columns.column_default). A numeric constant a DEFAULT gives an integer column
+/// past it is stored as the wire's pg_assign_int(text, type), which refuses at the INSERT that uses
+/// it; PostgreSQL stores and shows that constant as itself, typed by its literal: '3000000000'::bigint,
+/// numeric past int8 or for a decimal (recorded, rec40-default-catalog). Every other default shows
+/// as the engine stores it.
+pub(crate) fn default_display(expr: &turso_parser::ast::Expr) -> String {
+    use turso_parser::ast::{Expr, Literal};
+    // The stored default is parenthesized: (pg_assign_int('3000000000', 'integer')).
+    let mut inner = expr;
+    while let Expr::Parenthesized(items) = inner {
+        match items.as_slice() {
+            [only] => inner = only.as_ref(),
+            _ => break,
+        }
+    }
+    if let Expr::FunctionCall { name, args, .. } = inner {
+        if name.as_str().eq_ignore_ascii_case("pg_assign_int") {
+            if let [first, _] = args.as_slice() {
+                if let Expr::Literal(Literal::String(quoted)) = first.as_ref() {
+                    let text = quoted.trim_matches('\'').replace("''", "'");
+                    let ty = match text.trim().parse::<i128>() {
+                        Ok(v) if i64::try_from(v).is_ok() => "bigint",
+                        _ => "numeric",
+                    };
+                    return format!("'{text}'::{ty}");
+                }
+            }
+        }
+    }
+    expr.to_string()
+}
+
 pub(crate) fn sqlite_type_to_pg_oid(ty_str: &str) -> i64 {
     let base = match ty_str.find('(') {
         Some(pos) => &ty_str[..pos],
@@ -3242,7 +3275,7 @@ impl PgAttrdefCursor {
                         Value::from_i64(attrdef_oid),                // oid
                         Value::from_i64(table_oid),                  // adrelid
                         Value::from_i64(col_idx as i64 + 1),         // adnum (1-based)
-                        Value::build_text(default_expr.to_string()), // adbin
+                        Value::build_text(default_display(default_expr)), // adbin
                     ]);
                     attrdef_oid += 1;
                 }

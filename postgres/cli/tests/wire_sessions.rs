@@ -12536,6 +12536,17 @@ replays_postgresql!(
     [
     ]
 );
+// rec40 (artie f55e14738b): a coerced DEFAULT as the catalog shows it (information_schema.columns, pg_get_expr).
+replays_postgresql!(
+    pg18_wirefuzz_a_coerced_default_shows_in_the_catalog_as_postgresql_stores_it_replays_as_postgresql_answered,
+    "pg18-wirefuzz-a_coerced_default_shows_in_the_catalog_as_postgresql_stores_it.out",
+    [
+        (2, "PGDIV-DEFAULT-DISPLAY value [wire]: information_schema.columns shows a coerced DEFAULT as the value the table stores: 2.5 into an int as 3, 12345678901234567.00 into a bigint without its scale, ' 7 ' into a smallint as 7, where PG shows '2.5', '12345678901234567.00' and '7'::smallint; its columns are typed 25 where PG types them name (19) and varchar (1043)"),
+        (3, "PGDIV-DEFAULT-DISPLAY value [wire]: pg_get_expr over pg_attrdef shows the stored values as in #2; the columns are typed 25 where PG types attname name (19)"),
+        (5, "PGDIV-SET-DEFAULT-REFUSED error [wire]: ALTER COLUMN SET DEFAULT is refused 0A000 and changes nothing (the lead's ruling LEAD-RULINGS 0fac7e134e), where PG sets the default"),
+        (8, "PGDIV-SET-DEFAULT-REFUSED value [wire]: b keeps no default after the refused SET DEFAULT (PG shows 16), and ADD COLUMN e int DEFAULT 4.5 shows 5 (PGDIV-DEFAULT-DISPLAY) where PG shows 4.5"),
+    ]
+);
 // numfuzz seed 3504 (artie c098a7ed4d): an expression cast to an integer rounds as its operand's type's cast rounds
 // (de900873a). A bare numeric column is stored and announced float8 here, so an expression over one rounds half to
 // even as a float8 does, where PG's numeric rounds half away from zero (registered from rec50, artie 0de472ed9d).
@@ -18099,6 +18110,80 @@ fn a_float_cast_to_text_is_written_as_its_output_routine_writes_it() {
         let r = a.q(sql);
         if r.error.is_some() || r.rows != want {
             wrong.push(format!("{sql}: PG {want:?}; got {:?} {:?}", r.rows, r.error));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// numfuzz seed 4912 at 783dee075 (artie 4f001ce3aa): a float column compared with a numeric constant past the type the
+/// comparison resolves to is 22003 with numeric_out's text of the constant: an IN list takes the column's type (real), so
+/// -0.330e300 is past it; = and < compare a real as float8, so 1e39 is not, and 1e400 is past float8. The IN list
+/// answered no rows. Expected answers: PG 18.6, recorded on eceubuntu2 (artie dc1092962a,
+/// rec59-float-compare-range/pg18-wirefuzz-a_float_column_compared_with_a_constant_past_its_range_is_22003.out).
+#[test]
+fn a_float_column_compared_with_a_constant_past_its_range_is_22003() {
+    let dir = Scratch::new("float-compare-range");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in ["CREATE TABLE fr (id int PRIMARY KEY, r real, f float8)", "INSERT INTO fr VALUES (1, 1.5, 2.5)"] {
+        a.q(sql).ok(sql);
+    }
+    let mut wrong = Vec::new();
+    for (sql, message) in [
+        ("SELECT id FROM fr WHERE r IN ((-0.330e300), (-32768)) ORDER BY id", format!("\"-33{}\" is out of range for type real", "0".repeat(298))),
+        ("SELECT id FROM fr WHERE f = 1e400", format!("\"1{}\" is out of range for type double precision", "0".repeat(400))),
+    ] {
+        let r = a.q(sql);
+        if !r.error.as_ref().is_some_and(|e| e.code == "22003" && e.message == message) {
+            wrong.push(format!("{sql}: PG 22003; got {:?} {:?}", r.rows, r.error.as_ref().map(|e| (&e.code, e.message.chars().take(60).collect::<String>()))));
+        }
+    }
+    let one = vec![vec![Some("1".to_string())]];
+    for (sql, want) in [
+        ("SELECT id FROM fr WHERE r = 1e39", vec![]),
+        ("SELECT id FROM fr WHERE r < 1e-50", vec![]),
+        ("SELECT id FROM fr WHERE 1e39 > r", one.clone()),
+        ("SELECT id FROM fr WHERE r = 1.5", one.clone()),
+        ("SELECT id FROM fr WHERE r IN (1.5, 2) ORDER BY id", one.clone()),
+        ("SELECT id FROM fr WHERE f < 1e300", one.clone()),
+        ("SELECT id FROM fr WHERE r BETWEEN 0 AND 1e39", one.clone()),
+    ] {
+        let r = a.q(sql);
+        if r.error.is_some() || r.rows != want {
+            wrong.push(format!("{sql}: PG {want:?}; got {:?} {:?}", r.rows, r.error));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// numfuzz seeds 7472, 7552 at b46404e66 (artie 875b49ec51): a constant expression with integer functions (abs, floor,
+/// ceil, round, trunc) or a numeric(p, s) cast inside, assigned to an integer or numeric(p, s) column, is refused past
+/// the column or the cast even when no row matches, as PostgreSQL folds it before any row is read (it answered UPDATE
+/// 0). Expected answers: PG 18.6, recorded on eceubuntu2 (artie d50082cd8d, rec58-folded-assign-functions/
+/// pg18-wirefuzz-a_constant_with_integer_functions_assigned_is_folded.out).
+#[test]
+fn a_constant_with_integer_functions_assigned_is_folded() {
+    let dir = Scratch::new("folded-assign-functions");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE ff (id int PRIMARY KEY, s smallint, b bigint, n numeric(10,2))").ok("create");
+    let mut wrong = Vec::new();
+    for (sql, message) in [
+        ("UPDATE ff SET b = floor(-(((-9223372036854775808) - 1_000_000))) WHERE id = 3", "bigint out of range"),
+        ("UPDATE ff SET s = ceil((floor((-32768)))::numeric(6,2)) WHERE id = 1", "numeric field overflow"),
+        ("UPDATE ff SET s = abs(-40000) WHERE id = 1", "smallint out of range"),
+        ("UPDATE ff SET s = trunc(70000) WHERE id = 1", "smallint out of range"),
+        ("UPDATE ff SET n = round(123456789012) WHERE id = 1", "numeric field overflow"),
+    ] {
+        let r = a.q(sql);
+        if !r.error.as_ref().is_some_and(|e| e.code == "22003" && e.message == message) {
+            wrong.push(format!("{sql}: PG 22003 {message:?}; got {:?} {:?}", r.tags, r.error));
+        }
+    }
+    for sql in ["UPDATE ff SET s = abs(-300) WHERE id = 1", "UPDATE ff SET s = (floor(5))::int WHERE id = 1"] {
+        let r = a.q(sql);
+        if r.error.is_some() || r.tags != vec!["UPDATE 0".to_string()] {
+            wrong.push(format!("{sql}: PG UPDATE 0; got {:?} {:?}", r.tags, r.error));
         }
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
