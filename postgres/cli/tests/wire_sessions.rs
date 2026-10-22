@@ -17493,6 +17493,53 @@ fn a_string_parameter_assigned_to_another_category_is_42804() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// numfuzz (seed 1237 at c8b6e2916; artie c80202ac4e): a constant cast to numeric or an integer type and assigned to an
+/// integer column is the cast's value then the assignment's, each rounded half away from zero and range-checked, so a
+/// statement matching no row is refused too: '1e5'::numeric into a smallint was answered (UPDATE 0). A typmod rounds
+/// first (1.45::numeric(3,1) is 1.5, then 2). Expected answers: PG 18.6, recorded (artie c2fe0580f5,
+/// rec32-cast-constant-assign/pg18-wirefuzz-a_cast_constant_assigned_to_an_integer_column_is_range_checked.out), but its
+/// NaN and Infinity casts (0A000 there; the engine's numeric refuses them otherwise, its own class).
+#[test]
+fn a_cast_constant_assigned_to_an_integer_column_is_range_checked() {
+    let dir = Scratch::new("cast-constant-int");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let ddl = "CREATE TABLE nt (id int PRIMARY KEY, a smallint, b int, c bigint)";
+    a.q(ddl).ok(ddl);
+    let mut wrong = Vec::new();
+    for (sql, message) in [
+        ("UPDATE nt SET a = '1e5'::numeric WHERE id = 1", "smallint out of range"),
+        ("INSERT INTO nt (id, a) VALUES (1, 40000::int)", "smallint out of range"),
+        ("INSERT INTO nt (id, b) VALUES (1, 3000000000::bigint)", "integer out of range"),
+        ("INSERT INTO nt (id, b) VALUES (1, '3000000000'::int8)", "integer out of range"),
+        ("INSERT INTO nt (id, b) VALUES (1, CAST('2147483647.5' AS numeric))", "integer out of range"),
+        ("INSERT INTO nt (id, b) VALUES (1, 1e10::decimal(11,0))", "integer out of range"),
+        ("INSERT INTO nt (id, b) VALUES (2, '2.5'::numeric)", ""),
+        ("INSERT INTO nt (id, b) VALUES (3, 1.45::numeric(3,1))", ""),
+        ("INSERT INTO nt (id, a) VALUES (4, '-7'::int8)", ""),
+        ("INSERT INTO nt (id, c) VALUES (5, '-0.5'::numeric)", ""),
+    ] {
+        let r = a.q(sql);
+        let fine = if message.is_empty() {
+            r.error.is_none()
+        } else {
+            r.error.as_ref().is_some_and(|e| e.code == "22003" && e.message == message)
+        };
+        if !fine {
+            wrong.push(format!("{sql}: PG {message:?}; got {:?} {:?}", r.tags, r.error));
+        }
+    }
+    let r = a.q("SELECT id, a, b, c FROM nt ORDER BY id");
+    let want: Vec<Vec<Option<String>>> = [["2", "", "3", ""], ["3", "", "2", ""], ["4", "-7", "", ""], ["5", "", "", "-1"]]
+        .iter()
+        .map(|row| row.iter().map(|v| (!v.is_empty()).then(|| v.to_string())).collect())
+        .collect();
+    if r.error.is_some() || r.rows != want {
+        wrong.push(format!("SELECT id, a, b, c: PG {want:?}; got {:?} {:?}", r.rows, r.error));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// numfuzz (seeds 285 at 6e17acc9a, 875 at 45de98440; artie 9b32cd5149, dcbd0e0179): a constant cast past
 /// numeric(p, s) is 22003 'numeric field overflow' at planning, wherever it stands, so a statement matching no row is
 /// refused too; each was answered (UPDATE 0). The bound is the value rounded half away from zero to s places reaching
