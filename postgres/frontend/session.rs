@@ -2583,10 +2583,15 @@ type LiteralAssignments = (
 
 /// The integer value of a constant expression PostgreSQL's planner folds: integer literals, a
 /// decimal literal cast to an integer (rounded half away from zero, as numeric's cast rounds it),
-/// integer or numeric casts of those, abs, floor, ceil, round and trunc of one, unary minus and
-/// + - *, in i128. Err for a numeric(p, s) cast inside that the value overflows (22003 'numeric
-/// field overflow', as the planner's fold refuses it; numfuzz seed 7472). Ok(None) for anything
-/// else, including a decimal that is not cast to an integer, a division, or an i128 overflow.
+/// integer or numeric casts of those, abs, floor, ceil, round and trunc of one, unary minus,
+/// + - *, and / and % of two integer-typed sides ([`integer_typed`]), truncated toward zero as
+/// int4div and int4mod truncate, in i128. Err for a numeric(p, s) cast inside that the value
+/// overflows (22003 'numeric field overflow', as the planner's fold refuses it; numfuzz seed 7472),
+/// and for a zero divisor (22012 'division by zero', as the fold raises it even when no row
+/// matches). Ok(None) for anything else, including a decimal that is not cast to an integer, a
+/// division with a numeric or float side, any other function call, or an i128 overflow. BLIND
+/// SPOT: what is not folded is range-checked at Execute (pg_assign_int_value), which a statement
+/// matching no row never reaches: 65535::numeric / 2 into a smallint is UPDATE 0 there.
 fn fold_integer(node: &turso_pg_parser::pg_query::protobuf::Node) -> std::result::Result<Option<i128>, SqlErrorMessage> {
     use turso_pg_parser::pg_query::protobuf::{a_const::Val, node::Node};
     let Some(n) = node.node.as_ref() else { return Ok(None) };
@@ -2663,11 +2668,51 @@ fn fold_integer(node: &turso_pg_parser::pg_query::protobuf::Node) -> std::result
                 (Some(l), Some("+")) => fold_integer(l)?.zip(side(e.rexpr.as_deref())?).and_then(|(a, b)| a.checked_add(b)),
                 (Some(l), Some("-")) => fold_integer(l)?.zip(side(e.rexpr.as_deref())?).and_then(|(a, b)| a.checked_sub(b)),
                 (Some(l), Some("*")) => fold_integer(l)?.zip(side(e.rexpr.as_deref())?).and_then(|(a, b)| a.checked_mul(b)),
+                (Some(l), Some(op @ ("/" | "%"))) if integer_typed(l) && e.rexpr.as_deref().is_some_and(integer_typed) => {
+                    match fold_integer(l)?.zip(side(e.rexpr.as_deref())?) {
+                        Some((_, 0)) => return Err(SqlErrorMessage::classified(SqlErrorKind::DivisionByZero, "division by zero")),
+                        // i128's / and % truncate toward zero, as int4div and int4mod do.
+                        Some((a, b)) if op == "/" => a.checked_div(b),
+                        Some((a, b)) => a.checked_rem(b),
+                        None => None,
+                    }
+                }
                 _ => None,
             }
         }
         _ => None,
     })
+}
+
+/// Whether `node` is of an integer type to PostgreSQL, so its / and % are int4div and int4mod: an
+/// integer literal within int8 (a longer one is numeric), a cast to int2, int4 or int8, abs of one,
+/// and unary minus, + - * / % of those. floor, ceil, round and trunc of an integer are float8, and a
+/// numeric cast is numeric, so they are not.
+fn integer_typed(node: &turso_pg_parser::pg_query::protobuf::Node) -> bool {
+    use turso_pg_parser::pg_query::protobuf::{a_const::Val, node::Node};
+    match node.node.as_ref() {
+        Some(Node::AConst(c)) if !c.isnull => match c.val.as_ref() {
+            Some(Val::Ival(_)) => true,
+            Some(Val::Fval(f)) => f.fval.parse::<i64>().is_ok(),
+            _ => false,
+        },
+        Some(Node::TypeCast(c)) => c
+            .type_name
+            .as_ref()
+            .filter(|t| t.array_bounds.is_empty())
+            .and_then(|t| t.names.last())
+            .is_some_and(|n| matches!(&n.node, Some(Node::String(s)) if matches!(s.sval.as_str(), "int2" | "int4" | "int8"))),
+        Some(Node::FuncCall(f)) => {
+            f.args.len() == 1
+                && f.funcname.last().is_some_and(|n| matches!(&n.node, Some(Node::String(s)) if s.sval == "abs"))
+                && integer_typed(&f.args[0])
+        }
+        Some(Node::AExpr(e)) => {
+            let arithmetic = e.name.iter().any(|n| matches!(&n.node, Some(Node::String(s)) if matches!(s.sval.as_str(), "+" | "-" | "*" | "/" | "%")));
+            arithmetic && e.lexpr.as_deref().is_none_or(integer_typed) && e.rexpr.as_deref().is_some_and(integer_typed)
+        }
+        _ => false,
+    }
 }
 
 /// The location of an assigned value that is an expression: an operator, a function call, a cast
