@@ -2342,6 +2342,7 @@ pub(crate) fn session_translation(
     // Each value assigned to a column is coerced as parse analysis coerces it, here so the
     // re-prepare judges it alike; a literal an integer column reads is written as its value.
     let integer_literals = literal_assignments(pg_conn, parse_result).map_err(LimboError::InvalidArgument)?;
+    constant_numeric_casts(sql, parse_result).map_err(LimboError::InvalidArgument)?;
     let translator = || {
         let t = translator();
         let t = if text_casts.is_empty() { t } else { t.with_text_integer_casts(text_casts.clone()) };
@@ -2653,6 +2654,59 @@ fn literal_assignments(
     }
     drop(coerce);
     Ok(rewrites)
+}
+
+/// A constant cast to numeric(p, s) past it is 22003 'numeric field overflow', as the planner's
+/// constant folding raises it wherever the cast stands, so a statement matching no row is refused
+/// as well (numfuzz seeds 285 at 6e17acc9a, 875 at 45de98440: UPDATE 0; recorded,
+/// rec31-constant-numeric-cast, artie 8ceb58f30a). Bounded by the text: a statement that does not
+/// spell numeric or decimal holds no such cast. BLIND SPOT: a cast over an expression of constants
+/// ((1 + 2)::numeric(1,0)), which the engine judges at run time, only when a row reaches it.
+fn constant_numeric_casts(sql: &str, parse: &turso_pg_parser::pg_query::ParseResult) -> std::result::Result<(), SqlErrorMessage> {
+    use turso_pg_parser::pg_query::{protobuf::a_const::Val, protobuf::node::Node, NodeRef};
+    let b = sql.as_bytes();
+    let spelled = |w: &[u8]| b.windows(w.len()).any(|x| x.eq_ignore_ascii_case(w));
+    if !spelled(b"numeric") && !spelled(b"decimal") {
+        return Ok(());
+    }
+    for (n, ..) in parse.protobuf.nodes().iter() {
+        let NodeRef::TypeCast(c) = n else { continue };
+        let Some(t) = c.type_name.as_ref().filter(|t| t.array_bounds.is_empty() && !t.typmods.is_empty()) else {
+            continue;
+        };
+        if !t.names.last().is_some_and(|n| matches!(&n.node, Some(Node::String(s)) if s.sval == "numeric")) {
+            continue;
+        }
+        let modifier = |i: usize| match t.typmods.get(i).and_then(|m| m.node.as_ref()) {
+            Some(Node::AConst(a)) => match a.val.as_ref() {
+                Some(Val::Ival(v)) => Some(v.ival),
+                _ => None,
+            },
+            _ => None,
+        };
+        let Some(precision) = modifier(0).filter(|p| *p >= 1) else { continue };
+        let scale = if t.typmods.len() > 1 {
+            match modifier(1) {
+                Some(s) => s,
+                None => continue,
+            }
+        } else {
+            0
+        };
+        let text = match c.arg.as_deref().and_then(|a| a.node.as_ref()) {
+            Some(Node::AConst(a)) if !a.isnull => match a.val.as_ref() {
+                Some(Val::Ival(i)) => i.ival.to_string(),
+                Some(Val::Fval(f)) => f.fval.clone(),
+                Some(Val::Sval(s)) => s.sval.clone(),
+                _ => continue,
+            },
+            _ => continue,
+        };
+        if crate::functions::numeric_overflows(&text, precision, scale) == Some(true) {
+            return Err(SqlErrorMessage::classified(SqlErrorKind::NumericValueOutOfRange, "numeric field overflow"));
+        }
+    }
+    Ok(())
 }
 
 /// A translation's refusal as the engine error it is reported with: PostgreSQL's own message, with
