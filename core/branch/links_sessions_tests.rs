@@ -558,10 +558,22 @@ fn ls_hard_limit_child() {
     db.branch_wait_name_filter();
     let busy0 = db.branches.wal_truncate_busy_for_test();
     let trunk = db.connect().unwrap();
+    // FE_LS_HARD_FORCE (the lead's forced end-of-operations window, 2026-10-22): the fill is held before its
+    // column-only transaction for all 600 creates, so the gate defers every checkpoint past the hard limit, and the
+    // hold is let go only after the last create. Whatever then cuts the log must be started by a later operation.
+    let force = std::env::var_os("FE_LS_HARD_FORCE").is_some();
+    if force {
+        super::store::LINKS_FILL_HOLD_BEFORE_COLUMNS.store(true, Ordering::Release);
+    }
     let mut peak = 0;
     for _ in 0..600 {
         let _ = trunk.fork_branch().unwrap().into_id();
         peak = peak.max(log_bytes(&path));
+    }
+    if force {
+        super::store::LINKS_FILL_HOLD_BEFORE_COLUMNS.store(false, Ordering::Release);
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        println!("LS-HARD-FORCE peak={peak} log={}", log_present(&path));
     }
     // FLAGGED harness repair, the ruled pattern of 01a02150d/ce77ead23 (lead ruling 2026-10-21T17:58:38Z: a
     // checkpoint the gate or a running WAL truncation defers past the hard limit starts at the next operation):
