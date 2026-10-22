@@ -13319,19 +13319,8 @@ replays_postgresql!(
         (7, "PGDIV-SUM-INT8-NUMERIC value [engine]: sum(bigint) past int8: ours 22003 'integer overflow'; PG answers numeric 9223372036854775808"),
         (8, "PGDIV-INT-RANGE error-step [engine]: v + 1 past int8 is 22003 bigint out of range as PG; PG sends the RowDescription (20) first, ours refuses at the first row before it (the wire's range guard)"),
         (9, "PGDIV-INT-RANGE error-step [engine]: v * 2 past int8 is 22003 bigint out of range as PG; PG sends the RowDescription (20) first, ours refuses before it (the wire's range guard)"),
-        (10, "PGDIV-INT-RANGE value [engine]: SILENT: abs(-9223372036854775808::int8) answers 9223372036854775807 typed 25; PG 22003"),
         (11, "PGDIV-INT-RANGE value [engine]: SILENT: abs(v - max - max - 2) answers '9.223372036854776e+18' typed 25; PG 20 then 22003"),
         (14, "PGDIV-INT-RANGE error-step [engine]: v + 1 past int8 inside a block is 22003 bigint out of range and aborts it, as PG; PG sends the RowDescription first, ours refuses at the first row before it (the wire's range guard, wire-rev-7128c6f73 L3)"),
-        (20, "PGDIV-INT-RANGE value [engine]: SILENT: abs(-9223372036854775808::int8) answers 9223372036854775807 typed 25 (the engine clamps) and leaves the block open; PG 22003 bigint out of range aborts it"),
-        (21, "PGDIV-INT-RANGE cascade [engine]: INSERT (3) succeeds; PG 25P02 because #20 aborted its block (cascade of #20)"),
-        (22, "PGDIV-INT-RANGE cascade [engine]: COMMIT commits rows 2 and 3; PG answers ROLLBACK (cascade of #20)"),
-        (23, "PGDIV-INT-RANGE cascade [engine]: count 2 vs 0 (cascade of #20)"),
-        (25, "PGDIV-INT-RANGE cascade [engine]: INSERT (2) 23505 duplicate (cascade of #20)"),
-        (26, "PGDIV-INT-RANGE cascade [engine]: SAVEPOINT s refused 25P02 because #25 aborted our block (cascade of #20)"),
-        (27, "PGDIV-INT-RANGE cascade [engine]: 25P02 in our aborted block (cascade of #20)"),
-        (28, "PGDIV-INT-RANGE cascade [engine]: ROLLBACK TO s: 3B001 no such savepoint since #26 made none (cascade of #20)"),
-        (29, "PGDIV-INT-RANGE cascade [engine]: SELECT 1: 25P02 in our still-aborted block (cascade of #20)"),
-        (30, "PGDIV-INT-RANGE cascade [engine]: COMMIT answers ROLLBACK where PG commits (cascade of #20)"),
     ]
 );
 replays_postgresql!(
@@ -13545,16 +13534,11 @@ replays_postgresql!(
     pg18_c33_intrange_replays_as_postgresql_answered,
     "pg18-c33-intrange.out",
     [
-        (4, "PGDIV-INT-RANGE value [engine]: SILENT: -9223372036854775808::int8 (cast binds before minus, so 2^63 overflows) answers -9223372036854775807 typed 20; PG 22003 bigint out of range"),
-        (5, "PGDIV-INT-RANGE value [engine]: SILENT: abs(-9223372036854775808::int8) answers 9223372036854775807 typed 25; PG 22003"),
-        (6, "PGDIV-INT-RANGE error-text [engine]: '9223372036854775808'::int8 is 22003 as PG, saying 'integer out of range'; PG 'value \"9223372036854775808\" is out of range for type bigint'"),
         (8, "PGDIV-INT-RANGE error-step [engine]: bigint column v + 1 is 22003 bigint out of range as PG; PG sends the RowDescription (20) first, ours refuses before it (the wire's range guard)"),
         (9, "PGDIV-INT-RANGE error-step [engine]: v * 2 is 22003 bigint out of range as PG; PG sends the RowDescription (20) first, ours refuses before it"),
         (10, "PGDIV-INT-RANGE error-step [engine]: -v - 2 is 22003 bigint out of range as PG; PG sends the RowDescription (20) first, ours refuses before it"),
         (12, "PGDIV-INT-RANGE error-step [engine]: int column i + 1 is 22003 integer out of range as PG; PG sends the RowDescription (23) first, ours refuses before it"),
         (13, "PGDIV-INT-RANGE error-step [engine]: i * 2 is 22003 integer out of range as PG; PG sends the RowDescription (23) first, ours refuses before it"),
-        (14, "PGDIV-INT-RANGE error-text [engine]: '2147483648'::int4 is 22003 as PG, saying 'integer out of range'; PG 'value \"2147483648\" is out of range for type integer'"),
-        (16, "PGDIV-INT-RANGE error-text [engine]: CAST(9.5e18 AS BIGINT) is 22003 as PG, saying 'integer out of range'; PG 'bigint out of range'"),
         (20, "PGDIV-SUM-INT8-NUMERIC value [engine]: sum(bigint) past int8: ours 22003 'integer overflow'; PG sum(int8) is numeric and answers 9223372036854775808 typed 1700"),
     ]
 );
@@ -17598,6 +17582,64 @@ fn a_string_parameter_assigned_to_another_category_is_42804() {
         if !agrees {
             wrong.push(format!("{sql}: PG {want:?}; got {:?} {:?}", r.tags, r.error));
         }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// numfuzz (seeds 1442, 1458 and 1600 at 1d8a8b230; artie 00a35c0147): a constant past a numeric(p, s) column is 22003
+/// 'numeric field overflow', a constant cast past an integer type is 22003 wherever it stands, and an INSERT ... SELECT's
+/// targets are coerced to their columns as VALUES items are, each at planning, so a statement matching no row is refused
+/// too; each was answered. Expected answers: PG 18.6, recorded (artie 555adcffb6,
+/// rec33-assign-numeric-select/pg18-wirefuzz-a_constant_past_a_numeric_column_or_an_integer_cast_is_22003_and_insert_select_is_coerced.out),
+/// but its INSERT ... SELECT 3, 2.5, whose 23505 is worded by the engine here, its own class.
+#[test]
+fn a_constant_past_a_numeric_column_or_an_integer_cast_is_22003_and_insert_select_is_coerced() {
+    let dir = Scratch::new("numeric-column-constant");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let ddl = "CREATE TABLE nt (id int PRIMARY KEY, n numeric(6,2), b int, f double precision, g text)";
+    a.q(ddl).ok(ddl);
+    let mut wrong = Vec::new();
+    for (sql, code, message) in [
+        ("UPDATE nt SET n = '1e5'::numeric WHERE id = 1", "22003", "numeric field overflow"),
+        ("UPDATE nt SET n = 12345.678 WHERE id = 1", "22003", "numeric field overflow"),
+        ("UPDATE nt SET n = '9999.995' WHERE id = 1", "22003", "numeric field overflow"),
+        ("UPDATE nt SET n = 9999.994 WHERE id = 1", "", ""),
+        ("UPDATE nt SET n = 100000 WHERE id = 1", "22003", "numeric field overflow"),
+        ("INSERT INTO nt (id, n) VALUES (1, 1e4)", "22003", "numeric field overflow"),
+        ("INSERT INTO nt (id, n) VALUES (1, 'Infinity')", "22003", "numeric field overflow"),
+        ("INSERT INTO nt (id, n) VALUES (2, 9999.99)", "", ""),
+        ("SELECT id FROM nt WHERE b > (2.950255e+20)::int", "22003", "integer out of range"),
+        ("SELECT id FROM nt WHERE b > 3000000000::int", "22003", "integer out of range"),
+        ("SELECT id FROM nt WHERE b > '3000000000'::int", "22003", r#"value "3000000000" is out of range for type integer"#),
+        ("SELECT id FROM nt WHERE b > 40000::smallint", "22003", "smallint out of range"),
+        ("SELECT id FROM nt WHERE b > 2.5::int", "", ""),
+        ("INSERT INTO nt (id, f) SELECT 3, (abs(-('1.5'::numeric)))::text", "42804", r#"column "f" is of type double precision but expression is of type text"#),
+        ("INSERT INTO nt (id, b) SELECT 3, '5'", "", ""),
+        ("INSERT INTO nt (id, b) SELECT 3, 'x'", "22P02", r#"invalid input syntax for type integer: "x""#),
+        ("INSERT INTO nt (id, b) SELECT 3, 3000000000", "22003", "integer out of range"),
+        ("INSERT INTO nt (id, g) SELECT 4, 5", "", ""),
+        ("INSERT INTO nt (id, n) SELECT 5, 123456", "22003", "numeric field overflow"),
+        ("INSERT INTO nt (id, b) SELECT 6, 'x'::text WHERE false", "42804", r#"column "b" is of type integer but expression is of type text"#),
+        ("INSERT INTO nt (id, b) SELECT id + 100, 3000000000 FROM nt", "22003", "integer out of range"),
+    ] {
+        let r = a.q(sql);
+        let fine = if code.is_empty() {
+            r.error.is_none()
+        } else {
+            r.error.as_ref().is_some_and(|e| e.code == code && e.message == message)
+        };
+        if !fine {
+            wrong.push(format!("{sql}: PG {code:?} {message:?}; got {:?} {:?}", r.tags, r.error));
+        }
+    }
+    let r = a.q("SELECT id, n, b, f, g FROM nt ORDER BY id");
+    let want: Vec<Vec<Option<String>>> = [["2", "9999.99", "", "", ""], ["3", "", "5", "", ""], ["4", "", "", "", "5"]]
+        .iter()
+        .map(|row| row.iter().map(|v| (!v.is_empty()).then(|| v.to_string())).collect())
+        .collect();
+    if r.error.is_some() || r.rows != want {
+        wrong.push(format!("SELECT id, n, b, f, g: PG {want:?}; got {:?} {:?}", r.rows, r.error));
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
