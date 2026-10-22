@@ -678,10 +678,12 @@ pub struct Walked {
     /// where the engine's % reads both sides as integers (numfuzz seeds 4703, 5316; recorded,
     /// rec52-numeric-modulo).
     pub numeric_mods: std::collections::BTreeSet<i32>,
-    /// Each abs() of a smallint (21) or an integer (23), by the call's parse location, with that
-    /// type: PostgreSQL's int2abs and int4abs refuse the type's smallest value (22003), where the
-    /// engine's i64 answers it (numfuzz seed 6261 at 4c7bc6102: abs(-32768::int2) was 32768).
-    pub integer_abs: std::collections::BTreeMap<i32, u32>,
+    /// Each abs(), + - * / or prefix minus whose PostgreSQL type is smallint (21) or integer (23),
+    /// by its parse location, with that type: PostgreSQL computes it in that width and refuses a
+    /// result past it (22003 'smallint out of range' / 'integer out of range'), where the engine's
+    /// i64 answered it (numfuzz seeds 6261 at 4c7bc6102, abs(-32768::int2) was 32768; 8054 and 8137
+    /// at f1dc48429, 2147483647 + 15 was 2147483662).
+    pub integer_ranges: std::collections::BTreeMap<i32, u32>,
     /// A plain SELECT's result columns' types, in order, as the walk read them (empty for any other
     /// statement): [`aggregate_types`] takes the aggregates' from these.
     pub columns: Vec<Option<u32>>,
@@ -902,7 +904,7 @@ fn parameter_types_with(
         integer_casts: Default::default(),
         float_texts: Default::default(),
         numeric_mods: Default::default(),
-        integer_abs: Default::default(),
+        integer_ranges: Default::default(),
         column_assignments: Vec::new(),
     };
     let mut columns = Vec::new();
@@ -928,7 +930,7 @@ fn parameter_types_with(
     let integer_casts = infer.integer_casts.take();
     let float_texts = infer.float_texts.take();
     let numeric_mods = infer.numeric_mods.take();
-    let integer_abs = infer.integer_abs.take();
+    let integer_ranges = infer.integer_ranges.take();
     Ok(Walked {
         params: infer.types,
         untyped,
@@ -939,7 +941,7 @@ fn parameter_types_with(
         integer_casts,
         float_texts,
         numeric_mods,
-        integer_abs,
+        integer_ranges,
         columns,
         assignments: infer.assignments,
     })
@@ -1050,8 +1052,8 @@ struct Infer<'a> {
     float_texts: std::rc::Rc<std::cell::RefCell<std::collections::BTreeMap<i32, u32>>>,
     /// Each % over a numeric, by its location ([`Walked::numeric_mods`]).
     numeric_mods: std::rc::Rc<std::cell::RefCell<std::collections::BTreeSet<i32>>>,
-    /// Each abs() of a smallint or an integer, by its location ([`Walked::integer_abs`]).
-    integer_abs: std::rc::Rc<std::cell::RefCell<std::collections::BTreeMap<i32, u32>>>,
+    /// Each smallint or integer result the engine must range-check ([`Walked::integer_ranges`]).
+    integer_ranges: std::rc::Rc<std::cell::RefCell<std::collections::BTreeMap<i32, u32>>>,
     /// Each bare $n assigned to a column, in the order PostgreSQL analyses them: ($n, the column's
     /// name, its type) ([`Walked::column_assignments`]).
     column_assignments: Vec<(u32, String, u32)>,
@@ -1787,7 +1789,7 @@ impl Infer<'_> {
             integer_casts: self.integer_casts.clone(),
             float_texts: self.float_texts.clone(),
             numeric_mods: self.numeric_mods.clone(),
-            integer_abs: self.integer_abs.clone(),
+            integer_ranges: self.integer_ranges.clone(),
             column_assignments: Vec::new(),
         };
         let columns = walk.select(query, &Vec::new());
@@ -2911,7 +2913,7 @@ impl Infer<'_> {
                         self.refusal(SqlErrorKind::UndefinedFunction, format!("function {}({}) does not exist", parts.join("."), types.join(", ")))
                     }
                     ("abs", t @ (INT2 | INT4)) => {
-                        self.integer_abs.borrow_mut().insert(call.location, t);
+                        self.integer_ranges.borrow_mut().insert(call.location, t);
                         Some(t)
                     }
                     // sign has a float8 and a numeric candidate, so an integer or a float4 resolves
@@ -3071,7 +3073,7 @@ impl Infer<'_> {
                 if op == Some("%") && matches!(l.zip(r).map(|(a, b)| arithmetic("%", a, b)), Some(Arithmetic::Type(NUMERIC))) && e.location >= 0 {
                     self.numeric_mods.borrow_mut().insert(e.location);
                 }
-                match (l, r) {
+                let ty = match (l, r) {
                     (Some(a), Some(b)) => match arithmetic(op.unwrap_or(""), a, b) {
                         // An interval result (timestamp - timestamp): the engine has no interval
                         // type and answered '0' (wire-rev-7128c6f73 L4), so it is refused.
@@ -3111,7 +3113,22 @@ impl Infer<'_> {
                     // A unary operator (`-x`) has no left side.
                     (None, Some(b)) if e.lexpr.is_none() => Some(b),
                     _ => None,
+                };
+                // A smallint or integer result is computed in that width by PostgreSQL, which
+                // refuses one past it; the engine's i64 does not ([`Walked::integer_ranges`]). %
+                // cannot leave the width, and a prefix plus changes nothing.
+                // Only integer operands (or a parameter beside one): date - date is an integer too,
+                // and the engine computes it over dates.
+                let ranged = match e.lexpr {
+                    Some(_) => matches!(op, Some("+" | "-" | "*" | "/")),
+                    None => op == Some("-"),
+                };
+                let integer_side = |t: Option<u32>, x: Option<&PgNode>| matches!(t, Some(INT2 | INT4)) || param(x);
+                let integer_operands = (e.lexpr.is_none() || integer_side(l, e.lexpr.as_deref())) && integer_side(r, e.rexpr.as_deref());
+                if let Some(t @ (INT2 | INT4)) = ty.filter(|_| ranged && integer_operands && matches!(kind, AExprKind::AexprOp) && e.location >= 0) {
+                    self.integer_ranges.borrow_mut().insert(e.location, t);
                 }
+                ty
             }
             Node::BoolExpr(_) | Node::NullTest(_) | Node::BooleanTest(_) => Some(BOOL),
             Node::CoalesceExpr(_) | Node::MinMaxExpr(_) | Node::CaseExpr(_) => {
@@ -3180,7 +3197,7 @@ impl Infer<'_> {
             integer_casts: self.integer_casts.clone(),
             float_texts: self.float_texts.clone(),
             numeric_mods: self.numeric_mods.clone(),
-            integer_abs: self.integer_abs.clone(),
+            integer_ranges: self.integer_ranges.clone(),
             column_assignments: Vec::new(),
         };
         let level = walk.from_items(&s.from_clause, scope);

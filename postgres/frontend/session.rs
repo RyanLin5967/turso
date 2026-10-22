@@ -2401,10 +2401,11 @@ fn walk_statement(
 /// ([`crate::result_types::Walked::integer_casts`]); the real and float8 values written as text,
 /// to write as float4out or float8out does ([`crate::result_types::Walked::float_texts`]); the %
 /// over a numeric, to compute PostgreSQL's remainder ([`crate::result_types::Walked::numeric_mods`]);
-/// each abs() of a smallint or an integer, to refuse the type's smallest value
-/// ([`crate::result_types::Walked::integer_abs`]).
+/// each smallint or integer result, to refuse one past its width
+/// ([`crate::result_types::Walked::integer_ranges`]).
 /// Read from the parse and the schema alone, so the engine's re-prepare translates alike; the walk
-/// runs only for a statement holding such a cast, a cast to a string type, a ||, a % or an abs().
+/// runs only for a statement holding such a cast, a cast to a string type, a ||, a %, an abs(), or
+/// + - * /. A constant smallint or integer expression past its width is refused 22003 here.
 type CastWalk = (
     std::collections::HashMap<i32, u32>,
     std::collections::HashMap<i32, u32>,
@@ -2420,7 +2421,7 @@ fn cast_walk(pg_conn: &PgConnectionInner, parse: &turso_pg_parser::pg_query::Par
     };
     let any = parse.protobuf.nodes().iter().any(|(n, ..)| match n {
         NodeRef::TypeCast(c) => string_target(c) || c.arg.as_deref().is_some_and(|arg| crate::result_types::integer_cast_of_compound(c, arg)),
-        NodeRef::AExpr(e) => e.name.iter().any(|n| matches!(&n.node, Some(Node::String(s)) if s.sval == "||" || s.sval == "%")),
+        NodeRef::AExpr(e) => e.name.iter().any(|n| matches!(&n.node, Some(Node::String(s)) if matches!(s.sval.as_str(), "||" | "%" | "+" | "-" | "*" | "/"))),
         NodeRef::FuncCall(f) => f.funcname.last().is_some_and(|n| matches!(&n.node, Some(Node::String(s)) if s.sval == "abs")),
         _ => false,
     });
@@ -2429,11 +2430,25 @@ fn cast_walk(pg_conn: &PgConnectionInner, parse: &turso_pg_parser::pg_query::Par
     }
     let schema = pg_conn.conn.current_schema();
     let walked = walk_statement(pg_conn, &schema, parse)?;
+    // A constant smallint or integer expression past its width is refused here, as PostgreSQL's
+    // planner folds it before any row is read: 2147483647 + 15 over an empty table is 22003
+    // (numfuzz seed 8054 at f1dc48429), where a check at Execute sees no row.
+    for (n, ..) in parse.protobuf.nodes().iter() {
+        let NodeRef::AExpr(e) = n else { continue };
+        let Some(ty) = walked.integer_ranges.get(&e.location) else { continue };
+        let node = turso_pg_parser::pg_query::protobuf::Node { node: Some(Node::AExpr(Box::new((*e).clone()))) };
+        if let Some(v) = fold_integer(&node)? {
+            let (limit, name) = if *ty == 21 { (1i128 << 15, "smallint") } else { (1i128 << 31, "integer") };
+            if v < -limit || v >= limit {
+                return Err(SqlErrorMessage::classified(SqlErrorKind::NumericValueOutOfRange, format!("{name} out of range")));
+            }
+        }
+    }
     Ok((
         walked.integer_casts.into_iter().collect(),
         walked.float_texts.into_iter().collect(),
         walked.numeric_mods.into_iter().collect(),
-        walked.integer_abs.into_iter().collect(),
+        walked.integer_ranges.into_iter().collect(),
     ))
 }
 
@@ -2491,7 +2506,7 @@ pub(crate) fn session_translation(
     let text_casts = text_integer_casts(pg_conn, sql, parse_result);
     // Each cast to an integer type of a compound numeric or float expression rounds as its type's
     // cast does (PGDIV-INT-CAST-TRUNCATES; numfuzz seed 3504): the engine's CAST truncates.
-    let (rounding, float_texts, numeric_mods, integer_abs) = cast_walk(pg_conn, parse_result).map_err(LimboError::InvalidArgument)?;
+    let (rounding, float_texts, numeric_mods, integer_ranges) = cast_walk(pg_conn, parse_result).map_err(LimboError::InvalidArgument)?;
     // Each value assigned to a column is coerced as parse analysis coerces it, here so the
     // re-prepare judges it alike; a literal an integer column reads is written as its value.
     let (integer_literals, text_literals, float_literals, int_assignments, numeric_assignments) = literal_assignments(pg_conn, parse_result).map_err(LimboError::InvalidArgument)?;
@@ -2506,7 +2521,7 @@ pub(crate) fn session_translation(
         let t = if rounding.is_empty() { t } else { t.with_integer_cast_rounding(rounding.clone()) };
         let t = if float_texts.is_empty() { t } else { t.with_float_texts(float_texts.clone()) };
         let t = if numeric_mods.is_empty() { t } else { t.with_numeric_mods(numeric_mods.clone()) };
-        let t = if integer_abs.is_empty() { t } else { t.with_integer_abs(integer_abs.clone()) };
+        let t = if integer_ranges.is_empty() { t } else { t.with_integer_ranges(integer_ranges.clone()) };
         let t = if int_assignments.is_empty() { t } else { t.with_integer_assignments(int_assignments.clone()) };
         let t = if numeric_assignments.is_empty() { t } else { t.with_numeric_assignments(numeric_assignments.clone()) };
         let t = if text_literals.is_empty() { t } else { t.with_text_literals(text_literals.clone()) };

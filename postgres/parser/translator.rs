@@ -259,9 +259,9 @@ pub struct PostgreSQLTranslator {
     float_texts: Option<std::collections::HashMap<i32, u32>>,
     /// The % over a numeric, by their parse locations ([`PostgreSQLTranslator::with_numeric_mods`]).
     numeric_mods: Option<std::collections::HashSet<i32>>,
-    /// The abs() calls of a smallint (21) or an integer (23), by their parse locations
-    /// ([`PostgreSQLTranslator::with_integer_abs`]).
-    integer_abs: Option<std::collections::HashMap<i32, u32>>,
+    /// The smallint (21) and integer (23) results to range-check, by their parse locations
+    /// ([`PostgreSQLTranslator::with_integer_ranges`]).
+    integer_ranges: Option<std::collections::HashMap<i32, u32>>,
     /// The expressions assigned to integer columns, by their parse locations: the column's bits and
     /// the rounding ([`PostgreSQLTranslator::with_integer_assignments`]).
     integer_assignments: Option<std::collections::HashMap<i32, (u32, &'static str)>>,
@@ -564,11 +564,13 @@ impl PostgreSQLTranslator {
         self
     }
 
-    /// Range-checks each listed abs() as its type's: PostgreSQL's int2abs and int4abs refuse the
-    /// smallest value, 22003 'smallint out of range' or 'integer out of range', where the engine's
-    /// i64 answers it (numfuzz seed 6261), through pg_assign_int_value.
-    pub fn with_integer_abs(mut self, calls: std::collections::HashMap<i32, u32>) -> Self {
-        self.integer_abs = Some(calls);
+    /// Range-checks each listed expression (an abs(), + - * / or a prefix minus) as its type's,
+    /// smallint or integer, as PostgreSQL computes it in that width and refuses a result past it
+    /// (22003 'smallint out of range' / 'integer out of range'), where the engine's i64 answered it
+    /// (numfuzz seeds 6261, 8054, 8137), through pg_assign_int_value. Nested inside an assignment's
+    /// check at the same location, so both hold.
+    pub fn with_integer_ranges(mut self, ranges: std::collections::HashMap<i32, u32>) -> Self {
+        self.integer_ranges = Some(ranges);
         self
     }
 
@@ -3919,6 +3921,32 @@ impl PostgreSQLTranslator {
         Ok(result_columns)
     }
 
+    /// `node` translated, range-checked as its smallint or integer type when it is listed
+    /// ([`PostgreSQLTranslator::with_integer_ranges`]): pg_assign_int_value(expr, type, 'numeric'),
+    /// which passes a value within the width and refuses one past it.
+    fn translate_expr_ranged(&self, node: &pg_query::protobuf::Node) -> Result<ast::Expr, ParseError> {
+        let ranged = match node.node.as_ref() {
+            Some(pg_query::protobuf::node::Node::AExpr(_) | pg_query::protobuf::node::Node::FuncCall(_)) => {
+                self.integer_ranges.as_ref().and_then(|m| pg_location(node).and_then(|l| m.get(&l)))
+            }
+            _ => None,
+        };
+        let inner = self.translate_expr_unassigned(node)?;
+        let Some(ty) = ranged else { return Ok(inner) };
+        Ok(ast::Expr::FunctionCall {
+            name: pg_name("pg_assign_int_value"),
+            distinctness: None,
+            args: vec![
+                Box::new(inner),
+                Box::new(ast::Expr::Literal(sql_string(if *ty == 21 { "smallint" } else { "integer" }))),
+                Box::new(ast::Expr::Literal(sql_string("numeric"))),
+            ],
+            order_by: vec![],
+            within_group: vec![],
+            filter_over: ast::FunctionTail { filter_clause: None, over_clause: None },
+        })
+    }
+
     fn translate_expr(&self, node: &pg_query::protobuf::Node) -> Result<ast::Expr, ParseError> {
         if let Some((bits, kind)) = self.integer_assignments.as_ref().and_then(|m| pg_location(node).and_then(|l| m.get(&l))) {
             let name = match bits {
@@ -3926,7 +3954,7 @@ impl PostgreSQLTranslator {
                 32 => "integer",
                 _ => "bigint",
             };
-            let inner = self.translate_expr_unassigned(node)?;
+            let inner = self.translate_expr_ranged(node)?;
             return Ok(ast::Expr::FunctionCall {
                 name: pg_name("pg_assign_int_value"),
                 distinctness: None,
@@ -3937,7 +3965,7 @@ impl PostgreSQLTranslator {
             });
         }
         if let Some((precision, scale)) = self.numeric_assignments.as_ref().and_then(|m| pg_location(node).and_then(|l| m.get(&l))) {
-            let inner = self.translate_expr_unassigned(node)?;
+            let inner = self.translate_expr_ranged(node)?;
             let number = |v: i32| Box::new(ast::Expr::Literal(ast::Literal::Numeric(v.to_string())));
             return Ok(ast::Expr::FunctionCall {
                 name: pg_name("pg_assign_numeric_value"),
@@ -3948,7 +3976,7 @@ impl PostgreSQLTranslator {
                 filter_over: ast::FunctionTail { filter_clause: None, over_clause: None },
             });
         }
-        self.translate_expr_unassigned(node)
+        self.translate_expr_ranged(node)
     }
 
     /// [`PostgreSQLTranslator::translate_expr`] without an assignment's cast.
@@ -5632,32 +5660,6 @@ impl PostgreSQLTranslator {
             })
             .next_back()
             .ok_or_else(|| ParseError::ParseError("Missing function name".to_string().into()))?;
-
-        if let (Some(ty), [arg]) = (
-            self.integer_abs.as_ref().and_then(|m| m.get(&func_call.location)).filter(|_| func_name == "abs"),
-            func_call.args.as_slice(),
-        ) {
-            let abs = ast::Expr::FunctionCall {
-                name: pg_name("abs"),
-                distinctness: None,
-                args: vec![Box::new(self.translate_expr(arg)?)],
-                order_by: vec![],
-                within_group: vec![],
-                filter_over: ast::FunctionTail { filter_clause: None, over_clause: None },
-            };
-            return Ok(ast::Expr::FunctionCall {
-                name: pg_name("pg_assign_int_value"),
-                distinctness: None,
-                args: vec![
-                    Box::new(abs),
-                    Box::new(ast::Expr::Literal(sql_string(if *ty == 21 { "smallint" } else { "integer" }))),
-                    Box::new(ast::Expr::Literal(sql_string("numeric"))),
-                ],
-                order_by: vec![],
-                within_group: vec![],
-                filter_over: ast::FunctionTail { filter_clause: None, over_clause: None },
-            });
-        }
 
         if matches!(func_name.to_ascii_lowercase().as_str(), "sum" | "avg")
             && func_call.args.iter().any(is_numeric_typmod_cast)
