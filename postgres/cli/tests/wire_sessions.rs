@@ -17808,6 +17808,57 @@ fn a_float_numeric_or_boolean_column_reads_its_literal_as_its_input_routine_does
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// numfuzz seeds 5961, 5498, 4822 (artie b1d9ea5276, 1ed077342a, 4f001ce3aa): an expression's value assigned to a
+/// numeric(p, s) column is checked and rounded as PostgreSQL's assignment cast does it: numeric infinity in any form
+/// (negated, through float8, through round) and a value past the precision are 22003 'numeric field overflow', a float8
+/// is read through its shortest text and rounded to the scale (2.555 is 2.56), and NaN is stored. Infinity was stored,
+/// and an overflow was refused with the engine's longer message. Expected answers: PG 18.6, recorded (artie a8e16a651e,
+/// rec54-expression-assign-numeric/pg18-wirefuzz-an_expression_assigned_to_a_numeric_typmod_column_is_checked_as_postgresql_checks_it.out).
+#[test]
+fn an_expression_assigned_to_a_numeric_typmod_column_is_checked_as_postgresql_checks_it() {
+    let dir = Scratch::new("expression-assign-numeric");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in [
+        "CREATE TABLE en (id int PRIMARY KEY, n numeric(6,2), f float8, m numeric)",
+        "INSERT INTO en (id, f, m) VALUES (1, 2.555, 1234.5), (2, -1.005, 'Infinity')",
+    ] {
+        a.q(sql).ok(sql);
+    }
+    let mut wrong = Vec::new();
+    for sql in [
+        "UPDATE en SET n = -('Infinity'::numeric) WHERE id = 1",
+        "UPDATE en SET n = ('-Infinity'::numeric)::float8 WHERE id = 1",
+        "UPDATE en SET n = round('-Infinity'::numeric) WHERE id = 1",
+        "UPDATE en SET n = m * 1 WHERE id = 2",
+        "UPDATE en SET n = m * 1000 WHERE id = 1",
+    ] {
+        let r = a.q(sql);
+        if !r.error.as_ref().is_some_and(|e| e.code == "22003" && e.message == "numeric field overflow") {
+            wrong.push(format!("{sql}: PG 22003 'numeric field overflow'; got {:?} {:?}", r.tags, r.error));
+        }
+    }
+    for sql in [
+        "UPDATE en SET n = f * 1 WHERE id IN (1, 2)",
+        "INSERT INTO en (id, n) SELECT 3, m + 0.004 FROM en WHERE id = 1",
+        "INSERT INTO en (id, n) SELECT 4, 'NaN'::numeric * 1",
+    ] {
+        let r = a.q(sql);
+        if r.error.is_some() {
+            wrong.push(format!("{sql}: PG succeeds; got {:?}", r.error));
+        }
+    }
+    let r = a.q("SELECT id, n FROM en ORDER BY id");
+    let want: Vec<Vec<Option<String>>> = [["1", "2.56"], ["2", "-1.01"], ["3", "1234.50"], ["4", "NaN"]]
+        .iter()
+        .map(|row| row.iter().map(|v| Some(v.to_string())).collect())
+        .collect();
+    if r.error.is_some() || r.rows != want {
+        wrong.push(format!("SELECT: PG {want:?}; got {:?} {:?}", r.rows, r.error));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// numfuzz seeds 4703, 3659 (artie f1fec7d3cc, 77b6087556), PGDIV-INT-RANGE's "an expression's value assigned to one is
 /// not (the engine stores it)": an expression's value assigned to a smallint, integer or bigint column is cast as
 /// PostgreSQL's assignment cast casts it, on INSERT ... SELECT and UPDATE: a numeric rounds half away from zero, a
