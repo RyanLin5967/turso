@@ -17797,6 +17797,35 @@ fn a_float_numeric_or_boolean_column_reads_its_literal_as_its_input_routine_does
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// The lead's ruling (LEAD-RULINGS 9d87841628), the condition on dd348f3dd: 'NaN' into a double precision or real column
+/// (PostgreSQL stores NaN; the engine's REAL stores none) is refused loudly, never stored as NULL, 0 or a number, on
+/// every assignment path, and an existing row keeps its value.
+#[test]
+fn nan_into_a_float_column_is_refused_never_stored_otherwise() {
+    let dir = Scratch::new("nan-refused");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in ["CREATE TABLE fn (id int PRIMARY KEY, d double precision, r real)", "INSERT INTO fn VALUES (1, 1.5, 2.5)"] {
+        a.q(sql).ok(sql);
+    }
+    for sql in [
+        "INSERT INTO fn (id, d) VALUES (2, 'NaN')",
+        "INSERT INTO fn (id, r) VALUES (3, ' nan ')",
+        "INSERT INTO fn (id, d) SELECT 4, 'NaN'",
+        "UPDATE fn SET d = 'NaN' WHERE id = 1",
+        "INSERT INTO fn (id, d) VALUES (1, 0) ON CONFLICT (id) DO UPDATE SET d = 'NaN'",
+    ] {
+        let r = a.q(sql);
+        assert!(r.error.is_some(), "{sql} was not refused: {:?}", r.tags);
+    }
+    let r = a.q("SELECT id, d, r FROM fn ORDER BY id");
+    assert_eq!(
+        r.rows,
+        vec![vec![Some("1".to_string()), Some("1.5".to_string()), Some("2.5".to_string())]],
+        "a NaN assignment left a row or changed one"
+    );
+}
+
 /// The lead's ruling (LEAD-RULINGS 0fac7e134e), the condition on 8f49aa6f1: ALTER COLUMN SET DEFAULT, which this server
 /// does not implement, is refused loudly, 0A000, and changes nothing: the column keeps its default (none) and an
 /// INSERT omitting it stores NULL.
