@@ -30,6 +30,7 @@ pub(crate) fn resolve_scalar(name: &str, arg_count: usize) -> bool {
         | "encode" | "bpcharlt" | "pg_text_int" | "pg_assign_int" => &[2],
         "pg_round_even" => &[1],
         "pg_float_text" | "pg_numeric_mod" => &[2],
+        "pg_assign_int_value" => &[3],
         "version" | "current_database" | "current_schema" | "pg_backend_pid" => &[0],
         "now" | "transaction_timestamp" | "statement_timestamp" => &[0],
         "make_date" => &[3],
@@ -128,6 +129,51 @@ pub(crate) fn exec_scalar(conn: &Connection, name: &str, args: &[Value]) -> Resu
                     (Ok(n), Ok(d)) => Value::from_f64(n % d),
                     _ => Value::Null,
                 }),
+            }
+        }
+        // An expression's value assigned to an integer column, cast as PostgreSQL's assignment cast
+        // casts it: an integer range-checked, a float or decimal text rounded ("numeric" half away
+        // from zero, "float" half to even) and range-checked, 22003 '<type> out of range' past the
+        // column; a numeric NaN or infinity 0A000, a float one 22003, as PostgreSQL refuses them.
+        // Written by the translator (its with_integer_assignments). Any other value passes.
+        "pg_assign_int_value" => {
+            let name = text_arg(1);
+            let numeric = text_arg(2) != "float";
+            let limit: i128 = match name.as_str() {
+                "smallint" => 1 << 15,
+                "integer" => 1 << 31,
+                _ => 1 << 63,
+            };
+            let out_of_range = || LimboError::Constraint(SqlErrorMessage::classified(SqlErrorKind::NumericValueOutOfRange, format!("{name} out of range")));
+            let float = |f: f64| -> turso_core::Result<Value> {
+                if !f.is_finite() {
+                    return Err(if numeric {
+                        LimboError::Constraint(SqlErrorMessage::classified(SqlErrorKind::FeatureNotSupported, format!("cannot convert {} to {name}", if f.is_nan() { "NaN" } else { "infinity" })))
+                    } else {
+                        out_of_range()
+                    });
+                }
+                let rounded = if numeric { f.round() } else { f.round_ties_even() };
+                if rounded < -(limit as f64) || rounded >= limit as f64 {
+                    return Err(out_of_range());
+                }
+                Ok(Value::from_i64(rounded as i64))
+            };
+            match args.first() {
+                Some(Value::Numeric(turso_core::Numeric::Integer(i))) => {
+                    let v = i128::from(*i);
+                    if v < -limit || v >= limit {
+                        return Err(out_of_range());
+                    }
+                    Ok(Value::from_i64(*i))
+                }
+                Some(Value::Numeric(turso_core::Numeric::Float(f))) => float(f64::from(*f)),
+                Some(Value::Text(t)) => match t.as_str().trim().parse::<f64>() {
+                    Ok(f) => float(f),
+                    Err(_) => Ok(Value::Text(t.clone())),
+                },
+                Some(other) => Ok(other.clone()),
+                None => Ok(Value::Null),
             }
         }
         "pg_text_int" => match args.first() {

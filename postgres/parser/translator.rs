@@ -259,6 +259,9 @@ pub struct PostgreSQLTranslator {
     float_texts: Option<std::collections::HashMap<i32, u32>>,
     /// The % over a numeric, by their parse locations ([`PostgreSQLTranslator::with_numeric_mods`]).
     numeric_mods: Option<std::collections::HashSet<i32>>,
+    /// The expressions assigned to integer columns, by their parse locations: the column's bits and
+    /// the rounding ([`PostgreSQLTranslator::with_integer_assignments`]).
+    integer_assignments: Option<std::collections::HashMap<i32, (u32, &'static str)>>,
     /// The string and numeric literals (by their parse locations) the caller read as an integer
     /// column's assignment reads them ([`PostgreSQLTranslator::with_integer_literals`]): written as
     /// the value as a number, which the engine's integer column and a domain over one take ('0x1F'
@@ -536,6 +539,16 @@ impl PostgreSQLTranslator {
     /// Computes each listed % as PostgreSQL's numeric remainder through pg_numeric_mod (a fraction,
     /// the dividend's sign, 22012 for a zero divisor), where the engine's % reads both sides as
     /// integers (numfuzz seeds 4703, 5316; recorded, rec52-numeric-modulo).
+    /// Casts each listed expression's value as PostgreSQL's assignment cast to its integer column
+    /// casts it, through pg_assign_int_value: rounded ("numeric" half away from zero, "float" half to
+    /// even) and range-checked (22003 with the column type's message; NaN and infinity as PostgreSQL
+    /// refuses them), where the engine refused a REAL or stored a value past a smallint (recorded,
+    /// rec53-expression-assign-int).
+    pub fn with_integer_assignments(mut self, assignments: std::collections::HashMap<i32, (u32, &'static str)>) -> Self {
+        self.integer_assignments = Some(assignments);
+        self
+    }
+
     pub fn with_numeric_mods(mut self, mods: std::collections::HashSet<i32>) -> Self {
         self.numeric_mods = Some(mods);
         self
@@ -3829,6 +3842,27 @@ impl PostgreSQLTranslator {
     }
 
     fn translate_expr(&self, node: &pg_query::protobuf::Node) -> Result<ast::Expr, ParseError> {
+        if let Some((bits, kind)) = self.integer_assignments.as_ref().and_then(|m| pg_location(node).and_then(|l| m.get(&l))) {
+            let name = match bits {
+                16 => "smallint",
+                32 => "integer",
+                _ => "bigint",
+            };
+            let inner = self.translate_expr_unassigned(node)?;
+            return Ok(ast::Expr::FunctionCall {
+                name: pg_name("pg_assign_int_value"),
+                distinctness: None,
+                args: vec![Box::new(inner), Box::new(ast::Expr::Literal(sql_string(name))), Box::new(ast::Expr::Literal(sql_string(kind)))],
+                order_by: vec![],
+                within_group: vec![],
+                filter_over: ast::FunctionTail { filter_clause: None, over_clause: None },
+            });
+        }
+        self.translate_expr_unassigned(node)
+    }
+
+    /// [`PostgreSQLTranslator::translate_expr`] without an assignment's cast.
+    fn translate_expr_unassigned(&self, node: &pg_query::protobuf::Node) -> Result<ast::Expr, ParseError> {
         match &node.node {
             Some(pg_query::protobuf::node::Node::ColumnRef(col_ref)) => {
                 if let Some((table, _)) = self.series_column(col_ref)? {

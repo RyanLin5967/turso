@@ -640,7 +640,7 @@ fn refuse_long_decimals(
     // seed 622 at 45de98440). One within it is exempt: literal_assignments reads it exactly and the
     // translator writes its value, never a float (the lead's ruling LEAD-RULINGS 82dcec6b66, for
     // integer columns on its paths alone; recorded, rec34-long-decimal-integer, artie afd9557309).
-    let (integer, _, _) = literal_assignments(pg_conn, parse).map_err(LimboError::InvalidArgument)?;
+    let (integer, _, _, _) = literal_assignments(pg_conn, parse).map_err(LimboError::InvalidArgument)?;
     let (default_values, deferred_defaults) = default_coercions(parse).map_err(LimboError::InvalidArgument)?;
     let mut exempt = float_target_literals(pg_conn, parse);
     exempt.extend(integer.keys().chain(default_values.keys()).chain(deferred_defaults.keys()).filter_map(|l| usize::try_from(*l).ok()));
@@ -2376,7 +2376,7 @@ pub(crate) fn session_translation(
     let (rounding, float_texts, numeric_mods) = cast_walk(pg_conn, parse_result).map_err(LimboError::InvalidArgument)?;
     // Each value assigned to a column is coerced as parse analysis coerces it, here so the
     // re-prepare judges it alike; a literal an integer column reads is written as its value.
-    let (integer_literals, text_literals, float_literals) = literal_assignments(pg_conn, parse_result).map_err(LimboError::InvalidArgument)?;
+    let (integer_literals, text_literals, float_literals, int_assignments) = literal_assignments(pg_conn, parse_result).map_err(LimboError::InvalidArgument)?;
     // ... and a CREATE TABLE's or ADD COLUMN's DEFAULT as DDL coerces it: its refusals here, its
     // values by the translator itself (integer_default), since the table's text is translated
     // again at each schema load.
@@ -2388,6 +2388,7 @@ pub(crate) fn session_translation(
         let t = if rounding.is_empty() { t } else { t.with_integer_cast_rounding(rounding.clone()) };
         let t = if float_texts.is_empty() { t } else { t.with_float_texts(float_texts.clone()) };
         let t = if numeric_mods.is_empty() { t } else { t.with_numeric_mods(numeric_mods.clone()) };
+        let t = if int_assignments.is_empty() { t } else { t.with_integer_assignments(int_assignments.clone()) };
         let t = if text_literals.is_empty() { t } else { t.with_text_literals(text_literals.clone()) };
         let t = if float_literals.is_empty() { t } else { t.with_float_literals(float_literals.clone()) };
         if integer_literals.is_empty() { t } else { t.with_integer_literals(integer_literals.clone()) }
@@ -2448,6 +2449,73 @@ pub(crate) fn session_translation(
     }
     reject_catalog_dml(translated.cmd.stmt())?;
     Ok(translated)
+}
+
+/// What [`literal_assignments`] gives the translator: the integer, text and float literal rewrites,
+/// and the expressions assigned to integer columns ([`integer_assignment`]).
+type LiteralAssignments = (
+    std::collections::HashMap<i32, i64>,
+    std::collections::HashMap<i32, String>,
+    std::collections::HashMap<i32, f64>,
+    std::collections::HashMap<i32, (u32, &'static str)>,
+);
+
+/// The location and rounding ("numeric": half away from zero, "float": half to even) of an
+/// expression assigned to an integer column of `bits`: an operator, a function call, a cast of a
+/// non-constant, or a column of a wider or non-integer type. None for a constant, a constant's
+/// cast or a parameter, which are judged where they are read, and for a column that fits. The
+/// rounding is the expression's own type's: float when a float column or a float cast takes part,
+/// numeric otherwise. BLIND SPOT: an expression mixing both rounds as a float, and the engine holds
+/// either as its REAL, so only a value exactly halfway can differ from PostgreSQL's.
+fn integer_assignment(value: &turso_pg_parser::pg_query::protobuf::Node, bits: u32, source: &StringSource) -> Option<(i32, &'static str)> {
+    use turso_pg_parser::pg_query::protobuf::node::Node;
+    let column_type = |r: &turso_pg_parser::pg_query::protobuf::ColumnRef| -> Option<String> {
+        let (table, name, alias) = source.as_ref()?;
+        let fields: Vec<&str> = r.fields.iter().map(|f| match &f.node {
+            Some(Node::String(s)) => Some(s.sval.as_str()),
+            _ => None,
+        }).collect::<Option<Vec<_>>>()?;
+        let column = match fields.as_slice() {
+            [c] => *c,
+            [q, c] if q.eq_ignore_ascii_case(alias) || q.eq_ignore_ascii_case(name) => *c,
+            _ => return None,
+        };
+        table.get_column(column).map(|(_, c)| c.ty_str.clone())
+    };
+    fn float_leaf(node: &turso_pg_parser::pg_query::protobuf::Node, column_type: &dyn Fn(&turso_pg_parser::pg_query::protobuf::ColumnRef) -> Option<String>) -> bool {
+        match node.node.as_ref() {
+            Some(Node::ColumnRef(r)) => column_type(r).is_some_and(|t| matches!(crate::catalog::sqlite_type_to_pg_oid(&t), 700 | 701)),
+            Some(Node::TypeCast(c)) => {
+                c.type_name.as_ref().and_then(|t| t.names.last()).is_some_and(|n| matches!(&n.node, Some(Node::String(s)) if s.sval == "float8" || s.sval == "float4"))
+                    || c.arg.as_deref().is_some_and(|a| float_leaf(a, column_type))
+            }
+            Some(Node::AExpr(e)) => e.lexpr.as_deref().is_some_and(|l| float_leaf(l, column_type)) || e.rexpr.as_deref().is_some_and(|r| float_leaf(r, column_type)),
+            Some(Node::FuncCall(f)) => f.args.iter().any(|a| float_leaf(a, column_type)),
+            _ => false,
+        }
+    }
+    let location = match value.node.as_ref()? {
+        Node::AExpr(e) => e.location,
+        Node::FuncCall(f) => f.location,
+        Node::TypeCast(c) if !matches!(c.arg.as_deref().and_then(|a| a.node.as_ref()), Some(Node::AConst(_))) => c.location,
+        Node::ColumnRef(r) => {
+            let fits = column_type(r).is_some_and(|t| {
+                let source_bits = match crate::catalog::sqlite_type_to_pg_oid(&t) {
+                    21 => 16,
+                    23 => 32,
+                    20 => 64,
+                    _ => 0,
+                };
+                source_bits > 0 && source_bits <= bits
+            });
+            if fits {
+                return None;
+            }
+            r.location
+        }
+        _ => return None,
+    };
+    (location >= 0).then(|| (location, if float_leaf(value, &column_type) { "float" } else { "numeric" }))
 }
 
 /// The relation a value's column reference reads, with the names it is known by ([`string_type`]).
@@ -2805,25 +2873,25 @@ fn resolves_to_main(pg_conn: &PgConnectionInner, relation: &turso_pg_parser::pg_
 fn literal_assignments(
     pg_conn: &PgConnectionInner,
     parse: &turso_pg_parser::pg_query::ParseResult,
-) -> Result<(std::collections::HashMap<i32, i64>, std::collections::HashMap<i32, String>, std::collections::HashMap<i32, f64>), SqlErrorMessage> {
+) -> Result<LiteralAssignments, SqlErrorMessage> {
     use turso_pg_parser::pg_query::protobuf::node::Node;
     use turso_pg_parser::pg_query::protobuf::{a_const::Val, Node as PgNode};
     let mut rewrites = std::collections::HashMap::new();
     // String literals rewritten as other text: an integer array's canonical elements.
     let mut text_rewrites: std::collections::HashMap<i32, String> = std::collections::HashMap::new();
     let Some(stmt) = parse.protobuf.stmts.first().and_then(|r| r.stmt.as_ref()).and_then(|s| s.node.as_ref()) else {
-        return Ok((rewrites, text_rewrites, Default::default()));
+        return Ok((rewrites, text_rewrites, Default::default(), Default::default()));
     };
     let relation = match stmt {
         Node::InsertStmt(i) => i.relation.as_ref(),
         Node::UpdateStmt(u) => u.relation.as_ref(),
-        _ => return Ok((rewrites, text_rewrites, Default::default())),
+        _ => return Ok((rewrites, text_rewrites, Default::default(), Default::default())),
     };
     let Some(relation) = relation.filter(|r| resolves_to_main(pg_conn, r)) else {
-        return Ok((rewrites, text_rewrites, Default::default()));
+        return Ok((rewrites, text_rewrites, Default::default(), Default::default()));
     };
     let schema = pg_conn.conn.current_schema();
-    let Some(table) = schema.get_btree_table(&relation.relname) else { return Ok((rewrites, text_rewrites, Default::default())) };
+    let Some(table) = schema.get_btree_table(&relation.relname) else { return Ok((rewrites, text_rewrites, Default::default(), Default::default())) };
     // An integer column's width from its declared type, read without allocating.
     let integer_bits = |ty: &str| -> u32 {
         let base = ty.split('(').next().unwrap_or("").trim();
@@ -2966,6 +3034,9 @@ fn literal_assignments(
         Some((target, typmods, text))
     };
     let mut float_rewrites: std::collections::HashMap<i32, f64> = std::collections::HashMap::new();
+    // Each expression assigned to an integer column: its location, the column's bits and the
+    // rounding its type takes ([`integer_assignment`]).
+    let mut int_assignments: std::collections::HashMap<i32, (u32, &'static str)> = std::collections::HashMap::new();
     // A set operation's branch constants written as their value, applied once coerce is done.
     let mut setop_rewrites: Vec<(i32, i64)> = Vec::new();
     // The relation a value's column reference reads, with the names it is known by: an UPDATE's
@@ -3007,6 +3078,14 @@ fn literal_assignments(
                         ),
                     ));
                 }
+            }
+        }
+        // An expression's value assigned to an integer column is cast as PostgreSQL's assignment
+        // cast casts it (rec53, numfuzz seeds 4703, 3659): written by the translator through
+        // pg_assign_int_value, which rounds and range-checks each value.
+        if let Some(bits) = column_type(column).map(|t| integer_bits(&t)).filter(|b| *b > 0) {
+            if let Some(assignment) = integer_assignment(value, bits, &source) {
+                int_assignments.insert(assignment.0, (bits, assignment.1));
             }
         }
         // A numeric NaN or Infinity cast into an integer column: 0A000 (rec42; numfuzz seed 2436).
@@ -3510,7 +3589,7 @@ fn literal_assignments(
     }
     drop(coerce);
     rewrites.extend(setop_rewrites);
-    Ok((rewrites, text_rewrites, float_rewrites))
+    Ok((rewrites, text_rewrites, float_rewrites, int_assignments))
 }
 
 /// A constant cast's own value, as the planner folds it before an integer column's assignment
