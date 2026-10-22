@@ -391,7 +391,12 @@ pub struct HashDistinctData {
     pub key_start_reg: usize,
     pub num_keys: usize,
     pub collations: Vec<CollationSeq>,
+    /// A key the table already holds jumps here.
     pub target_pc: BranchOffset,
+    /// The key that fills the table jumps here, to open the ephemeral index and look it up there.
+    pub open_pc: BranchOffset,
+    /// A key a full table does not hold jumps here, to look it up in the ephemeral index.
+    pub tree_pc: BranchOffset,
 }
 
 // There are currently 190 opcodes in sqlite

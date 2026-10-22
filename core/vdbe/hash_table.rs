@@ -190,6 +190,18 @@ fn keys_equal_distinct(key1: &[Value], key2: &[ValueRef], collations: &[Collatio
     true
 }
 
+/// What [HashTable::insert_distinct] did with a key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DistinctInsert {
+    /// The key was new and the table now holds it.
+    New,
+    /// The table already holds the key.
+    Duplicate,
+    /// The table does not hold the key and is full: the caller looks the key up in its ephemeral
+    /// index. `first` is the call that filled the table, when the caller opens that index.
+    Overflow { first: bool },
+}
+
 /// State machine states for hash table operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HashTableState {
@@ -1000,6 +1012,9 @@ pub struct HashTable {
     probe_spill_state: Option<ProbeSpillState>,
     /// Grace processing state machine.
     grace_state: Option<GraceState>,
+    /// A DISTINCT table at its budget: it holds its keys and takes no more (see
+    /// [HashTable::insert_distinct]).
+    distinct_full: bool,
 }
 
 crate::assert::assert_send!(HashTable);
@@ -1092,6 +1107,7 @@ impl HashTable {
             partition_count_override: config.partition_count,
             probe_spill_state: None,
             grace_state: None,
+            distinct_full: false,
         })
     }
 
@@ -1255,108 +1271,45 @@ impl HashTable {
         Ok(HashInsertResult::Done)
     }
 
-    /// Insert keys into the hash table if not already present.
-    /// Returns true if inserted, false if duplicate found.
-    /// Unlike hash join inserts, DISTINCT keeps NULLs and treats NULL==NULL.
-    pub fn insert_distinct(
-        &mut self,
-        key_values: &[Value],
-        key_refs: &[ValueRef],
-        mut metrics: Option<&mut HashJoinMetrics>,
-    ) -> Result<IOResult<bool>> {
+    /// Insert keys into the hash table if not already present. Unlike hash join inserts, DISTINCT
+    /// keeps NULLs and treats NULL==NULL.
+    ///
+    /// A DISTINCT table never spills. Hash partitions answer "is this key new?" only by loading
+    /// the key's whole partition, so past the budget every new key read its partition from disk
+    /// (fastest-engine probe artie 02c8ff3f8d: 603 MB read for 30000 keys over a 32 KiB budget).
+    /// At the budget the table is FULL instead: it keeps every key it holds and takes no more, and
+    /// each later key it does not hold is the caller's to look up in an ephemeral b-tree index
+    /// ([DistinctInsert::Overflow]), SQLite's structure for DISTINCT, whose lookups read pages, not
+    /// partitions. A key is in at most one of the two: the table is consulted first and never
+    /// grows once full. [HashTable::clear] empties it and makes it not full.
+    pub fn insert_distinct(&mut self, key_values: &[Value], key_refs: &[ValueRef]) -> Result<DistinctInsert> {
         turso_assert!(
-            self.state == HashTableState::Building || self.state == HashTableState::Spilled,
+            self.state == HashTableState::Building,
             "Cannot insert_distinct into hash table in unexpected state",
             { "state": format!("{:?}", self.state) }
         );
 
-        let hash = hash_join_key(key_refs, &self.collations);
-
-        if self.spill_state.is_some() {
-            let partition_idx = self.partition_index(hash);
-            // Check partition buffer for duplicates
-            let has_buffer_dup = {
-                let spill_state = self.spill_state.as_ref().expect("spill state exists");
-                let buffer = &spill_state.partition_buffers[partition_idx];
-                buffer.entries.iter().any(|entry| {
-                    entry.hash == hash
-                        && keys_equal_distinct(&entry.key_values, key_refs, &self.collations)
-                })
-            };
-            if has_buffer_dup {
-                return Ok(IOResult::Done(false));
-            }
-
-            // Ensure spilled partition is loaded before checking
-            let has_partition = {
-                let spill_state = self.spill_state.as_ref().expect("spill state exists");
-                spill_state.find_partition(partition_idx).is_some()
-            };
-            if has_partition && !self.is_partition_loaded(partition_idx) {
-                return_if_io!(self.load_spilled_partition(partition_idx, metrics.as_deref_mut()));
-            }
-
-            // Check loaded partition for duplicates
-            let has_spilled_dup = 'has_spilled_dup: {
-                let spill_state = self.spill_state.as_ref().expect("spill state exists");
-                let Some(partition) = spill_state.find_partition(partition_idx) else {
-                    break 'has_spilled_dup false;
-                };
-                if partition.buckets.is_empty() {
-                    break 'has_spilled_dup false;
-                }
-                let bucket_idx = (hash as usize) % partition.buckets.len();
-                let bucket = &partition.buckets[bucket_idx];
-                bucket.entries.iter().any(|entry| {
-                    entry.hash == hash
-                        && keys_equal_distinct(&entry.key_values, key_refs, &self.collations)
-                })
-            };
-            if has_spilled_dup {
-                return Ok(IOResult::Done(false));
-            }
-
-            let entry_size = HashEntry::size_from_values(key_values, &[]);
-            if let Some(c) = self.spill_partitions_for_entry(entry_size, metrics.as_deref_mut())? {
-                if !c.succeeded() {
-                    return Ok(IOResult::IO(IOCompletions(c)));
-                }
-            }
-
-            {
-                let spill_state = self.spill_state.as_mut().expect("spill state exists");
-                spill_state.partition_buffers[partition_idx].insert(HashEntry::new(
-                    hash,
-                    key_values.iter().cloned().try_collect()?,
-                    0,
-                ))?;
-            }
-            self.num_entries += 1;
-            self.mem_used += entry_size;
-            return Ok(IOResult::Done(true));
+        if self.distinct_full && crate::branch::store::fe_mutant("distinct_full_skips_table") {
+            return Ok(DistinctInsert::Overflow { first: false });
         }
-
-        // Non-spilled mode: check main buckets
+        let hash = hash_join_key(key_refs, &self.collations);
         let bucket_idx = (hash as usize) % self.buckets.len();
         let bucket = &self.buckets[bucket_idx];
         for entry in &bucket.entries {
             if entry.hash == hash
                 && keys_equal_distinct(&entry.key_values, key_refs, &self.collations)
             {
-                return Ok(IOResult::Done(false));
+                return Ok(DistinctInsert::Duplicate);
             }
         }
 
+        if self.distinct_full {
+            return Ok(DistinctInsert::Overflow { first: false });
+        }
         let entry_size = HashEntry::size_from_values(key_values, &[]);
         if self.mem_used + entry_size > self.mem_budget {
-            if self.spill_state.is_none() {
-                let partition_count = self.choose_partition_count(entry_size);
-                let partitioning = Partitioning::new(partition_count);
-                self.spill_state = Some(SpillState::new(&self.io, self.temp_store, partitioning)?);
-                self.redistribute_to_partitions()?;
-                self.state = HashTableState::Spilled;
-            }
-            return self.insert_distinct(key_values, key_refs, metrics);
+            self.distinct_full = true;
+            return Ok(DistinctInsert::Overflow { first: true });
         }
 
         if self.buckets[bucket_idx].entries.is_empty() {
@@ -1369,11 +1322,14 @@ impl HashTable {
         ))?;
         self.num_entries += 1;
         self.mem_used += entry_size;
-        Ok(IOResult::Done(true))
+        Ok(DistinctInsert::New)
     }
 
     /// Clear all entries and reset spill state.
     pub fn clear(&mut self) -> Result<()> {
+        if !crate::branch::store::fe_mutant("distinct_full_survives_clear") {
+            self.distinct_full = false;
+        }
         if self.num_entries == 0 && self.spill_state.is_none() {
             self.state = HashTableState::Building;
             self.current_probe_keys = None;
@@ -3402,6 +3358,66 @@ mod hashtests {
             }
         }
         assert!(wrong.is_empty(), "CLAIM: at most a page (4096 bytes) per row: {wrong:?}");
+    }
+
+    /// The two tiers of a DISTINCT past its budget (the full hash table, then the ephemeral index)
+    /// count each key once: keys the table holds repeat after it fills, a NULL, an integer and its
+    /// REAL, and two spellings under NOCASE each meet their first occurrence in the other tier, and
+    /// a GROUP BY's next group starts both tiers empty. Answers by hand (SQLite's DISTINCT: NULLs
+    /// equal, 1 = 1.0). Kills `distinct_full_skips_table` (the repeats counted twice) and
+    /// `distinct_full_survives_clear` (group 1 finds group 0's keys in the index).
+    #[test]
+    fn a_distinct_past_the_budget_counts_each_key_once_across_both_tiers() {
+        assert!(
+            DEFAULT_MEM_BUDGET < 3000 * 8,
+            "premise: 3000 distinct keys exceed the hash budget ({DEFAULT_MEM_BUDGET} bytes; a debug build's)"
+        );
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let db = crate::Database::open_file_with_flags(
+            io,
+            ":memory:",
+            crate::OpenFlags::Create,
+            crate::DatabaseOpts::new(),
+            None,
+            Arc::new(crate::SqliteDialect),
+        )
+        .unwrap();
+        let conn = db.connect().unwrap();
+        let cases: [(&str, &str); 6] = [
+            ("SELECT count(DISTINCT value % 5000) FROM generate_series(1, 30000)", "5000"),
+            ("SELECT count(*) FROM (SELECT DISTINCT value % 7000 FROM generate_series(1, 30000))", "7000"),
+            (
+                "SELECT count(*) FROM (SELECT DISTINCT CASE WHEN value > 20000 THEN NULL ELSE value END \
+                 FROM generate_series(1, 30000))",
+                "20001",
+            ),
+            (
+                "SELECT count(DISTINCT CASE WHEN value <= 15000 THEN value % 5000 ELSE (value % 5000) * 1.0 END) \
+                 FROM generate_series(1, 30000)",
+                "5000",
+            ),
+            (
+                "SELECT count(*) FROM (SELECT DISTINCT t COLLATE NOCASE FROM (SELECT CASE WHEN value <= 15000 \
+                 THEN 'k' ELSE 'K' END || (value % 4000) AS t FROM generate_series(1, 30000)))",
+                "4000",
+            ),
+            (
+                "SELECT group_concat(n, ',') FROM (SELECT g, count(DISTINCT v) AS n FROM (SELECT value % 3 AS g, \
+                 value / 3 AS v FROM generate_series(0, 29999)) GROUP BY g ORDER BY g)",
+                "10000,10000,10000",
+            ),
+        ];
+        let mut wrong = Vec::new();
+        for (sql, want) in cases {
+            let got = conn
+                .prepare(sql)
+                .and_then(|mut stmt| stmt.run_collect_rows())
+                .map(|rows| rows[0][0].to_string());
+            if got.as_deref().ok() != Some(want) {
+                wrong.push(format!("{sql}: {got:?}, want {want}"));
+            }
+        }
+        assert!(wrong.is_empty(), "CLAIM: each key counted once across both tiers: {wrong:#?}");
     }
 
     #[test]
