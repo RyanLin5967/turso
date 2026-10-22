@@ -2497,13 +2497,56 @@ fn text_integer_casts(
 /// half away from zero and range-checked (22003 'integer out of range'); a cast to a string type
 /// to a numeric or boolean column is 42804. Returns the literals whose spelling the engine's
 /// integer column does not read ('0x1F', '1_000', ' 7', 1.5), by parse location, with their values.
-/// Every INSERT and UPDATE passes here, so nothing is allocated per value. BLIND SPOTS: a
-/// schema-qualified or attached table, an array or domain column, a column of another relation or
+/// Every INSERT and UPDATE passes here, so nothing is allocated per value. BLIND SPOTS: an
+/// attached schema's table ([`resolves_to_main`]), an array or domain column, a column of another relation or
 /// an expression of a string type (upper('x')), a negated or hexadecimal constant, a set
 /// operation's branches, a DEFAULT, and a literal to a float or boolean column (stored as the
 /// engine reads it). A constant to a numeric(p, s) column past it is 22003 'numeric field
 /// overflow', and an INSERT ... SELECT's targets are judged as VALUES items are (numfuzz seeds
 /// 1442, 1600 at 1d8a8b230; recorded, rec33-assign-numeric-select, artie 555adcffb6).
+/// Whether an INSERT's or UPDATE's relation is main's table, resolved as the engine resolves it:
+/// public or main by name; unqualified, a temp table first, then the search path's entries in order
+/// (public is main, another is an attached schema; with no path, main first), the first holding
+/// the name deciding, a view there included (the engine's own resolver, which answers None for one,
+/// is asked last). literal_assignments judges main's tables alone: under search_path s, public an
+/// unqualified t is s.t (recorded, rec38-search-path-assign, artie 8d9065d8e9), and it judged
+/// public.t. BLIND SPOT: an attached schema's table, whose declared types no public core accessor
+/// gives (its column names alone), is not judged.
+fn resolves_to_main(pg_conn: &PgConnectionInner, relation: &turso_pg_parser::pg_query::protobuf::RangeVar) -> bool {
+    use turso_pg_parser::SchemaQualifier;
+    let conn = &pg_conn.conn;
+    let table = relation.relname.as_str();
+    if !relation.catalogname.is_empty() {
+        return false;
+    }
+    match turso_pg_parser::schema_qualifier(&relation.schemaname) {
+        SchemaQualifier::Main => true,
+        SchemaQualifier::Unqualified => {
+            if conn.resident_table_columns("temp", table).is_some() {
+                return false;
+            }
+            let path = written_search_path(pg_conn);
+            let main_holds = || conn.current_schema().get_btree_table(table).is_some() && conn.resident_unqualified_table_columns(table, &path).is_some();
+            // With no path the engine reads main after temp, and main cannot hold a view and a
+            // table of one name: no resolver call (which allocates) on the common INSERT.
+            if path.is_empty() {
+                return conn.current_schema().get_btree_table(table).is_some();
+            }
+            let attached = conn.attached_database_names();
+            for entry in &path {
+                if entry == "public" || entry == "main" {
+                    return main_holds();
+                }
+                if attached.iter().any(|a| a == entry) && conn.resident_table_columns(entry, table).is_some() {
+                    return false;
+                }
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
 fn literal_assignments(
     pg_conn: &PgConnectionInner,
     parse: &turso_pg_parser::pg_query::ParseResult,
@@ -2519,7 +2562,7 @@ fn literal_assignments(
         Node::UpdateStmt(u) => u.relation.as_ref(),
         _ => return Ok(rewrites),
     };
-    let Some(relation) = relation.filter(|r| r.schemaname.is_empty() || r.schemaname.eq_ignore_ascii_case("public")) else {
+    let Some(relation) = relation.filter(|r| resolves_to_main(pg_conn, r)) else {
         return Ok(rewrites);
     };
     let schema = pg_conn.conn.current_schema();
