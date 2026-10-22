@@ -17797,6 +17797,60 @@ fn a_float_numeric_or_boolean_column_reads_its_literal_as_its_input_routine_does
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// The lead's ruling (LEAD-RULINGS 9d87841628, 3): an INSERT ... SELECT whose query is a set operation is coerced to
+/// its columns after the branches' types resolve together: untyped literals in every branch resolve to text (42804),
+/// a string-typed branch makes the column text, and a constant past the column in a UNION of constant branches is
+/// 22003, while a non-integral one rounds. Expected answers: PG 18.6, recorded (artie afc7757a41,
+/// rec45-setop-assign/pg18-wirefuzz-a_set_operation_assigned_to_a_column_is_coerced_after_its_branches_resolve.out).
+#[test]
+fn a_set_operation_assigned_to_a_column_is_coerced_after_its_branches_resolve() {
+    let dir = Scratch::new("setop-assign");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let ddl = "CREATE TABLE so (id int PRIMARY KEY, b int, s smallint, t text)";
+    a.q(ddl).ok(ddl);
+    let text = r#"column "b" is of type integer but expression is of type text"#;
+    let mut wrong = Vec::new();
+    for (sql, code, message) in [
+        ("INSERT INTO so (id, b) SELECT 1, '5' UNION SELECT 2, '6'", "42804", text),
+        ("INSERT INTO so (id, b) SELECT 1, 5 UNION ALL SELECT 2, 3000000000", "22003", "integer out of range"),
+        ("INSERT INTO so (id, s) SELECT 1, 40000 UNION SELECT 2, 1", "22003", "smallint out of range"),
+        ("INSERT INTO so (id, b) SELECT 3, 2.5 UNION ALL SELECT 4, 3.5", "", ""),
+        ("INSERT INTO so (id, b) SELECT 5, 'x' INTERSECT SELECT 5, 'x'", "42804", text),
+        ("INSERT INTO so (id, b) SELECT 6, 7 EXCEPT SELECT 8, 9", "", ""),
+        ("INSERT INTO so (id, b) SELECT 7, upper('x') UNION SELECT 8, 'y'", "42804", text),
+        ("INSERT INTO so (id, t) SELECT 9, 1 UNION SELECT 10, 2", "", ""),
+        ("INSERT INTO so (id, b) SELECT 11, '0x1F'::int UNION SELECT 12, 1", "", ""),
+    ] {
+        let r = a.q(sql);
+        let fine = if code.is_empty() {
+            r.error.is_none()
+        } else {
+            r.error.as_ref().is_some_and(|e| e.code == code && e.message == message)
+        };
+        if !fine {
+            wrong.push(format!("{sql}: PG {code:?} {message:?}; got {:?} {:?}", r.tags, r.error));
+        }
+    }
+    let r = a.q("SELECT id, b, s, t FROM so ORDER BY id");
+    let want: Vec<Vec<Option<String>>> = [
+        ["3", "3", "", ""],
+        ["4", "4", "", ""],
+        ["6", "7", "", ""],
+        ["9", "", "", "1"],
+        ["10", "", "", "2"],
+        ["11", "31", "", ""],
+        ["12", "1", "", ""],
+    ]
+    .iter()
+    .map(|row| row.iter().map(|v| (!v.is_empty()).then(|| v.to_string())).collect())
+    .collect();
+    if r.error.is_some() || r.rows != want {
+        wrong.push(format!("SELECT: PG {want:?}; got {:?} {:?}", r.rows, r.error));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// The lead's ruling (LEAD-RULINGS 9d87841628, 2): a value of a string type assigned to a numeric or boolean column (a
 /// text function's result, a || of strings, a text or varchar column) is 42804, even when no row matches; each was
 /// stored or answered. Expected answers: PG 18.6, recorded (artie e139983801,
