@@ -66,8 +66,8 @@ fn a_numeric_nan_is_refused_before_it_reaches_an_integer() {
         wrong.push(format!("{sql} over a row: {got:?}, PostgreSQL 0A000 cannot convert NaN"));
     }
     match run(&c, "SELECT c1 FROM nt WHERE id = 1") {
-        Ok(rows) if rows == ["5"] => {}
-        other => wrong.push(format!("the row after the refused UPDATE: {other:?}, PostgreSQL 5")),
+        Ok(rows) if rows == ["5.0000000000"] => {}
+        other => wrong.push(format!("the row after the refused UPDATE: {other:?}, PostgreSQL 5.0000000000 (recorded, artie uw-pg18-nan_row-rec13-iccad11)")),
     }
     assert!(wrong.is_empty(), "CLAIM: a numeric NaN is refused (0A000) before any integer holds it: {wrong:#?}");
 }

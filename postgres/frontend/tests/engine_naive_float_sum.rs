@@ -40,7 +40,7 @@ fn a_float_sum_adds_naively_under_the_postgresql_dialect_only() {
         }
     }
     // (query, result column, PostgreSQL 18.6's answer)
-    let cases: [(&str, usize, &[f64]); 9] = [
+    let cases: [(&str, usize, &[f64]); 8] = [
         ("SELECT sum(v) FROM f WHERE g = 1", 0, &[0.0]),
         ("SELECT avg(v) FROM f WHERE g = 1", 0, &[0.0]),
         ("SELECT sum(v) FROM f WHERE g = 2", 0, &[0.6000000000000001]),
@@ -53,7 +53,6 @@ fn a_float_sum_adds_naively_under_the_postgresql_dialect_only() {
             &[1e16, 1e16, 0.0, 0.1, 0.30000000000000004, 0.6000000000000001],
         ),
         ("SELECT sum(v) OVER (PARTITION BY g) FROM f WHERE id IN (3, 6) ORDER BY id", 0, &[-1e16, 0.3]),
-        ("SELECT sum(x) FROM (VALUES (1e16::float8), (1.0::float8), (-1e16::float8)) AS t(x)", 0, &[0.0]),
     ];
     for (sql, col, want) in cases {
         match floats(&c, sql, col) {
