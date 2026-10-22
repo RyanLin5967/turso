@@ -17477,6 +17477,60 @@ fn a_string_parameter_assigned_to_another_category_is_42804() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// The lead's ruling (LEAD-RULINGS 82dcec6b66, lifting d2bf57effb's interim refusal for integer columns): a decimal
+/// past 15 significant digits assigned to an integer column (INSERT VALUES, INSERT ... SELECT, SET, ON CONFLICT SET) is
+/// stored exactly, rounded half away from zero, as PostgreSQL's assignment cast stores it; through a float8 it would
+/// round (12345678901234567 is 12345678901234568 there). Past the column it is 22003. Expected answers: PG 18.6,
+/// recorded (artie afd9557309, rec34-long-decimal-integer/pg18-wirefuzz-a_long_decimal_assigned_to_an_integer_column_is_stored_exactly.out),
+/// but its comparison and numeric(30,2) column, which stay refused under the interim ruling.
+#[test]
+fn a_long_decimal_assigned_to_an_integer_column_is_stored_exactly() {
+    let dir = Scratch::new("long-decimal-integer");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let ddl = "CREATE TABLE li (id int PRIMARY KEY, b bigint, i int)";
+    a.q(ddl).ok(ddl);
+    let mut wrong = Vec::new();
+    for (sql, message) in [
+        ("INSERT INTO li (id, b) VALUES (1, 12345678901234567.00)", ""),
+        ("INSERT INTO li (id, b) VALUES (2, 9223372036854775807.4)", ""),
+        ("INSERT INTO li (id, b) VALUES (3, 1234567890123456789.5)", ""),
+        ("INSERT INTO li (id, b) VALUES (4, -1234567890123456789.5)", ""),
+        ("INSERT INTO li (id, i) VALUES (5, 2147483646.9999999999999999)", ""),
+        ("INSERT INTO li (id, b) VALUES (6, 9223372036854775807.5)", "bigint out of range"),
+        ("INSERT INTO li (id, b) SELECT 7, 98765432109876543.21", ""),
+        ("UPDATE li SET b = 11111111111111111.49 WHERE id = 1", ""),
+        ("UPDATE li SET b = 22222222222222222.5 WHERE id = 1000", ""),
+        ("INSERT INTO li (id, b) VALUES (2, 0) ON CONFLICT (id) DO UPDATE SET b = 33333333333333333.5", ""),
+    ] {
+        let r = a.q(sql);
+        let fine = if message.is_empty() {
+            r.error.is_none()
+        } else {
+            r.error.as_ref().is_some_and(|e| e.code == "22003" && e.message == message)
+        };
+        if !fine {
+            wrong.push(format!("{sql}: PG {message:?}; got {:?} {:?}", r.tags, r.error));
+        }
+    }
+    let r = a.q("SELECT id, b, i FROM li ORDER BY id");
+    let want: Vec<Vec<Option<String>>> = [
+        ["1", "11111111111111111", ""],
+        ["2", "33333333333333334", ""],
+        ["3", "1234567890123456790", ""],
+        ["4", "-1234567890123456790", ""],
+        ["5", "", "2147483647"],
+        ["7", "98765432109876543", ""],
+    ]
+    .iter()
+    .map(|row| row.iter().map(|v| (!v.is_empty()).then(|| v.to_string())).collect())
+    .collect();
+    if r.error.is_some() || r.rows != want {
+        wrong.push(format!("SELECT id, b, i: PG {want:?}; got {:?} {:?}", r.rows, r.error));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// numfuzz (seeds 1442, 1458 and 1600 at 1d8a8b230; artie 00a35c0147): a constant past a numeric(p, s) column is 22003
 /// 'numeric field overflow', a constant cast past an integer type is 22003 wherever it stands, and an INSERT ... SELECT's
 /// targets are coerced to their columns as VALUES items are, each at planning, so a statement matching no row is refused
