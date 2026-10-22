@@ -511,8 +511,8 @@ impl PostgreSQLTranslator {
     /// tell a text column from a numeric(p, s) column's decimal text).
     /// Rounds each listed cast to an integer type as PostgreSQL's cast from the operand's type does,
     /// where the engine's CAST truncates (PGDIV-INT-CAST-TRUNCATES; numfuzz seed 3504; recorded,
-    /// rec50-expression-int-cast): a numeric half away from zero (round), a float8 or real half to
-    /// even (pg_round_even). The operand is evaluated once.
+    /// rec50-expression-int-cast): a numeric half away from zero, a float8 or real half to even,
+    /// range-checked as the cast is (rec55), through pg_assign_int_value. The operand is evaluated once.
     /// Writes each listed real or float8 value as text as float4out or float8out does (the shortest
     /// text that reads back exactly: -683390.3, 0.30000000000000004, 1e+20), through pg_float_text,
     /// where the engine's CAST wrote 15 significant digits (numfuzz seeds 4681, 4784; recorded,
@@ -4298,12 +4298,27 @@ impl PostgreSQLTranslator {
                         }
                     }
                     if let Some(ty) = self.integer_cast_rounding.as_ref().and_then(|m| m.get(&type_cast.location)).filter(|_| integer) {
-                        let round = if *ty == 1700 { "round" } else { "pg_round_even" };
+                        // Rounded and range-checked as the cast does it, through the assignment
+                        // cast's function: past the type 22003, numeric infinity 0A000 (numfuzz seed
+                        // 5676: ceil(-Infinity)::bigint answered int8's least through round()).
+                        let target = match t.names.last().and_then(|n| match &n.node {
+                            Some(pg_query::protobuf::node::Node::String(s)) => Some(s.sval.as_str()),
+                            _ => None,
+                        }) {
+                            Some("int2") => "smallint",
+                            Some("int4") => "integer",
+                            _ => "bigint",
+                        };
+                        let kind = if *ty == 1700 { "numeric" } else { "float" };
                         return Ok(ast::Expr::Cast {
                             expr: Box::new(ast::Expr::FunctionCall {
-                                name: pg_name(round),
+                                name: pg_name("pg_assign_int_value"),
                                 distinctness: None,
-                                args: vec![Box::new(self.translate_expr(arg)?)],
+                                args: vec![
+                                    Box::new(self.translate_expr(arg)?),
+                                    Box::new(ast::Expr::Literal(sql_string(target))),
+                                    Box::new(ast::Expr::Literal(sql_string(kind))),
+                                ],
                                 order_by: vec![],
                                 within_group: vec![],
                                 filter_over: ast::FunctionTail { filter_clause: None, over_clause: None },
