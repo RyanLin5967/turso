@@ -1751,6 +1751,11 @@ impl Kept {
 /// since the server started: turso_branch_stats' `checkpoints_skipped`.
 static CHECKPOINTS_SKIPPED: AtomicU64 = AtomicU64::new(0);
 
+/// Assignment probes ([`turso_pg::StatementTypes::assign_probe`]) run, since the server started:
+/// turso_branch_probes(), so a test counts probe statements per Execute (one per statement text
+/// and connection, LEAD-RULINGS 1710ba2857).
+static ASSIGN_PROBES_RUN: AtomicU64 = AtomicU64::new(0);
+
 impl Session {
     fn new(shared: Arc<Shared>) -> Self {
         let interrupts = Arc::new(Interrupts::new(shared.waits.clone(), shared.sessions.clone()));
@@ -3106,10 +3111,21 @@ impl Session {
         // An INSERT's or UPDATE's constant expressions to numeric(p, s) columns are judged the
         // same way, before the statement, so one past its column is refused with no row
         // (StatementTypes::assign_probe; numfuzz seed 8183).
+        let assigning = types.fold_probe.is_none() || !query;
         let probe = types.fold_probe.as_deref().filter(|_| query).or(types.assign_probe.as_deref());
         let folded_error = match probe {
             Some(probe) => match conn.prepare_typed(probe) {
-                Ok((mut folded, _)) => folded.run_ignore_rows().err(),
+                Ok((mut folded, _)) => {
+                    let assign = assigning && types.assign_probe.as_deref() == Some(probe);
+                    if assign {
+                        ASSIGN_PROBES_RUN.fetch_add(1, Ordering::Relaxed);
+                    }
+                    let failed = folded.run_ignore_rows().err();
+                    if assign && failed.is_none() {
+                        conn.note_probe_passed(probe);
+                    }
+                    failed
+                }
                 Err(_) => None,
             },
             None => None,
@@ -3190,6 +3206,14 @@ impl Session {
         }
         // The allocations the server process has made, for the per-step allocation budget
         // (budget.py work); NULL in a build that counts none (no `alloc-count` feature).
+        // The assignment probes run since the server started ([`ASSIGN_PROBES_RUN`]).
+        if f == "turso_branch_probes" {
+            arity(call, 0)?;
+            result_format(format, 0, 1)?;
+            bad_code(&*st)?;
+            let n = ASSIGN_PROBES_RUN.load(Ordering::Relaxed) as i64;
+            return one_row(f, Type::INT8, format, |e| e.encode_field(&n));
+        }
         if f == "turso_branch_allocations" {
             arity(call, 0)?;
             result_format(format, 0, 1)?;
@@ -3212,7 +3236,7 @@ impl Session {
         ) {
             return Err(error(
                 SqlErrorKind::UndefinedFunction,
-                format!("function {f} does not exist; the branch functions are turso_branch_create(name), turso_branch_switch(name), turso_branch_delete(name), turso_branch_current(), turso_branch_stats(), turso_branch_allocations() and turso_branch_work()"),
+                format!("function {f} does not exist; the branch functions are turso_branch_create(name), turso_branch_switch(name), turso_branch_delete(name), turso_branch_current(), turso_branch_stats(), turso_branch_allocations(), turso_branch_work() and turso_branch_probes()"),
             ));
         }
         arity(call, 1)?;
@@ -4189,7 +4213,7 @@ fn branch_call_fields(call: &PgBranchCall, format: &Format) -> SqlResult<Vec<Fie
     }
     let pg_type = if matches!(
         &*call.function,
-        "turso_branch_create" | "turso_branch_allocations"
+        "turso_branch_create" | "turso_branch_allocations" | "turso_branch_probes"
     ) {
         Type::INT8
     } else {

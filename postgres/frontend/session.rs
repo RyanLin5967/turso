@@ -36,6 +36,12 @@ pub(crate) struct PgConnectionInner {
     broken: std::sync::atomic::AtomicBool,
     /// The parameter-type walk's views, read once per schema snapshot (wire review 14 item 10).
     view_cache: parking_lot::Mutex<crate::result_types::ViewCache>,
+    /// The assignment probes ([`crate::StatementTypes::assign_probe`]) this connection has run and
+    /// seen pass. A probe's text is its constants and the columns' modifiers, so one that passed
+    /// passes again: it is left out of later prepares, so it runs once per statement text and
+    /// connection, never per Execute (the lead's condition, LEAD-RULINGS 1710ba2857). Bounded:
+    /// cleared at [`PASSED_PROBES_MAX`] entries, which costs a re-run, never a skipped check.
+    passed_probes: parking_lot::Mutex<std::collections::HashSet<String>>,
     /// SET lock_timeout, in milliseconds: 0 when unset or set to 0, PostgreSQL's "no timeout",
     /// which here is the server's own lock wait. Lock-free, as the server reads it while a branch
     /// call waits (wire review 16 item 12).
@@ -93,6 +99,9 @@ pub enum ServerFiles {
 
 /// The source of [`PgConnectionInner::search_path_stamp`]'s values.
 static SEARCH_PATH_ASSIGNMENTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// The bound on [`PgConnectionInner::passed_probes`].
+const PASSED_PROBES_MAX: usize = 256;
 
 /// The client settings this server answers by, under PostgreSQL's names, at the values it behaves
 /// by: what SHOW gives and what startup announces (ParameterStatus), from this one table, as they
@@ -1072,6 +1081,7 @@ impl PgConnection {
                 session_state: parking_lot::Mutex::new(SessionState::default()),
                 broken: std::sync::atomic::AtomicBool::new(false),
                 view_cache: parking_lot::Mutex::new(crate::result_types::ViewCache::default()),
+                passed_probes: parking_lot::Mutex::new(std::collections::HashSet::new()),
                 lock_timeout_ms: std::sync::atomic::AtomicU64::new(0),
                 statement_timeout_ms: std::sync::atomic::AtomicU64::new(0),
                 min_messages: std::sync::atomic::AtomicU8::new(7),
@@ -1093,6 +1103,16 @@ impl PgConnection {
 
     pub fn inner(&self) -> &Arc<Connection> {
         &self.inner.conn
+    }
+
+    /// Records that `probe` (a statement's [`crate::StatementTypes::assign_probe`]) ran and passed,
+    /// so later prepares of the statement leave it out.
+    pub fn note_probe_passed(&self, probe: &str) {
+        let mut passed = self.inner.passed_probes.lock();
+        if passed.len() >= PASSED_PROBES_MAX {
+            passed.clear();
+        }
+        passed.insert(probe.to_string());
     }
 
     /// A statement starts to run: statement_timestamp() is read anew, and outside a block so is
@@ -2263,7 +2283,7 @@ fn prepare_statement_parsed(
         types.param_targets = crate::result_types::param_targets(&parse_result);
         types.folds_at_plan = folds_at_plan(&parse_result);
         types.fold_probe = if types.folds_at_plan { None } else { fold_probe(&parse_result) };
-        types.assign_probe = assignment_probe(pg_conn, &parse_result);
+        types.assign_probe = assignment_probe(pg_conn, &parse_result).filter(|p| !pg_conn.passed_probes.lock().contains(p));
         // A table's width, for a `*` beside a typed column, from the in-memory schema alone.
         let tables = |schema: &str, table: &str| resident_relation_columns(pg_conn, schema, table);
         let fixed = crate::result_types::expression_types(&parse_result, &tables);
