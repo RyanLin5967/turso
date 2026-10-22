@@ -17494,6 +17494,44 @@ fn a_string_parameter_assigned_to_another_category_is_42804() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// numfuzz (seeds 343 at 6e17acc9a, 1144 at 45de98440; artie 9b32cd5149, 52ca04164d): a real is written in the
+/// shortest digits that read back as it from strictly inside its rounding interval, as float4out writes it: a decimal on
+/// the interval's edge reads back only by ties-to-even, and PostgreSQL passes over it (-337198016 is -3.3719802e+08,
+/// written -3.37198e+08). Expected answers: PG 18.6, recorded (artie 8534fb40a0,
+/// rec30-float4-ties/pg18-wirefuzz-a_real_is_written_in_the_shortest_digits_strictly_inside_its_interval.out),
+/// but its v::float8 (-337198016, 16999999488): the engine stores a real column's value unrounded to float4, its own
+/// class (routed to the engine).
+#[test]
+fn a_real_is_written_in_the_shortest_digits_strictly_inside_its_interval() {
+    let dir = Scratch::new("float4-ties");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in [
+        "CREATE TABLE r (id int PRIMARY KEY, v real)",
+        "INSERT INTO r VALUES (1, '-337198023.9225'), (2, 1.70e10), (3, 979207168), (4, -61659648), (5, -59204712), (6, 74746384), (7, 37812272), (8, 0.1), (9, 1.5), (10, 3.4028235e38), (11, 1e-45), (12, 100), (13, -2.5e-5)",
+    ] {
+        a.q(sql).ok(sql);
+    }
+    let mut wrong = Vec::new();
+    let col = |v: &[&str]| -> Vec<Vec<Option<String>>> { v.iter().map(|x| vec![Some(x.to_string())]).collect() };
+    for (sql, want) in [
+        (
+            "SELECT v FROM r ORDER BY id",
+            col(&[
+                "-3.3719802e+08", "1.6999999e+10", "9.7920717e+08", "-6.1659648e+07", "-5.9204712e+07", "7.4746384e+07",
+                "3.7812272e+07", "0.1", "1.5", "3.4028235e+38", "1e-45", "100", "-2.5e-05",
+            ]),
+        ),
+        ("SELECT DISTINCT v FROM r WHERE id = 1", col(&["-3.3719802e+08"])),
+    ] {
+        let r = a.q(sql);
+        if r.error.is_some() || r.rows != want {
+            wrong.push(format!("{sql}: PG {want:?}; got {:?} {:?}", r.rows, r.error));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// numfuzz (seed 622 at 45de98440; artie e49c37285f): a numeric or int8 constant assigned to an integer column is
 /// rounded half away from zero and range-checked as the assignment cast does, at planning, so a statement matching no
 /// row is refused too: 15341459444911775 into an int column was stored. Expected answers: PG 18.6, recorded (artie
