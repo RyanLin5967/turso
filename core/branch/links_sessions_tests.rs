@@ -652,8 +652,11 @@ fn ls_fill_starved_child() {
     // (Ruling 62c11ec63d: what is polled is the log's cut; the meta row is read once it is.)
     let t = std::time::Instant::now();
     let mut log_held = log_present(&path);
+    // Operations go on while the cut is waited for (FLAGGED, the ruled pattern of 01a02150d: a deferred checkpoint
+    // starts at the next operation).
     while log_held >= peak && t.elapsed() < std::time::Duration::from_secs(60) {
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let _ = trunk.fork_branch().unwrap().into_id();
         log_held = log_present(&path);
     }
     let meta = poll_meta_version(&path);
@@ -734,8 +737,11 @@ fn ls_fill_entry_starved_child() {
     // (Ruling 62c11ec63d: what is polled is the log's cut; the meta row is read once it is.)
     let t = std::time::Instant::now();
     let mut log_held = log_present(&path);
+    // Operations go on while the cut is waited for (FLAGGED, the ruled pattern of 01a02150d: a deferred checkpoint
+    // starts at the next operation).
     while log_held >= peak && t.elapsed() < std::time::Duration::from_secs(60) {
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let _ = trunk.fork_branch().unwrap().into_id();
         log_held = log_present(&path);
     }
     let meta_held = poll_meta_version(&path);
