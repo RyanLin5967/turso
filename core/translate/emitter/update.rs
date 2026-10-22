@@ -980,7 +980,9 @@ fn emit_update_column_values<'a>(
                                         .get_type_def_unchecked(ty)
                                         .is_some_and(|td| td.encode().is_some())
                             };
-                            let translate_result = if has_custom_encode {
+                            let translate_result = if has_custom_encode
+                                && crate::branch::store::fe_mutant("custom_encode_set_not_hoisted")
+                            {
                                 translate_expr_no_constant_opt(
                                     program,
                                     Some(table_references),
@@ -989,6 +991,32 @@ fn emit_update_column_values<'a>(
                                     &t_ctx.resolver,
                                     NoConstantOptReason::CustomTypeEncode,
                                 )
+                            } else if has_custom_encode {
+                                // The value goes to a register of its own, where its constant
+                                // parts are hoisted as any SET value's are, and is copied into
+                                // the target that the encode then rewrites in place, so the
+                                // second row never re-encodes an encoded value. Hoisted, a
+                                // constant that raises raises once, before the first row, even
+                                // when no row matches, as SQLite's hoisting and PostgreSQL's
+                                // plan-time folding both do (fastest-engine, seed 1715:
+                                // `SET c1 = -(ceil(('NaN'::numeric)::int))` on an empty table
+                                // answered UPDATE 0 where PostgreSQL 18.6 raises 0A000).
+                                let raw_reg = program.alloc_register();
+                                translate_expr(
+                                    program,
+                                    Some(table_references),
+                                    expr,
+                                    raw_reg,
+                                    &t_ctx.resolver,
+                                )
+                                .map(|_| {
+                                    program.emit_insn(Insn::Copy {
+                                        src_reg: raw_reg,
+                                        dst_reg: target_reg,
+                                        extra_amount: 0,
+                                    });
+                                    target_reg
+                                })
                             } else {
                                 translate_expr(
                                     program,

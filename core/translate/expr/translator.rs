@@ -25,6 +25,10 @@ pub enum NoConstantOptReason {
     /// the *encoded* result (i.e. `encode_fn(99)` not `99`), but that
     /// requires tracking the encode through the hoisting machinery. For now
     /// we simply disable hoisting for these columns.
+    ///
+    /// UPDATE's SET no longer takes this path (fastest-engine, seed 1715): it evaluates the value
+    /// into a register of its own, hoistable, and copies it into the target before the encode, so
+    /// the encode never sees its own output. Only mutant `custom_encode_set_not_hoisted` reaches it.
     CustomTypeEncode,
     /// IN-list values are inserted into an ephemeral table in a loop.
     /// Each value reuses the same register, so hoisting would collapse
