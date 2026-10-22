@@ -17917,6 +17917,62 @@ fn a_float_numeric_or_boolean_column_reads_its_literal_as_its_input_routine_does
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// numfuzz seeds 5961, 5498, 4822 (artie b1d9ea5276, 1ed077342a, 4f001ce3aa): an expression's value assigned to a
+/// numeric(p, s) column is checked and rounded as PostgreSQL's assignment cast does it: numeric infinity in any form
+/// (negated, through float8, through round) and a value past the precision are 22003 'numeric field overflow', a float8
+/// is read through its shortest text and rounded to the scale (2.555 is 2.56); NaN, which PG stores, is refused loudly
+/// (the NaN ruling). Infinity was refused 22P02 with "-inf", and an overflow with the engine's longer message. Expected answers: PG 18.6, recorded (artie a8e16a651e,
+/// rec54-expression-assign-numeric/pg18-wirefuzz-an_expression_assigned_to_a_numeric_typmod_column_is_checked_as_postgresql_checks_it.out).
+#[test]
+fn an_expression_assigned_to_a_numeric_typmod_column_is_checked_as_postgresql_checks_it() {
+    let dir = Scratch::new("expression-assign-numeric");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in [
+        "CREATE TABLE en (id int PRIMARY KEY, n numeric(6,2), f float8, m numeric)",
+        "INSERT INTO en (id, f, m) VALUES (1, 2.555, 1234.5), (2, -1.005, 'Infinity')",
+    ] {
+        a.q(sql).ok(sql);
+    }
+    let mut wrong = Vec::new();
+    for sql in [
+        "UPDATE en SET n = -('Infinity'::numeric) WHERE id = 1",
+        "UPDATE en SET n = ('-Infinity'::numeric)::float8 WHERE id = 1",
+        "UPDATE en SET n = round('-Infinity'::numeric) WHERE id = 1",
+        "UPDATE en SET n = m * 1 WHERE id = 2",
+        "UPDATE en SET n = m * 1000 WHERE id = 1",
+    ] {
+        let r = a.q(sql);
+        if !r.error.as_ref().is_some_and(|e| e.code == "22003" && e.message == "numeric field overflow") {
+            wrong.push(format!("{sql}: PG 22003 'numeric field overflow'; got {:?} {:?}", r.tags, r.error));
+        }
+    }
+    for sql in [
+        "UPDATE en SET n = f * 1 WHERE id IN (1, 2)",
+        "INSERT INTO en (id, n) SELECT 3, m + 0.004 FROM en WHERE id = 1",
+    ] {
+        let r = a.q(sql);
+        if r.error.is_some() {
+            wrong.push(format!("{sql}: PG succeeds; got {:?}", r.error));
+        }
+    }
+    // PG stores NaN; the engine's REAL holds none, so NaN is refused loudly and never stored otherwise
+    // (the lead's ruling, LEAD-RULINGS 9d87841628's condition on dd348f3dd).
+    let r = a.q("INSERT INTO en (id, n) SELECT 4, 'NaN'::numeric * 1");
+    if r.error.is_none() {
+        wrong.push(format!("NaN: refused loudly; got {:?}", r.tags));
+    }
+    let r = a.q("SELECT id, n FROM en ORDER BY id");
+    let want: Vec<Vec<Option<String>>> = [["1", "2.56"], ["2", "-1.01"], ["3", "1234.50"]]
+        .iter()
+        .map(|row| row.iter().map(|v| Some(v.to_string())).collect())
+        .collect();
+    if r.error.is_some() || r.rows != want {
+        wrong.push(format!("SELECT: PG {want:?}; got {:?} {:?}", r.rows, r.error));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// numfuzz seeds 4703, 3659 (artie f1fec7d3cc, 77b6087556), PGDIV-INT-RANGE's "an expression's value assigned to one is
 /// not (the engine stores it)": an expression's value assigned to a smallint, integer or bigint column is cast as
 /// PostgreSQL's assignment cast casts it, on INSERT ... SELECT and UPDATE: a numeric rounds half away from zero, a
@@ -18044,6 +18100,128 @@ fn a_float_cast_to_text_is_written_as_its_output_routine_writes_it() {
         if r.error.is_some() || r.rows != want {
             wrong.push(format!("{sql}: PG {want:?}; got {:?} {:?}", r.rows, r.error));
         }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// numfuzz seeds 6789, 6673, 6700 at b46404e66 (artie fbbb5b4ce6): a cast to an integer of a constant's cast rounds as
+/// the cast does (' 2.50 '::numeric::int is 3; it truncated to 2), and a constant expression assigned to an integer or
+/// numeric(p, s) column is refused past the column even when no row matches, as PostgreSQL folds it before any row is
+/// read (it was accepted, UPDATE 0). Expected answers: PG 18.6, recorded (artie 6d2df9a3cc,
+/// rec57-cast-of-cast-and-folded-assign/pg18-wirefuzz-a_cast_of_a_cast_rounds_and_a_constant_expression_assigned_is_folded.out).
+#[test]
+fn a_cast_of_a_cast_rounds_and_a_constant_expression_assigned_is_folded() {
+    let dir = Scratch::new("cast-of-cast-folded");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE fc (id int PRIMARY KEY, s smallint, i int, n numeric(6,2))").ok("create");
+    let mut wrong = Vec::new();
+    let r = a.q("SELECT -(-((' 2.50 '::numeric)::int)) AS a, ('-2.5'::numeric)::int AS b, (('1.5'::float8))::int AS c, ('2.5'::float8)::bigint AS d");
+    let want: Vec<Vec<Option<String>>> = vec![["3", "-3", "2", "2"].iter().map(|v| Some(v.to_string())).collect()];
+    if r.error.is_some() || r.rows != want {
+        wrong.push(format!("casts of casts: PG {want:?}; got {:?} {:?}", r.rows, r.error));
+    }
+    for (sql, message) in [
+        ("UPDATE fc SET s = (9965823707318 - 32767) WHERE id = 1", "smallint out of range"),
+        ("UPDATE fc SET s = -(((0003712916.796)::int)::numeric) WHERE id = 2", "smallint out of range"),
+        ("UPDATE fc SET i = 2147483647 + 1 WHERE id = 3", "integer out of range"),
+        ("UPDATE fc SET n = 9999 * 2 WHERE id = 4", "numeric field overflow"),
+        ("INSERT INTO fc (id, s) SELECT 5, 40000 WHERE false", "smallint out of range"),
+    ] {
+        let r = a.q(sql);
+        if !r.error.as_ref().is_some_and(|e| e.code == "22003" && e.message == message) {
+            wrong.push(format!("{sql}: PG 22003 {message:?}; got {:?} {:?}", r.tags, r.error));
+        }
+    }
+    let r = a.q("UPDATE fc SET s = 7 * 3 WHERE id = 6");
+    if r.error.is_some() || r.tags != vec!["UPDATE 0".to_string()] {
+        wrong.push(format!("7 * 3: PG UPDATE 0; got {:?} {:?}", r.tags, r.error));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// numfuzz seed 4871 at 783dee075 (artie 4f001ce3aa): a value bound to an integer column is cast as PostgreSQL's
+/// custom plan casts it at Bind, even when no row matches: a declared numeric, float8 or wider integer past the column is
+/// 22003 '<type> out of range', a numeric NaN 0A000, a float infinity 22003, and an undeclared one past the column is
+/// int4in's 22003. A declared numeric 58401200842280 was stored in an integer column. A fractional value PostgreSQL
+/// rounds (2.5 is 3 as a numeric, 2 as a float8) is refused loudly or stored as PG stores it, never anything else.
+/// Expected answers: PG 18.6, recorded (artie 14babf96bd,
+/// rec56-bound-value-int-assign/pg18-wirefuzz-a_bound_value_assigned_to_an_integer_column_is_cast_as_postgresql_casts_it.out).
+#[test]
+fn a_bound_value_assigned_to_an_integer_column_is_cast_as_postgresql_casts_it() {
+    let dir = Scratch::new("bound-int-assign");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE bi (id int PRIMARY KEY, s smallint, i int, b bigint)").ok("create");
+    let mut wrong = Vec::new();
+    let refused: [(&str, &[(u32, i16, &[u8])], &str, &str); 8] = [
+        ("INSERT INTO bi (id, i) VALUES ($1, $2)", &[(23, 0, b"1"), (1700, 0, b"58401200842280")], "22003", "integer out of range"),
+        ("INSERT INTO bi (id, s) VALUES ($1, $2)", &[(23, 0, b"1"), (1700, 0, b"40000")], "22003", "smallint out of range"),
+        ("INSERT INTO bi (id, i) VALUES ($1, $2)", &[(23, 0, b"3"), (20, 0, b"3000000000")], "22003", "integer out of range"),
+        ("INSERT INTO bi (id, b) VALUES ($1, $2)", &[(23, 0, b"4"), (1700, 0, b"1e19")], "22003", "bigint out of range"),
+        ("INSERT INTO bi (id, i) VALUES ($1, $2)", &[(23, 0, b"5"), (1700, 0, b"NaN")], "0A000", "cannot convert NaN to integer"),
+        ("INSERT INTO bi (id, i) VALUES ($1, $2)", &[(23, 0, b"5"), (701, 0, b"Infinity")], "22003", "integer out of range"),
+        ("INSERT INTO bi (id, i) VALUES ($1, $2)", &[(0, 0, b"6"), (0, 0, b"58401200842280")], "22003", r#"value "58401200842280" is out of range for type integer"#),
+        ("UPDATE bi SET s = $1 WHERE id = 1000", &[(1700, 0, b"70000")], "22003", "smallint out of range"),
+    ];
+    for (sql, params, code, message) in refused {
+        let r = a.xt(sql, params);
+        if !r.error.as_ref().is_some_and(|e| e.code == code && e.message == message) {
+            wrong.push(format!("{sql} {params:?}: PG {code} {message:?}; got {:?} {:?}", r.tags, r.error));
+        }
+    }
+    // Rounded by PostgreSQL: refused loudly here, or stored as PG stores it.
+    let rounded: [(&str, &[(u32, i16, &[u8])], &str, &str); 3] = [
+        ("INSERT INTO bi (id, i) VALUES ($1, $2)", &[(23, 0, b"1"), (1700, 0, b"2.5")], "SELECT i FROM bi WHERE id = 1", "3"),
+        ("INSERT INTO bi (id, i) VALUES ($1, $2)", &[(23, 0, b"2"), (701, 0, b"2.5")], "SELECT i FROM bi WHERE id = 2", "2"),
+        ("INSERT INTO bi (id, s) VALUES ($1, $2)", &[(23, 0, b"7"), (1700, 0, b"-32768.4")], "SELECT s FROM bi WHERE id = 7", "-32768"),
+    ];
+    for (sql, params, read, want) in rounded {
+        let r = a.xt(sql, params);
+        if r.error.is_none() {
+            let back = a.q(read);
+            if back.rows != vec![vec![Some(want.to_string())]] {
+                wrong.push(format!("{sql} {params:?}: PG stores {want}; stored {:?}", back.rows));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// numfuzz seed 5676 at 4c7bc6102 (artie bbd556e95e): an expression cast to an integer type is refused as PostgreSQL's
+/// cast refuses it: past the type 22003 with the type's message, numeric infinity 0A000 'cannot convert infinity to
+/// <type>', a float's infinity 22003. ceil(-Infinity numeric)::bigint answered -9223372036854775808. Expected answers:
+/// PG 18.6, recorded (artie fcfd1405f9,
+/// rec55-expression-int-cast-range/pg18-wirefuzz-an_expression_cast_to_an_integer_refuses_as_postgresql_refuses.out); its
+/// NaN row is asserted by code alone: the server refuses the NaN literal itself, 0A000, before any cast (the NaN ruling).
+#[test]
+fn an_expression_cast_to_an_integer_refuses_as_postgresql_refuses() {
+    let dir = Scratch::new("expression-int-cast-range");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in ["CREATE TABLE xr (id int PRIMARY KEY, n numeric(12,2), f float8)", "INSERT INTO xr VALUES (1, 30000.5, 1e300)"] {
+        a.q(sql).ok(sql);
+    }
+    let mut wrong = Vec::new();
+    for (sql, code, message) in [
+        ("SELECT (ceil(('-Infinity'::numeric * 00015494.760)))::bigint AS v", "0A000", "cannot convert infinity to bigint"),
+        ("SELECT (n * 100000)::int FROM xr", "22003", "integer out of range"),
+        ("SELECT (n * 2)::smallint FROM xr", "22003", "smallint out of range"),
+        ("SELECT (f * 1)::bigint FROM xr", "22003", "bigint out of range"),
+        ("SELECT (('Infinity'::float8) * 1)::int AS v", "22003", "integer out of range"),
+    ] {
+        let r = a.q(sql);
+        if !r.error.as_ref().is_some_and(|e| e.code == code && e.message == message) {
+            wrong.push(format!("{sql}: PG {code} {message:?}; got {:?} {:?}", r.rows, r.error));
+        }
+    }
+    let r = a.q("SELECT (('NaN'::numeric + 1))::int AS v");
+    if r.error.as_ref().map(|e| e.code.as_str()) != Some("0A000") {
+        wrong.push(format!("NaN: PG 0A000; got {:?} {:?}", r.rows, r.error));
+    }
+    let r = a.q("SELECT (n + 0.4)::int FROM xr");
+    if r.error.is_some() || r.rows != vec![vec![Some("30001".to_string())]] {
+        wrong.push(format!("(n + 0.4)::int: PG [[30001]]; got {:?} {:?}", r.rows, r.error));
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
 }

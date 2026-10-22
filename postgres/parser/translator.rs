@@ -262,6 +262,9 @@ pub struct PostgreSQLTranslator {
     /// The expressions assigned to integer columns, by their parse locations: the column's bits and
     /// the rounding ([`PostgreSQLTranslator::with_integer_assignments`]).
     integer_assignments: Option<std::collections::HashMap<i32, (u32, &'static str)>>,
+    /// The expressions assigned to numeric(p, s) columns, by their parse locations: the column's
+    /// modifiers ([`PostgreSQLTranslator::with_numeric_assignments`]).
+    numeric_assignments: Option<std::collections::HashMap<i32, (i32, i32)>>,
     /// The string and numeric literals (by their parse locations) the caller read as an integer
     /// column's assignment reads them ([`PostgreSQLTranslator::with_integer_literals`]): written as
     /// the value as a number, which the engine's integer column and a domain over one take ('0x1F'
@@ -508,8 +511,8 @@ impl PostgreSQLTranslator {
     /// tell a text column from a numeric(p, s) column's decimal text).
     /// Rounds each listed cast to an integer type as PostgreSQL's cast from the operand's type does,
     /// where the engine's CAST truncates (PGDIV-INT-CAST-TRUNCATES; numfuzz seed 3504; recorded,
-    /// rec50-expression-int-cast): a numeric half away from zero (round), a float8 or real half to
-    /// even (pg_round_even). The operand is evaluated once.
+    /// rec50-expression-int-cast): a numeric half away from zero, a float8 or real half to even,
+    /// range-checked as the cast is (rec55), through pg_assign_int_value. The operand is evaluated once.
     /// Writes each listed real or float8 value as text as float4out or float8out does (the shortest
     /// text that reads back exactly: -683390.3, 0.30000000000000004, 1e+20), through pg_float_text,
     /// where the engine's CAST wrote 15 significant digits (numfuzz seeds 4681, 4784; recorded,
@@ -544,6 +547,15 @@ impl PostgreSQLTranslator {
     /// even) and range-checked (22003 with the column type's message; NaN and infinity as PostgreSQL
     /// refuses them), where the engine refused a REAL or stored a value past a smallint (recorded,
     /// rec53-expression-assign-int).
+    /// Checks and rounds each listed expression's value as PostgreSQL's assignment cast to its
+    /// numeric(p, s) column does, through pg_assign_numeric_value: numeric infinity and a value past
+    /// the precision are 22003 'numeric field overflow', a value is rounded half away from zero to
+    /// the scale through its shortest text, NaN passes (recorded, rec54-expression-assign-numeric).
+    pub fn with_numeric_assignments(mut self, assignments: std::collections::HashMap<i32, (i32, i32)>) -> Self {
+        self.numeric_assignments = Some(assignments);
+        self
+    }
+
     pub fn with_integer_assignments(mut self, assignments: std::collections::HashMap<i32, (u32, &'static str)>) -> Self {
         self.integer_assignments = Some(assignments);
         self
@@ -3876,6 +3888,18 @@ impl PostgreSQLTranslator {
                 filter_over: ast::FunctionTail { filter_clause: None, over_clause: None },
             });
         }
+        if let Some((precision, scale)) = self.numeric_assignments.as_ref().and_then(|m| pg_location(node).and_then(|l| m.get(&l))) {
+            let inner = self.translate_expr_unassigned(node)?;
+            let number = |v: i32| Box::new(ast::Expr::Literal(ast::Literal::Numeric(v.to_string())));
+            return Ok(ast::Expr::FunctionCall {
+                name: pg_name("pg_assign_numeric_value"),
+                distinctness: None,
+                args: vec![Box::new(inner), number(*precision), number(*scale)],
+                order_by: vec![],
+                within_group: vec![],
+                filter_over: ast::FunctionTail { filter_clause: None, over_clause: None },
+            });
+        }
         self.translate_expr_unassigned(node)
     }
 
@@ -4294,12 +4318,27 @@ impl PostgreSQLTranslator {
                         }
                     }
                     if let Some(ty) = self.integer_cast_rounding.as_ref().and_then(|m| m.get(&type_cast.location)).filter(|_| integer) {
-                        let round = if *ty == 1700 { "round" } else { "pg_round_even" };
+                        // Rounded and range-checked as the cast does it, through the assignment
+                        // cast's function: past the type 22003, numeric infinity 0A000 (numfuzz seed
+                        // 5676: ceil(-Infinity)::bigint answered int8's least through round()).
+                        let target = match t.names.last().and_then(|n| match &n.node {
+                            Some(pg_query::protobuf::node::Node::String(s)) => Some(s.sval.as_str()),
+                            _ => None,
+                        }) {
+                            Some("int2") => "smallint",
+                            Some("int4") => "integer",
+                            _ => "bigint",
+                        };
+                        let kind = if *ty == 1700 { "numeric" } else { "float" };
                         return Ok(ast::Expr::Cast {
                             expr: Box::new(ast::Expr::FunctionCall {
-                                name: pg_name(round),
+                                name: pg_name("pg_assign_int_value"),
                                 distinctness: None,
-                                args: vec![Box::new(self.translate_expr(arg)?)],
+                                args: vec![
+                                    Box::new(self.translate_expr(arg)?),
+                                    Box::new(ast::Expr::Literal(sql_string(target))),
+                                    Box::new(ast::Expr::Literal(sql_string(kind))),
+                                ],
                                 order_by: vec![],
                                 within_group: vec![],
                                 filter_over: ast::FunctionTail { filter_clause: None, over_clause: None },

@@ -710,6 +710,11 @@ pub enum AssignTarget {
     /// varchar(n)[]: each element past n characters, unless the excess is spaces, 22001
     /// (wire-rev-cfdebc06d LOW-7).
     VarCharArray(u32),
+    /// smallint (16), integer (32) or bigint (64): a value of a wider parameter type (numeric,
+    /// float, a wider integer) past the column once rounded as the assignment cast rounds it,
+    /// 22003 '<type> out of range'; NaN and infinity as PostgreSQL refuses them (numfuzz seed
+    /// 4871; recorded, rec56-bound-value-int-assign).
+    Integer(u32),
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1050,9 +1055,10 @@ const VIEW_RED_ZONE: usize = 100 * 1024;
 const VIEW_STACK: usize = 1024 * 1024;
 
 /// The parameter number of a bare `$n`.
-/// Whether `c` casts to int2, int4 or int8 an operand other than a constant, a column, a parameter
-/// or a cast of a constant: the operands the translator does not already round
-/// ([`Walked::integer_casts`]).
+/// Whether `c` casts to int2, int4 or int8 an operand other than a constant, a column or a
+/// parameter: the operands the translator does not already round ([`Walked::integer_casts`]). A
+/// cast of a constant's cast is one (' 2.50 '::numeric::int truncated to 2 for PG's 3; numfuzz
+/// seed 6789): only a constant cast straight to an integer is read by its own path.
 pub fn integer_cast_of_compound(c: &turso_pg_parser::pg_query::protobuf::TypeCast, arg: &PgNode) -> bool {
     let integer = c.type_name.as_ref().filter(|t| t.array_bounds.is_empty()).and_then(|t| t.names.last()).is_some_and(|n| {
         matches!(&n.node, Some(Node::String(s)) if matches!(s.sval.as_str(), "int2" | "int4" | "int8"))
@@ -1060,7 +1066,6 @@ pub fn integer_cast_of_compound(c: &turso_pg_parser::pg_query::protobuf::TypeCas
     integer
         && match arg.node.as_ref() {
             Some(Node::AConst(_) | Node::ColumnRef(_) | Node::ParamRef(_)) => false,
-            Some(Node::TypeCast(inner)) => !matches!(inner.arg.as_deref().and_then(|a| a.node.as_ref()), Some(Node::AConst(_))),
             Some(_) => true,
             None => false,
         }
@@ -3330,7 +3335,7 @@ fn declared_target(schema: &Schema, relname: &str, column: &str) -> Option<Assig
 
 /// A column's [`AssignTarget`]: the engine's varchar(n) (the translator's VARCHAR(n)), the wire's
 /// bpchar(n) (CHAR(n), catalog.rs's BPCHAR_TYPE_SQL) or the engine's numeric(p, s), each with
-/// integer-literal parameters; None for any other column.
+/// integer-literal parameters, or an integer column; None for any other column.
 fn assign_target(col: &Column) -> Option<AssignTarget> {
     let array = col.array_dimensions() > 0;
     let int = |e: &turso_parser::ast::Expr| -> Option<i64> {
@@ -3352,6 +3357,12 @@ fn assign_target(col: &Column) -> Option<AssignTarget> {
         ("varchar", [n]) => u32::try_from(*n).ok().map(AssignTarget::VarChar),
         ("bpchar", [n]) => u32::try_from(*n).ok().map(AssignTarget::BpChar),
         ("numeric", [p, s]) => Some(AssignTarget::Numeric(u32::try_from(*p).ok()?, i32::try_from(*s).ok()?)),
+        (_, []) => match sqlite_type_to_pg_oid(&col.ty_str) {
+            21 => Some(AssignTarget::Integer(16)),
+            23 => Some(AssignTarget::Integer(32)),
+            20 => Some(AssignTarget::Integer(64)),
+            _ => None,
+        },
         _ => None,
     }
 }

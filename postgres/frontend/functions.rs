@@ -31,9 +31,8 @@ pub(crate) fn resolve_scalar(name: &str, arg_count: usize) -> bool {
         "pg_get_expr" => &[2, 3],
         "to_char" | "pg_input_is_valid" | "booleq" | "boolne" | "col_description" | "bpchareq"
         | "encode" | "bpcharlt" | "pg_text_int" | "pg_assign_int" => &[2],
-        "pg_round_even" => &[1],
         "pg_float_text" | "pg_numeric_mod" => &[2],
-        "pg_assign_int_value" => &[3],
+        "pg_assign_int_value" | "pg_assign_numeric_value" => &[3],
         "version" | "current_database" | "current_schema" | "pg_backend_pid" => &[0],
         "now" | "transaction_timestamp" | "statement_timestamp" => &[0],
         "make_date" => &[3],
@@ -80,14 +79,6 @@ pub(crate) fn exec_scalar(conn: &Connection, name: &str, args: &[Value]) -> Resu
         // A text column's value cast to an integer type, read as int2in/int4in/int8in read it:
         // 22P02 for anything but an integer, 22003 past the type (wire-rev-1de981755-numeric MED-1).
         // Any other value passes to the cast unchanged.
-        // A float's cast to an integer type rounds half to even (rint), as float8 and float4's
-        // casts do; written by the translator for a compound float operand (its
-        // with_integer_cast_rounding). Any other value passes unchanged.
-        "pg_round_even" => Ok(match args.first() {
-            Some(Value::Numeric(turso_core::Numeric::Float(f))) => Value::from_f64(f64::from(*f).round_ties_even()),
-            Some(other) => other.clone(),
-            None => Value::Null,
-        }),
         // A real or float8 value written as text as float4out or float8out writes it (the
         // shortest text that reads back exactly), with the default extra_float_digits; written by
         // the translator for a cast to a string type or an operand of || (its with_float_texts).
@@ -178,6 +169,54 @@ pub(crate) fn exec_scalar(conn: &Connection, name: &str, args: &[Value]) -> Resu
                 },
                 Some(other) => Ok(other.clone()),
                 None => Ok(Value::Null),
+            }
+        }
+        // An expression's value assigned to a numeric(p, s) column, checked and rounded as
+        // PostgreSQL's assignment cast does it: numeric infinity, or a value past the precision once
+        // rounded, is 22003 'numeric field overflow'; any other value is rounded half away from zero
+        // to the scale, read as the decimal its shortest text spells (a float8's 2.555 is 2.56, as
+        // float8_numeric reads it). NaN and a value it does not read pass to the engine. Written by
+        // the translator (its with_numeric_assignments).
+        "pg_assign_numeric_value" => {
+            let precision = args.get(1).and_then(|v| match v {
+                Value::Numeric(turso_core::Numeric::Integer(i)) => i32::try_from(*i).ok(),
+                _ => None,
+            });
+            let scale = args.get(2).and_then(|v| match v {
+                Value::Numeric(turso_core::Numeric::Integer(i)) => i32::try_from(*i).ok(),
+                _ => None,
+            });
+            let (Some(precision), Some(scale)) = (precision, scale) else { return Ok(args.first().cloned().unwrap_or(Value::Null)) };
+            let overflow = || LimboError::Constraint(SqlErrorMessage::classified(SqlErrorKind::NumericValueOutOfRange, "numeric field overflow"));
+            let text = match args.first() {
+                Some(Value::Numeric(turso_core::Numeric::Integer(i))) => i.to_string(),
+                Some(Value::Numeric(turso_core::Numeric::Float(f))) => {
+                    let f = f64::from(*f);
+                    if f.is_infinite() {
+                        return Err(overflow());
+                    }
+                    if f.is_nan() {
+                        return Ok(Value::from_f64(f));
+                    }
+                    format!("{f}")
+                }
+                Some(Value::Text(t)) => {
+                    let t = t.as_str().trim();
+                    let word = t.trim_start_matches(['-', '+']);
+                    if word.eq_ignore_ascii_case("infinity") || word.eq_ignore_ascii_case("inf") {
+                        return Err(overflow());
+                    }
+                    t.to_string()
+                }
+                Some(other) => return Ok(other.clone()),
+                None => return Ok(Value::Null),
+            };
+            if numeric_overflows(&text, precision, scale) == Some(true) {
+                return Err(overflow());
+            }
+            match crate::session::numeric_at_scale(&text, scale) {
+                Some(rounded) => Ok(Value::build_text(rounded)),
+                None => Ok(args.first().cloned().unwrap_or(Value::Null)),
             }
         }
         "pg_text_int" => match args.first() {
