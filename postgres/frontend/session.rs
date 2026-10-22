@@ -2117,10 +2117,15 @@ fn prepare_statement_parsed(
         // round(float8, 2): numfuzz at e4882aaed, answered where PostgreSQL has no candidate),
         // bounded by the text. BLIND SPOT: a CREATE VIEW is not walked for it (walking every view
         // as it is made warms the view memo, which changes how a deep chain is read later).
+        // So is one with a `%` or a cast to a string type, whose arithmetic the walk resolves
+        // (float8 % bigint, numeric * x::text: numfuzz seeds 482, 483 at 5d2f9d25f, answered).
         let numeric_call = || {
             [b"ceil(".as_slice(), b"ceiling(", b"floor(", b"round(", b"trunc(", b"abs(", b"sign(", b"sqrt(", b"exp(", b"ln(", b"log(", b"log10(", b"pow(", b"power("]
                 .iter()
                 .any(|w| may_name(w))
+                || [b"%".as_slice(), b"::text", b"::varchar", b"::char", b"::bpchar", b"::name", b"as text", b"as varchar", b"as char"]
+                    .iter()
+                    .any(|w| may_name(w))
         };
         if !used.is_empty() || aggregates.contains(&true) || min_max || unknown_call || numeric_call() || temporal() {
             // A parameter compared with something no context types is refused (42P18) by the
