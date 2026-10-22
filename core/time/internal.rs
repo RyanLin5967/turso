@@ -203,73 +203,42 @@ impl Time {
             .and_hms_opt(0, 0, 0)
             .unwrap();
 
-        match year.cmp(&0) {
-            std::cmp::Ordering::Greater => {
-                let months = match (year - 1).unsigned_abs().checked_mul(12) {
-                    Some(m) => m,
-                    None => return Ok(None),
-                };
-
-                dt = match dt.checked_add_months(chrono::Months::new(months)) {
-                    Some(d) => d,
-                    None => return Ok(None),
-                };
-            }
-            std::cmp::Ordering::Less => {
-                let months = match (year - 1).unsigned_abs().checked_mul(12) {
-                    Some(m) => m,
-                    None => return Ok(None),
-                };
-
-                dt = match dt.checked_sub_months(chrono::Months::new(months)) {
-                    Some(d) => d,
-                    None => return Ok(None),
-                };
-            }
-            std::cmp::Ordering::Equal => (),
+        // Every step is checked: a value at an integer's extreme (year i32::MIN made `year - 1`
+        // overflow, inside an extern "C" function that cannot unwind, so the process aborted; the
+        // crash batch, 2026-10-15) or a date past chrono's range is no date (`None`), never a panic.
+        // The months from 0001-01 to the year, then to the month, each in i64 so `- 1` cannot wrap.
+        // A year or a month of 0 moves nothing, as before.
+        let year_months = if year == 0 { Some(0) } else { (i64::from(year) - 1).checked_mul(12) };
+        let month_months = if month == 0 { 0 } else { i64::from(month) - 1 };
+        let Some(months) = year_months.and_then(|m| m.checked_add(month_months)) else {
+            return Ok(None);
         };
-
-        match month.cmp(&0) {
-            std::cmp::Ordering::Greater => {
-                dt = match dt.checked_add_months(chrono::Months::new((month - 1).unsigned_abs())) {
-                    Some(d) => d,
-                    None => return Ok(None),
-                };
-            }
-            std::cmp::Ordering::Less => {
-                dt = match dt.checked_sub_months(chrono::Months::new((month - 1).unsigned_abs())) {
-                    Some(d) => d,
-                    None => return Ok(None),
-                };
-            }
-            std::cmp::Ordering::Equal => (),
+        let Ok(span) = u32::try_from(months.unsigned_abs()) else {
+            return Ok(None);
         };
-
-        if let Some(d) = chrono::Duration::try_days(day - 1) {
-            dt += d;
+        let moved = if months >= 0 {
+            dt.checked_add_months(chrono::Months::new(span))
         } else {
+            dt.checked_sub_months(chrono::Months::new(span))
+        };
+        let Some(moved) = moved else {
             return Ok(None);
-        }
+        };
+        dt = moved;
 
-        if let Some(d) = chrono::Duration::try_hours(hour) {
-            dt += d;
-        } else {
-            return Ok(None);
+        let durations = [
+            day.checked_sub(1).and_then(chrono::Duration::try_days),
+            chrono::Duration::try_hours(hour),
+            chrono::Duration::try_minutes(minutes),
+            chrono::Duration::try_seconds(seconds),
+            Some(chrono::Duration::nanoseconds(nano_secs)),
+        ];
+        for d in durations {
+            let Some(next) = d.and_then(|d| dt.checked_add_signed(d)) else {
+                return Ok(None);
+            };
+            dt = next;
         }
-
-        if let Some(d) = chrono::Duration::try_minutes(minutes) {
-            dt += d;
-        } else {
-            return Ok(None);
-        }
-
-        if let Some(d) = chrono::Duration::try_seconds(seconds) {
-            dt += d;
-        } else {
-            return Ok(None);
-        }
-
-        dt += chrono::Duration::nanoseconds(nano_secs);
 
         let dt = dt
             .and_local_timezone(offset)
