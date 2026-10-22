@@ -17496,6 +17496,75 @@ fn a_string_parameter_assigned_to_another_category_is_42804() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// numfuzz (seed 622 at 45de98440; artie e49c37285f): a numeric or int8 constant assigned to an integer column is
+/// rounded half away from zero and range-checked as the assignment cast does, at planning, so a statement matching no
+/// row is refused too: 15341459444911775 into an int column was stored. Expected answers: PG 18.6, recorded (artie
+/// c9722422e1, rec29-constant-assign/pg18-wirefuzz-a_numeric_constant_assigned_to_an_integer_column_is_rounded_and_range_checked.out),
+/// but its #16 (9223372036854775807.4 into a bigint, stored by PG as 9223372036854775807) and that row: a decimal past 15
+/// significant digits within the column stays the interim 0A000 (a_decimal_past_15_digits_is_refused_on_every_path, the
+/// lead's ruling d2bf57effb).
+#[test]
+fn a_numeric_constant_assigned_to_an_integer_column_is_rounded_and_range_checked() {
+    let dir = Scratch::new("constant-int");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let ddl = "CREATE TABLE nt (id int PRIMARY KEY, a smallint, b int, c bigint)";
+    a.q(ddl).ok(ddl);
+    let mut wrong = Vec::new();
+    for (sql, message) in [
+        ("INSERT INTO nt (id, b) VALUES (1, 15341459444911775)", "integer out of range"),
+        ("INSERT INTO nt (id, a) VALUES (1, 40000)", "smallint out of range"),
+        ("INSERT INTO nt (id, b) VALUES (1, 2147483648)", "integer out of range"),
+        ("INSERT INTO nt (id, c) VALUES (1, 9223372036854775808)", "bigint out of range"),
+        ("INSERT INTO nt (id, b) VALUES (1, 2147483647.5)", "integer out of range"),
+        ("INSERT INTO nt (id, a) VALUES (1, 32767.5)", "smallint out of range"),
+        ("INSERT INTO nt (id, b) VALUES (1, 1.5e10)", "integer out of range"),
+        ("INSERT INTO nt (id, b) VALUES (1, -2147483648)", ""),
+        ("INSERT INTO nt (id, b) VALUES (2, 1.5)", ""),
+        ("INSERT INTO nt (id, b) VALUES (3, -2.5)", ""),
+        ("INSERT INTO nt (id, a) VALUES (4, 32767.4)", ""),
+        ("INSERT INTO nt (id, b) VALUES (5, 1e3)", ""),
+        ("INSERT INTO nt (id, b) VALUES (6, 0.4999)", ""),
+        ("INSERT INTO nt (id, b) VALUES (7, -0.5)", ""),
+        ("INSERT INTO nt (id, c) VALUES (9, -9223372036854775808)", ""),
+        ("INSERT INTO nt (id, b) VALUES (10, 2.5e-1)", ""),
+        ("INSERT INTO nt (id, b) VALUES (11, 7), (12, 3000000000)", "integer out of range"),
+        ("UPDATE nt SET b = 15341459444911775 WHERE id = 1000", "integer out of range"),
+        ("UPDATE nt SET a = 1e5 WHERE id = 1000", "smallint out of range"),
+        ("INSERT INTO nt (id, b) VALUES (2, 7) ON CONFLICT (id) DO UPDATE SET b = 4294967296", "integer out of range"),
+        ("INSERT INTO nt (id, b) VALUES (2, 7) ON CONFLICT (id) DO UPDATE SET b = 6.5", ""),
+    ] {
+        let r = a.q(sql);
+        let fine = if message.is_empty() {
+            r.error.is_none()
+        } else {
+            r.error.as_ref().is_some_and(|e| e.code == "22003" && e.message == message)
+        };
+        if !fine {
+            wrong.push(format!("{sql}: PG {message:?}; got {:?} {:?}", r.tags, r.error));
+        }
+    }
+    let r = a.q("SELECT id, a, b, c FROM nt ORDER BY id");
+    let want: Vec<Vec<Option<String>>> = [
+        ["1", "", "-2147483648", ""],
+        ["2", "", "7", ""],
+        ["3", "", "-3", ""],
+        ["4", "32767", "", ""],
+        ["5", "", "1000", ""],
+        ["6", "", "0", ""],
+        ["7", "", "-1", ""],
+        ["9", "", "", "-9223372036854775808"],
+        ["10", "", "0", ""],
+    ]
+    .iter()
+    .map(|row| row.iter().map(|v| (!v.is_empty()).then(|| v.to_string())).collect())
+    .collect();
+    if r.error.is_some() || r.rows != want {
+        wrong.push(format!("SELECT id, a, b, c: PG {want:?}; got {:?} {:?}", r.rows, r.error));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// numfuzz (seeds 288 and 332 at 6e17acc9a, 432, 482, 483 and 551 at 5d2f9d25f; PG 18.6's answers in their findings,
 /// artie 9b32cd5149 and 3b3324b82e): a function or operator with no candidate is 42883 inside a cast too, and
 /// beside a cast to text or a `%` it is walked: trunc(x::text)::numeric, round(float8, -1)::numeric in a SET, text
