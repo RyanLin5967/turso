@@ -398,6 +398,9 @@ fn expression_type(node: &PgNode) -> Option<u32> {
         {
             return Some(INT8);
         }
+        // pg_input_is_valid is boolean; it was announced as the engine's integer, 1 or 0
+        // (recorded, rec27-literal-assign, artie 0f7b0647a8: t and f).
+        Node::FuncCall(call) if func_name(call).is_some_and(|n| n == "pg_input_is_valid") => true,
         Node::BoolExpr(_) | Node::NullTest(_) | Node::BooleanTest(_) => true,
         // NULLIF is its first argument's type.
         Node::AExpr(e) if e.kind() == AExprKind::AexprNullif => {
@@ -1141,7 +1144,7 @@ fn arithmetic(op: &str, a: u32, b: u32) -> Arithmetic {
 }
 
 /// A type's name as PostgreSQL writes it in "operator does not exist: a op b".
-fn type_name(t: u32) -> &'static str {
+pub(crate) fn type_name(t: u32) -> &'static str {
     match t {
         INT2 => "smallint",
         INT4 => "integer",

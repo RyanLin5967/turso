@@ -249,6 +249,10 @@ pub struct PostgreSQLTranslator {
     /// knows is declared text ([`PostgreSQLTranslator::with_text_integer_casts`]): read as int4in
     /// reads text, where a numeric(p, s) column's decimal text rounds.
     text_integer_casts: Option<std::collections::HashSet<i32>>,
+    /// The string literals (by their parse locations) the caller read as an integer column's input
+    /// reads them ([`PostgreSQLTranslator::with_integer_literals`]): written as the value's decimal
+    /// text, which the engine's integer column takes ('0x1F' is 31, '1_000' is 1000).
+    integer_literals: Option<std::collections::HashMap<i32, i64>>,
     /// The cast targets this translation met that are neither built-in nor known, lowercased, for
     /// the caller to look up ([`PostgreSQLTranslator::unmapped_cast_types`]). A cast to a domain
     /// was dropped here, so `CAST(-5 AS dm)` skipped dm's CHECK and returned -5 (the domain CHECK
@@ -335,6 +339,11 @@ impl PostgreSQLTranslator {
     /// tell a text column from a numeric(p, s) column's decimal text).
     pub fn with_text_integer_casts(mut self, locations: std::collections::HashSet<i32>) -> Self {
         self.text_integer_casts = Some(locations);
+        self
+    }
+
+    pub fn with_integer_literals(mut self, values: std::collections::HashMap<i32, i64>) -> Self {
+        self.integer_literals = Some(values);
         self
     }
 
@@ -4489,6 +4498,9 @@ impl PostgreSQLTranslator {
                     ast::Literal::Numeric(i.ival.to_string()),
                 )),
                 pg_query::protobuf::a_const::Val::Sval(s) => {
+                    if let Some(v) = self.integer_literals.as_ref().and_then(|m| m.get(&a_const.location)) {
+                        return Ok(ast::Expr::Literal(sql_string(&v.to_string())));
+                    }
                     // Turso's AST expects string literals to include surrounding single quotes
                     // (sanitize_string strips them during bytecode emission): sql_string.
                     Ok(ast::Expr::Literal(sql_string(&s.sval)))
