@@ -18032,6 +18032,38 @@ fn loud_classes_answer_as_postgresql_does() {
             wrong.push(format!("{sql}: PG {code} {message:?}; got {:?} {:?}", r.rows, r.error));
         }
     }
+    // The exact numfuzz shapes (seeds 8428 and 8483; PG 18.6 recorded on eceubuntu2, artie 228e7e0800,
+    // rec61-loud-classes-exact): an undeclared parameter takes the int column's type and int4in reads its text
+    // (overflow first), a declared numeric one is cast (integer out of range); the four-expression INSERT is
+    // refused by parse analysis before any constant is judged.
+    a.q("CREATE TABLE nt (id int PRIMARY KEY, c0 numeric(6,2), c1 int)").ok("nt");
+    a.q("CREATE TABLE nt2 (id int PRIMARY KEY, c0 numeric(6,2), c1 numeric(6,2), c2 int)").ok("nt2");
+    let insert = "INSERT INTO nt (id, c0, c1) VALUES ($1, $2, $3)";
+    for (value, code, message) in [
+        ("332919446264442293.2332642300320518857", "22003", r#"value "332919446264442293.2332642300320518857" is out of range for type integer"#),
+        ("99999999999x", "22003", r#"value "99999999999x" is out of range for type integer"#),
+        ("12abc", "22P02", r#"invalid input syntax for type integer: "12abc""#),
+        ("1.5", "22P02", r#"invalid input syntax for type integer: "1.5""#),
+    ] {
+        let r = a.x_undeclared(insert, &["1", "0", value]);
+        if !r.error.as_ref().is_some_and(|e| e.code == code && e.message == message) {
+            wrong.push(format!("undeclared {value}: PG {code} {message:?}; got {:?} {:?}", r.rows, r.error));
+        }
+    }
+    let big: &[u8] = b"332919446264442293.2332642300320518857";
+    let r = a.xt(insert, &[(23, 0, &b"1"[..]), (1700, 0, &b"0"[..]), (1700, 0, big)]);
+    if !r.error.as_ref().is_some_and(|e| e.code == "22003" && e.message == "integer out of range") {
+        wrong.push(format!("declared numeric into int: PG 22003 \"integer out of range\"; got {:?} {:?}", r.rows, r.error));
+    }
+    let sql = "INSERT INTO nt2 (id, c0, c1, c2) SELECT 2, -(0037293.122), -(((0.687146)::numeric)::text), ((-363482559289947.4912101740065446970) / ((9238.102857137 / 8.759368e+300))::numeric(30,15))";
+    let r = a.q(sql);
+    if !r.error.as_ref().is_some_and(|e| e.code == "42883" && e.message == "operator does not exist: - text") {
+        wrong.push(format!("{sql}: PG 42883 \"operator does not exist: - text\"; got {:?} {:?}", r.rows, r.error));
+    }
+    let r = a.q("SELECT count(*) AS n FROM nt");
+    if r.rows != vec![vec![Some("0".to_string())]] {
+        wrong.push(format!("nt holds no row in PG; got {:?} {:?}", r.rows, r.error));
+    }
     a.q("INSERT INTO lc (id, n, m) VALUES (2, 1.25, 7.777)").ok("row");
     let rows = |v: &[&str]| vec![v.iter().map(|x| Some(x.to_string())).collect::<Vec<_>>()];
     for (sql, want) in [
