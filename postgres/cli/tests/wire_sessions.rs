@@ -17743,16 +17743,11 @@ fn a_constant_cast_past_numeric_p_s_is_22003_with_no_row() {
 #[test]
 fn an_assignment_is_judged_against_the_table_the_name_resolves_to() {
     let dir = Scratch::new("search-path-assign");
+    // The branch server refuses CREATE SCHEMA, so the schema is made through the CLI first.
+    cli_script(&dir, b"CREATE SCHEMA s;\nCREATE TABLE t (id int PRIMARY KEY, b int);\nCREATE TABLE s.t (id int PRIMARY KEY, b text);\n");
     let server = Server::start(&dir.db(), &[]);
     let mut a = server.connect();
-    for sql in [
-        "CREATE SCHEMA s",
-        "CREATE TABLE t (id int PRIMARY KEY, b int)",
-        "CREATE TABLE s.t (id int PRIMARY KEY, b text)",
-        "SET search_path = s, public",
-    ] {
-        a.q(sql).ok(sql);
-    }
+    a.q("SET search_path = s, public").ok("set");
     let mut wrong = Vec::new();
     for sql in ["INSERT INTO t (id, b) VALUES (1, 'x')", "INSERT INTO t (id, b) VALUES (2, 'x'::text)", "UPDATE t SET b = 'y' WHERE id = 1"] {
         let r = a.q(sql);
