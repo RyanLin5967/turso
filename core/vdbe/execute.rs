@@ -533,6 +533,31 @@ fn int64_overflow_check(program: &Program, lhs: &Value, rhs: &Value, op: fn(i64,
     Ok(())
 }
 
+/// The message of a refused division or remainder by zero, PostgreSQL's own wording, which the
+/// PostgreSQL server maps to 22012 (postgres/server/lib.rs).
+pub(crate) const DIVISION_BY_ZERO: &str = "division by zero";
+
+/// Under a dialect whose `division_by_zero_raises` (PostgreSQL), `lhs / rhs` and `lhs % rhs` with a
+/// divisor that is numerically zero and a dividend that is not NULL are an error, where SQLite's
+/// rule answers NULL. A NULL operand keeps the answer NULL, as in PostgreSQL. Mutant
+/// `division_by_zero_answers_null` (test builds only): NULL, as before.
+fn division_by_zero_check(program: &Program, lhs: &Value, rhs: &Value) -> Result<()> {
+    if !program.connection.division_by_zero_raises
+        || crate::branch::store::fe_mutant("division_by_zero_answers_null")
+    {
+        return Ok(());
+    }
+    let zero = match Numeric::from_value(rhs) {
+        Some(Numeric::Integer(0)) => true,
+        Some(Numeric::Float(f)) => f64::from(f) == 0.0,
+        _ => false,
+    };
+    if zero && Numeric::from_value(lhs).is_some() {
+        return Err(LimboError::Constraint(DIVISION_BY_ZERO.to_string()));
+    }
+    Ok(())
+}
+
 pub fn op_add(
     program: &Program,
     state: &mut ProgramState,
@@ -585,12 +610,13 @@ pub fn op_multiply(
 }
 
 pub fn op_divide(
-    _program: &Program,
+    program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(Divide { lhs, rhs, dest }, insn);
+    division_by_zero_check(program, state.registers[*lhs].get_value(), state.registers[*rhs].get_value())?;
     state.registers[*dest].set_value(
         state.registers[*lhs]
             .get_value()
@@ -624,12 +650,13 @@ pub fn op_drop_index(
 }
 
 pub fn op_remainder(
-    _program: &Program,
+    program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(Remainder { lhs, rhs, dest }, insn);
+    division_by_zero_check(program, state.registers[*lhs].get_value(), state.registers[*rhs].get_value())?;
     state.registers[*dest].set_value(
         state.registers[*lhs]
             .get_value()
@@ -10938,7 +10965,7 @@ pub fn op_function(
                             ScalarFunc::NumericDiv => {
                                 if b.is_zero() {
                                     return Err(LimboError::Constraint(
-                                        "division by zero".to_string(),
+                                        DIVISION_BY_ZERO.to_string(),
                                     ));
                                 }
                                 a.div(&b)?

@@ -55,6 +55,14 @@ pub trait Dialect: Send + Sync + 'static {
         false
     }
 
+    /// Whether `x / 0` and `x % 0` are an error (the message `DIVISION_BY_ZERO`; PostgreSQL's
+    /// 22012) rather than SQLite's NULL. Default false: SQLite's rule. Read once per connection
+    /// (`Connection::division_by_zero_raises`) and applied by `/` and `%` when the divisor is
+    /// numerically zero and the dividend is not NULL.
+    fn division_by_zero_raises(&self) -> bool {
+        false
+    }
+
     /// Whether an attached database's name matches only as written (PostgreSQL: a quoted schema
     /// name keeps its case, `"Q1"` is not `q1`; the frontend has already folded unquoted names),
     /// rather than in any case (SQLite). Default false. Read once per connection, by its

@@ -76,6 +76,12 @@ impl Dialect for PostgresDialect {
         true
     }
 
+    /// PostgreSQL raises 22012 "division by zero" for `/` and `%` over int2, int4, int8, float8
+    /// and numeric; SQLite answers NULL (fastest-engine, RESUME item 11, numfuzz seed 402).
+    fn division_by_zero_raises(&self) -> bool {
+        true
+    }
+
     /// A PostgreSQL schema (an attached database here) is named as written: libpg_query has
     /// folded an unquoted name, and a quoted one keeps its case, so `"Q1"` is not `q1`
     /// (fastest-engine, lead RESUME item 10).
