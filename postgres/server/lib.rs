@@ -2627,6 +2627,11 @@ fn sqlstate(e: &LimboError) -> &'static str {
         LimboError::Constraint(m) if m == "division by zero" => "22012",
         LimboError::Constraint(_) => "23000",
         LimboError::ParseError(m) if m.starts_with("Invalid statement:") => "42601",
+        // The crash batch (2026-10-15): views nested past the planner's limit, refused where they
+        // overflowed the stack (statement_too_complex, PostgreSQL's stack depth limit); and a
+        // make_date / make_timestamp past the date range, which aborted the process.
+        LimboError::ParseError(m) if m.starts_with("stack depth limit exceeded") => "54001",
+        LimboError::ExtensionError(m) if m.starts_with("date field value out of range") => "22008",
         LimboError::ParseError(m)
             if m.starts_with("no such table")
                 || m.starts_with("no such view")
@@ -4448,6 +4453,9 @@ fn is_create_table_as(upper: &str) -> bool {
     }
     matches!(tokens.next(), Some(t) if t == "AS" || t.starts_with("AS("))
 }
+
+#[cfg(test)]
+mod crash_batch_tests;
 
 #[cfg(test)]
 mod tests {

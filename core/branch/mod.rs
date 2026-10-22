@@ -130,6 +130,7 @@ pub(crate) mod id_set;
 pub use id_set::id_set_census;
 pub(crate) mod journal;
 pub mod merge;
+pub(crate) mod name_mirror;
 pub(crate) mod page_map;
 pub(crate) mod prewarm;
 pub(crate) mod store;
@@ -616,6 +617,15 @@ pub struct BranchOpenStats {
     pub cat_rows_read: u64,
     /// Catalog stores: arena slots the log's replay named or freed.
     pub touched_slots: u64,
+    /// Catalog stores: the free-table probe statements the arena rebuild ran (each one catalog
+    /// query, in `cat_queries`), so a test can tell them from the open's own reads: one per touched
+    /// slot below the checkpoint's high-water mark at formats 17/18; at 19/20 one per
+    /// `catalog::FREE_HAS_CHUNK` of the slots the log tail cannot settle (LEAP L4 2b).
+    pub free_probes: u64,
+    /// Catalog stores: touched slots below the checkpoint's high-water mark, whose state at the
+    /// checkpoint the arena rebuild needs, however it learns it (instrument: the written-tail open
+    /// budget's premise).
+    pub touched_below_hw: u64,
     /// Catalog stores (a12-durable-open C-P): trunk-version probes and range reads made during the
     /// open, and the trunk version rows they returned (`trunk_page_loads` stays 0: no trunk page is
     /// loaded whole).
@@ -1000,6 +1010,45 @@ impl Connection {
     /// database. The name is unique among unreleased branches, and is durable with the fork: both
     /// are one log record.
     pub fn create_branch(self: &Arc<Connection>, name: &str) -> Result<BranchId> {
+        // Mutant `budget_plant_wake_on_expensive_create` (test builds only; probe-adversary-2's
+        // plant4, ADV-claude-budget-probe-2-fdb57fcfe H1): every third create makes 2 extra syscalls
+        // (a write that wakes a blocked helper thread, and a close(-1)), and the woken helper makes
+        // one close(-1). The helper is spawned once and counted persistent, as the confirmation
+        // writer is. The probe refuses exactly the expensive creates; a budget must not then read
+        // the cheap ones as its verdict.
+        #[cfg(all(test, unix))]
+        if store::fe_mutant("budget_plant_wake_on_expensive_create") {
+            static FD: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
+            static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let fd = *FD.get_or_init(|| {
+                let mut p = [0i32; 2];
+                // SAFETY: a two-int buffer.
+                assert_eq!(unsafe { libc::pipe(p.as_mut_ptr()) }, 0);
+                let r = p[0];
+                budget_probe::persistent_started();
+                std::thread::Builder::new()
+                    .name("plant4-helper".into())
+                    .spawn(move || loop {
+                        let mut b = 0u8;
+                        // SAFETY: one byte into a local.
+                        if unsafe { libc::read(r, (&mut b as *mut u8).cast(), 1) } != 1 {
+                            return;
+                        }
+                        // SAFETY: an invalid descriptor: EBADF, one syscall.
+                        unsafe { libc::close(-1) };
+                    })
+                    .unwrap();
+                p[1]
+            });
+            if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 3 == 2 {
+                let b = 1u8;
+                // SAFETY: one byte from a local; an invalid descriptor.
+                unsafe {
+                    libc::write(fd, (&b as *const u8).cast(), 1);
+                    libc::close(-1);
+                }
+            }
+        }
         self.fork_with(Some(name))
     }
 
@@ -1764,6 +1813,23 @@ pub(crate) mod budget_probe;
 
 #[cfg(all(test, feature = "fs"))]
 mod budget_tests;
+
+// LEAP L4's oracle: each in-memory fact that skips a catalog query equals that query, over a
+// randomized lifecycle history (lead, 2026-10-15).
+#[cfg(all(test, feature = "fs"))]
+mod l4_oracle_tests;
+
+// Links adversary H1 (DECISIONS 7e77068514): one authority for the format version.
+#[cfg(all(test, feature = "fs"))]
+mod format_authority_tests;
+
+// Links adversary M1 (DECISIONS 7e77068514): nested histories, known links against the query path.
+#[cfg(all(test, feature = "fs"))]
+mod l4_nested_tests;
+
+// Links adversary 3 (DECISIONS 65eb410760): the bounded fill's progress across sessions and under pressure.
+#[cfg(all(test, feature = "fs"))]
+mod links_sessions_tests;
 
 #[cfg(test)]
 mod tests {
