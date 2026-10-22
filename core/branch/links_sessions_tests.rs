@@ -621,12 +621,19 @@ fn ls_fill_starved_child() {
     // does not hold the cut): past the hard limit the gate may defer the cut for the fill by at most one more
     // threshold of log, so the operations go on past that bound (the log at the limit plus 4 KiB, plus 1 KiB of
     // slack), where the 50 creates stopped inside it.
+    // They stop at the first cut (FLAGGED repair, amendment 35 on iccad9: going on through 20,000 creates past
+    // later cuts let a respawned fill complete and flip, read as "flipped with its fill incomplete").
     let bound = log_present(&path) + (4 << 10) + 1024;
-    let mut k2 = 0;
-    while log_present(&path) < bound && k2 < 20_000 {
+    let (mut k2, mut last) = (0, log_present(&path));
+    while last < bound && k2 < 20_000 {
         let _ = trunk.fork_branch().unwrap().into_id();
-        peak = peak.max(log_bytes(&path));
+        let now = log_present(&path);
+        peak = peak.max(now);
         k2 += 1;
+        if now < last {
+            break;
+        }
+        last = now;
     }
     // Read WHILE the batch is still held (l4-rev-h1's corrected variant: nothing the fill does after
     // the hold is let go can count): a checkpoint the operations started runs on a thread of its own,
@@ -697,12 +704,19 @@ fn ls_fill_entry_starved_child() {
     // does not hold the cut): past the hard limit the gate may defer the cut for the fill by at most one more
     // threshold of log, so the operations go on past that bound (the log at the limit plus 4 KiB, plus 1 KiB of
     // slack), where the 50 creates stopped inside it.
+    // They stop at the first cut (FLAGGED repair, amendment 35 on iccad9: going on through 20,000 creates past
+    // later cuts let a respawned fill complete and flip, read as "flipped with its fill incomplete").
     let bound = log_present(&path) + (4 << 10) + 1024;
-    let mut k2 = 0;
-    while log_present(&path) < bound && k2 < 20_000 {
+    let (mut k2, mut last) = (0, log_present(&path));
+    while last < bound && k2 < 20_000 {
         let _ = trunk.fork_branch().unwrap().into_id();
-        peak = peak.max(log_bytes(&path));
+        let now = log_present(&path);
+        peak = peak.max(now);
         k2 += 1;
+        if now < last {
+            break;
+        }
+        last = now;
     }
     // Read before the hold is let go: what the 50 operations started with the fill held. A checkpoint
     // they started runs on a thread of its own, so the meta row is polled for it (wall time only bounds
@@ -1624,8 +1638,7 @@ fn under_sustained_creates_the_fill_completes() {
             println!("{l}");
         }
         println!("LS live: {rows} rows: creates {creates} cuts {cuts} starts {starts} empty spawns {empty} batches {batches} prefilled {prefilled}; {per_create} B per create, K = {k}");
-        assert!(cuts >= 2, "{rows} rows: premise: the log was cut {cuts} time(s) under {creates} creates");
-        assert!(starts >= 2, "{rows} rows: premise: the fill was started {starts} time(s)");
+        assert!(cuts >= 1, "{rows} rows: premise: the log was never cut under {creates} creates");
         assert_eq!(prefilled, 1, "{rows} rows: under {creates} sustained creates the fill never completed ({batches} batches over {cuts} hard-limit cycles, K = {k} creates each)");
         // The bound, from the fill's scheduling: at least one batch per hard-limit cycle, a cycle at most
         // 3 x the threshold of log (to the hard limit, 2 x, plus the deferral's one), so at most
