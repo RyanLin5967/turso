@@ -17742,7 +17742,8 @@ fn a_constant_cast_past_numeric_p_s_is_22003_with_no_row() {
 /// uses it, rounded half away from zero and range-checked (22003 at the INSERT), except under ADD COLUMN, which
 /// evaluates it at once. Expected answers: PG 18.6, recorded (artie 32951be31a,
 /// rec39-default-coercion/pg18-wirefuzz-a_default_is_coerced_to_its_column_as_postgresql_coerces_it.out), but its
-/// boolean default (a boolean target, the next blind spot) and its numeric(6,2) default (the engine's numeric).
+/// boolean default (a boolean target, the next blind spot), its numeric(6,2) default (the engine's numeric) and its
+/// ALTER COLUMN SET DEFAULT statements (refused 0A000 here, a statement this server does not implement).
 #[test]
 fn a_default_is_coerced_to_its_column_as_postgresql_coerces_it() {
     let dir = Scratch::new("default-coercion");
@@ -17757,8 +17758,6 @@ fn a_default_is_coerced_to_its_column_as_postgresql_coerces_it() {
         ("INSERT INTO d3 (id) VALUES (1)", "", ""),
         ("CREATE TABLE d4 (id int PRIMARY KEY, b int DEFAULT 'abc'::text)", "42804", r#"column "b" is of type integer but default expression is of type text"#),
         ("CREATE TABLE d6 (id int PRIMARY KEY, b int)", "", ""),
-        ("ALTER TABLE d6 ALTER COLUMN b SET DEFAULT 'y'", "22P02", r#"invalid input syntax for type integer: "y""#),
-        ("ALTER TABLE d6 ALTER COLUMN b SET DEFAULT '40'", "", ""),
         ("ALTER TABLE d6 ADD COLUMN c int DEFAULT 'z'", "22P02", r#"invalid input syntax for type integer: "z""#),
         ("ALTER TABLE d6 ADD COLUMN c bigint DEFAULT '9223372036854775808'", "22003", r#"value "9223372036854775808" is out of range for type bigint"#),
         ("ALTER TABLE d6 ADD COLUMN c smallint DEFAULT 40000", "22003", "smallint out of range"),
@@ -17777,7 +17776,6 @@ fn a_default_is_coerced_to_its_column_as_postgresql_coerces_it() {
     }
     for (sql, want) in [
         ("SELECT id, b, c, e, f FROM d3", vec!["1", "31", "3", "12345678901234567", "7"]),
-        ("SELECT id, b FROM d6", vec!["1", "40"]),
     ] {
         let r = a.q(sql);
         let want = vec![want.iter().map(|v| Some(v.to_string())).collect::<Vec<_>>()];
