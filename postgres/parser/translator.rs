@@ -262,6 +262,9 @@ pub struct PostgreSQLTranslator {
     /// The expressions assigned to integer columns, by their parse locations: the column's bits and
     /// the rounding ([`PostgreSQLTranslator::with_integer_assignments`]).
     integer_assignments: Option<std::collections::HashMap<i32, (u32, &'static str)>>,
+    /// The expressions assigned to numeric(p, s) columns, by their parse locations: the column's
+    /// modifiers ([`PostgreSQLTranslator::with_numeric_assignments`]).
+    numeric_assignments: Option<std::collections::HashMap<i32, (i32, i32)>>,
     /// The string and numeric literals (by their parse locations) the caller read as an integer
     /// column's assignment reads them ([`PostgreSQLTranslator::with_integer_literals`]): written as
     /// the value as a number, which the engine's integer column and a domain over one take ('0x1F'
@@ -544,6 +547,15 @@ impl PostgreSQLTranslator {
     /// even) and range-checked (22003 with the column type's message; NaN and infinity as PostgreSQL
     /// refuses them), where the engine refused a REAL or stored a value past a smallint (recorded,
     /// rec53-expression-assign-int).
+    /// Checks and rounds each listed expression's value as PostgreSQL's assignment cast to its
+    /// numeric(p, s) column does, through pg_assign_numeric_value: numeric infinity and a value past
+    /// the precision are 22003 'numeric field overflow', a value is rounded half away from zero to
+    /// the scale through its shortest text, NaN passes (recorded, rec54-expression-assign-numeric).
+    pub fn with_numeric_assignments(mut self, assignments: std::collections::HashMap<i32, (i32, i32)>) -> Self {
+        self.numeric_assignments = Some(assignments);
+        self
+    }
+
     pub fn with_integer_assignments(mut self, assignments: std::collections::HashMap<i32, (u32, &'static str)>) -> Self {
         self.integer_assignments = Some(assignments);
         self
@@ -3853,6 +3865,18 @@ impl PostgreSQLTranslator {
                 name: pg_name("pg_assign_int_value"),
                 distinctness: None,
                 args: vec![Box::new(inner), Box::new(ast::Expr::Literal(sql_string(name))), Box::new(ast::Expr::Literal(sql_string(kind)))],
+                order_by: vec![],
+                within_group: vec![],
+                filter_over: ast::FunctionTail { filter_clause: None, over_clause: None },
+            });
+        }
+        if let Some((precision, scale)) = self.numeric_assignments.as_ref().and_then(|m| pg_location(node).and_then(|l| m.get(&l))) {
+            let inner = self.translate_expr_unassigned(node)?;
+            let number = |v: i32| Box::new(ast::Expr::Literal(ast::Literal::Numeric(v.to_string())));
+            return Ok(ast::Expr::FunctionCall {
+                name: pg_name("pg_assign_numeric_value"),
+                distinctness: None,
+                args: vec![Box::new(inner), number(*precision), number(*scale)],
                 order_by: vec![],
                 within_group: vec![],
                 filter_over: ast::FunctionTail { filter_clause: None, over_clause: None },
