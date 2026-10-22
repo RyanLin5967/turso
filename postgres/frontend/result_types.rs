@@ -663,6 +663,11 @@ pub struct Walked {
     pub compared_operands: std::collections::BTreeSet<u32>,
     /// Each bare $n assigned to a column ([`StatementTypes::column_assignments`]).
     pub column_assignments: Vec<(u32, String, u32)>,
+    /// Each cast to an integer type of a compound numeric, float8 or real expression: its parse
+    /// location and the operand's type, so the translator rounds it as PostgreSQL's cast does (a
+    /// numeric half away from zero, a float half to even) where the engine's CAST truncates
+    /// (PGDIV-INT-CAST-TRUNCATES; numfuzz seed 3504; recorded, rec50-expression-int-cast).
+    pub integer_casts: std::collections::BTreeMap<i32, u32>,
     /// A plain SELECT's result columns' types, in order, as the walk read them (empty for any other
     /// statement): [`aggregate_types`] takes the aggregates' from these.
     pub columns: Vec<Option<u32>>,
@@ -875,6 +880,7 @@ fn parameter_types_with(
         missing_rte: Default::default(),
         first_refusal: Default::default(),
         operand_params: Default::default(),
+        integer_casts: Default::default(),
         column_assignments: Vec::new(),
     };
     let mut columns = Vec::new();
@@ -897,6 +903,7 @@ fn parameter_types_with(
     }
     let (arithmetic_operands, compared_operands) = infer.operand_params.take();
     let column_assignments = std::mem::take(&mut infer.column_assignments);
+    let integer_casts = infer.integer_casts.take();
     Ok(Walked {
         params: infer.types,
         untyped,
@@ -904,6 +911,7 @@ fn parameter_types_with(
         arithmetic_operands,
         compared_operands,
         column_assignments,
+        integer_casts,
         columns,
         assignments: infer.assignments,
     })
@@ -1006,6 +1014,9 @@ struct Infer<'a> {
     /// Each bare $n that is an operand of arithmetic (.0) or of a comparison (.1)
     /// ([`Walked::arithmetic_operands`], [`Walked::compared_operands`]).
     operand_params: std::rc::Rc<std::cell::RefCell<(std::collections::BTreeSet<u32>, std::collections::BTreeSet<u32>)>>,
+    /// Each cast to an integer type of a compound numeric, float8 or real expression: the cast's
+    /// parse location and its operand's type ([`Walked::integer_casts`]). Shared with every nested walk.
+    integer_casts: std::rc::Rc<std::cell::RefCell<std::collections::BTreeMap<i32, u32>>>,
     /// Each bare $n assigned to a column, in the order PostgreSQL analyses them: ($n, the column's
     /// name, its type) ([`Walked::column_assignments`]).
     column_assignments: Vec<(u32, String, u32)>,
@@ -1018,6 +1029,22 @@ const VIEW_RED_ZONE: usize = 100 * 1024;
 const VIEW_STACK: usize = 1024 * 1024;
 
 /// The parameter number of a bare `$n`.
+/// Whether `c` casts to int2, int4 or int8 an operand other than a constant, a column, a parameter
+/// or a cast of a constant: the operands the translator does not already round
+/// ([`Walked::integer_casts`]).
+pub fn integer_cast_of_compound(c: &turso_pg_parser::pg_query::protobuf::TypeCast, arg: &PgNode) -> bool {
+    let integer = c.type_name.as_ref().filter(|t| t.array_bounds.is_empty()).and_then(|t| t.names.last()).is_some_and(|n| {
+        matches!(&n.node, Some(Node::String(s)) if matches!(s.sval.as_str(), "int2" | "int4" | "int8"))
+    });
+    integer
+        && match arg.node.as_ref() {
+            Some(Node::AConst(_) | Node::ColumnRef(_) | Node::ParamRef(_)) => false,
+            Some(Node::TypeCast(inner)) => !matches!(inner.arg.as_deref().and_then(|a| a.node.as_ref()), Some(Node::AConst(_))),
+            Some(_) => true,
+            None => false,
+        }
+}
+
 fn param(node: &PgNode) -> Option<u32> {
     match node.node.as_ref() {
         Some(Node::ParamRef(p)) => u32::try_from(p.number).ok(),
@@ -1696,6 +1723,7 @@ impl Infer<'_> {
             missing_rte: Default::default(),
             first_refusal: Default::default(),
             operand_params: Default::default(),
+            integer_casts: self.integer_casts.clone(),
             column_assignments: Vec::new(),
         };
         let columns = walk.select(query, &Vec::new());
@@ -2274,6 +2302,10 @@ impl Infer<'_> {
             Some(Node::TypeCast(c)) => {
                 if let Some(arg) = c.arg.as_deref() {
                     self.set(arg, cast_type(c));
+                    if integer_cast_of_compound(c, arg) {
+                        let ty = self.type_of(arg, scope);
+                        self.note_integer_cast(c, arg, ty);
+                    }
                     self.expr(arg, scope);
                 }
             }
@@ -2634,6 +2666,20 @@ impl Infer<'_> {
         }
     }
 
+    /// Records a cast to an integer type of a compound numeric, float8 or real operand
+    /// ([`Walked::integer_casts`]). A cast to NUMERIC(p, s) is typed float8 here (it is computed as
+    /// a REAL), but rounds as a numeric.
+    fn note_integer_cast(&self, c: &turso_pg_parser::pg_query::protobuf::TypeCast, arg: &PgNode, ty: Option<u32>) {
+        if !integer_cast_of_compound(c, arg) {
+            return;
+        }
+        let numeric_cast = matches!(arg.node.as_ref(), Some(Node::TypeCast(inner)) if inner.type_name.as_ref().and_then(|t| t.names.last()).is_some_and(|n| matches!(&n.node, Some(Node::String(s)) if s.sval == "numeric")));
+        let ty = if numeric_cast { Some(NUMERIC) } else { ty };
+        if let Some(ty @ (NUMERIC | FLOAT8 | FLOAT4)) = ty {
+            self.integer_casts.borrow_mut().insert(c.location, ty);
+        }
+    }
+
     fn type_of(&self, node: &PgNode, scope: &Scope) -> Option<u32> {
         use turso_pg_parser::pg_query::protobuf::a_const::Val;
         use turso_pg_parser::pg_query::protobuf::{AExprKind, SubLinkType};
@@ -2807,7 +2853,8 @@ impl Infer<'_> {
             // cast: trunc(x::text)::numeric is 42883 (numfuzz seed 551 at 5d2f9d25f: answered).
             Node::TypeCast(c) => {
                 if let Some(arg) = c.arg.as_deref().filter(|a| param(a).is_none()) {
-                    self.type_of(arg, scope);
+                    let ty = self.type_of(arg, scope);
+                    self.note_integer_cast(c, arg, ty);
                 }
                 cast_type(c)
             }
@@ -3025,6 +3072,7 @@ impl Infer<'_> {
             missing_rte: self.missing_rte.clone(),
             first_refusal: self.first_refusal.clone(),
             operand_params: self.operand_params.clone(),
+            integer_casts: self.integer_casts.clone(),
             column_assignments: Vec::new(),
         };
         let level = walk.from_items(&s.from_clause, scope);

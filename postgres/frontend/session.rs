@@ -2140,36 +2140,9 @@ fn prepare_statement_parsed(
             // A parameter compared with something no context types is refused (42P18) by the
             // server, which alone reads the types the client declared (wire review 8 item 7,
             // review 11 item 1).
-            let search_path = written_search_path(pg_conn);
-            // Which attached schema holds a name, probed only when the walk resolves an
-            // unqualified name through one, once per (schema, name) per statement (wire review 17
-            // item 3).
-            let names = pg_conn.conn.attached_database_names();
-            let probed = std::cell::RefCell::new(std::collections::HashMap::new());
-            let holds = |schema: &str, name: &str| {
-                let key = (schema.to_ascii_lowercase(), name.to_ascii_lowercase());
-                if let Some(held) = probed.borrow().get(&key) {
-                    return *held;
-                }
-                let held = get_table_columns(&pg_conn.conn, name, Some(schema))
-                    .is_ok_and(|columns| !columns.is_empty());
-                probed.borrow_mut().insert(key, held);
-                held
-            };
-            let attached = crate::result_types::Attached {
-                names: &names,
-                holds: &holds,
-            };
             // A column reference naming no FROM entry is refused here, 42P01 (wire review 17
             // item 5).
-            let walked = crate::result_types::parameter_types(
-                &parse_result,
-                &schema,
-                &search_path,
-                &pg_conn.view_cache,
-                &attached,
-            )
-            .map_err(LimboError::InvalidArgument)?;
+            let walked = walk_statement(pg_conn, &schema, &parse_result).map_err(LimboError::InvalidArgument)?;
             types.params = walked.params;
             types.untyped = walked.untyped;
             types.inconsistent = walked.inconsistent;
@@ -2292,6 +2265,51 @@ fn prepare_statement_parsed(
     noop_statement(&pg_conn.conn).map(Some)
 }
 
+/// The result-type walk of a statement ([`crate::result_types::parameter_types`]) over this
+/// session's search path and attached schemas. Which attached schema holds a name is probed only
+/// when the walk resolves an unqualified name through one, once per (schema, name) per statement
+/// (wire review 17 item 3).
+fn walk_statement(
+    pg_conn: &PgConnectionInner,
+    schema: &std::sync::Arc<turso_core::schema::Schema>,
+    parse: &turso_pg_parser::pg_query::ParseResult,
+) -> std::result::Result<crate::result_types::Walked, SqlErrorMessage> {
+    let search_path = written_search_path(pg_conn);
+    let names = pg_conn.conn.attached_database_names();
+    let probed = std::cell::RefCell::new(std::collections::HashMap::new());
+    let holds = |schema: &str, name: &str| {
+        let key = (schema.to_ascii_lowercase(), name.to_ascii_lowercase());
+        if let Some(held) = probed.borrow().get(&key) {
+            return *held;
+        }
+        let held = get_table_columns(&pg_conn.conn, name, Some(schema)).is_ok_and(|columns| !columns.is_empty());
+        probed.borrow_mut().insert(key, held);
+        held
+    };
+    let attached = crate::result_types::Attached { names: &names, holds: &holds };
+    crate::result_types::parameter_types(parse, schema, &search_path, &pg_conn.view_cache, &attached)
+}
+
+/// The parse locations of the casts to an integer type of a compound numeric, float8 or real
+/// expression, with the operand's type, for the translator to round as PostgreSQL's cast does
+/// ([`crate::result_types::Walked::integer_casts`]). Read from the parse and the schema alone, so
+/// the engine's re-prepare translates alike; the walk runs only for a statement holding such a cast.
+fn integer_cast_rounding(
+    pg_conn: &PgConnectionInner,
+    parse: &turso_pg_parser::pg_query::ParseResult,
+) -> std::result::Result<std::collections::HashMap<i32, u32>, SqlErrorMessage> {
+    use turso_pg_parser::pg_query::NodeRef;
+    let any = parse.protobuf.nodes().iter().any(|(n, ..)| match n {
+        NodeRef::TypeCast(c) => c.arg.as_deref().is_some_and(|arg| crate::result_types::integer_cast_of_compound(c, arg)),
+        _ => false,
+    });
+    if !any {
+        return Ok(std::collections::HashMap::new());
+    }
+    let schema = pg_conn.conn.current_schema();
+    Ok(walk_statement(pg_conn, &schema, parse)?.integer_casts.into_iter().collect())
+}
+
 /// THE translation of a statement, for the session's prepare and for the engine's re-prepare of it
 /// alike (ONE TRANSLATION PATH, the wire line review M1-M4: the re-prepare translated with a plain
 /// translator, so a DELETE ... USING lost its column lookup, a domain cast its CHECK, and
@@ -2344,6 +2362,9 @@ pub(crate) fn session_translation(
     // (wire-rev-1de981755-numeric MED-1); judged from the parse and the schema alone, so the engine's
     // re-prepare translates it alike.
     let text_casts = text_integer_casts(pg_conn, sql, parse_result);
+    // Each cast to an integer type of a compound numeric or float expression rounds as its type's
+    // cast does (PGDIV-INT-CAST-TRUNCATES; numfuzz seed 3504): the engine's CAST truncates.
+    let rounding = integer_cast_rounding(pg_conn, parse_result).map_err(LimboError::InvalidArgument)?;
     // Each value assigned to a column is coerced as parse analysis coerces it, here so the
     // re-prepare judges it alike; a literal an integer column reads is written as its value.
     let (integer_literals, text_literals, float_literals) = literal_assignments(pg_conn, parse_result).map_err(LimboError::InvalidArgument)?;
@@ -2355,6 +2376,7 @@ pub(crate) fn session_translation(
     let translator = || {
         let t = translator();
         let t = if text_casts.is_empty() { t } else { t.with_text_integer_casts(text_casts.clone()) };
+        let t = if rounding.is_empty() { t } else { t.with_integer_cast_rounding(rounding.clone()) };
         let t = if text_literals.is_empty() { t } else { t.with_text_literals(text_literals.clone()) };
         let t = if float_literals.is_empty() { t } else { t.with_float_literals(float_literals.clone()) };
         if integer_literals.is_empty() { t } else { t.with_integer_literals(integer_literals.clone()) }

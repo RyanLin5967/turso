@@ -249,6 +249,10 @@ pub struct PostgreSQLTranslator {
     /// knows is declared text ([`PostgreSQLTranslator::with_text_integer_casts`]): read as int4in
     /// reads text, where a numeric(p, s) column's decimal text rounds.
     text_integer_casts: Option<std::collections::HashSet<i32>>,
+    /// The casts to an integer type (by their parse locations) of a compound numeric (1700), float8
+    /// (701) or real (700) expression, with the operand's type
+    /// ([`PostgreSQLTranslator::with_integer_cast_rounding`]).
+    integer_cast_rounding: Option<std::collections::HashMap<i32, u32>>,
     /// The string and numeric literals (by their parse locations) the caller read as an integer
     /// column's assignment reads them ([`PostgreSQLTranslator::with_integer_literals`]): written as
     /// the value as a number, which the engine's integer column and a domain over one take ('0x1F'
@@ -478,6 +482,15 @@ impl PostgreSQLTranslator {
     /// TypeCast's parse location): each reads its text as int2in/int4in/int8in do, 22P02 for '2.5'
     /// (wire-rev-1de981755-numeric MED-1: the decimal-text arm rounded it to 3, being unable to
     /// tell a text column from a numeric(p, s) column's decimal text).
+    /// Rounds each listed cast to an integer type as PostgreSQL's cast from the operand's type does,
+    /// where the engine's CAST truncates (PGDIV-INT-CAST-TRUNCATES; numfuzz seed 3504; recorded,
+    /// rec50-expression-int-cast): a numeric half away from zero (round), a float8 or real half to
+    /// even (pg_round_even). The operand is evaluated once.
+    pub fn with_integer_cast_rounding(mut self, casts: std::collections::HashMap<i32, u32>) -> Self {
+        self.integer_cast_rounding = Some(casts);
+        self
+    }
+
     pub fn with_text_integer_casts(mut self, locations: std::collections::HashSet<i32>) -> Self {
         self.text_integer_casts = Some(locations);
         self
@@ -4166,6 +4179,20 @@ impl PostgreSQLTranslator {
                         arg.node.as_ref(),
                         Some(pg_query::protobuf::node::Node::ColumnRef(_) | pg_query::protobuf::node::Node::ParamRef(_))
                     );
+                    if let Some(ty) = self.integer_cast_rounding.as_ref().and_then(|m| m.get(&type_cast.location)).filter(|_| integer) {
+                        let round = if *ty == 1700 { "round" } else { "pg_round_even" };
+                        return Ok(ast::Expr::Cast {
+                            expr: Box::new(ast::Expr::FunctionCall {
+                                name: pg_name(round),
+                                distinctness: None,
+                                args: vec![Box::new(self.translate_expr(arg)?)],
+                                order_by: vec![],
+                                within_group: vec![],
+                                filter_over: ast::FunctionTail { filter_clause: None, over_clause: None },
+                            }),
+                            type_name: pg_type_name_to_ast_type(t),
+                        });
+                    }
                     if integer && self.text_integer_casts.as_ref().is_some_and(|l| l.contains(&type_cast.location)) {
                         let label = match t.names.last().and_then(|n| match &n.node {
                             Some(pg_query::protobuf::node::Node::String(s)) => Some(s.sval.to_ascii_lowercase()),
