@@ -3328,6 +3328,61 @@ impl PostgreSQLTranslator {
             .alias
             .as_ref()
             .map(|a| ast::As::Elided(pg_name(a.aliasname.clone())));
+        // An alias's column list (`(VALUES (1, 2)) AS t(x, y)`) renames the subquery's first
+        // columns, as for a table: read as a subselect naming each column anew, by the name the
+        // engine gives it. It was dropped, so `SELECT *` answered column1 and column2 (SILENT) and
+        // `x` was no column. A subquery whose names the engine's cannot be read, or that names two
+        // columns alike (the renaming subselect selects by name), is refused.
+        if let Some(a) = range_sub.alias.as_ref().filter(|a| !a.colnames.is_empty()) {
+            let declared = cte_output_names(select_stmt).ok_or_else(|| {
+                ParseError::ParseError(SqlErrorMessage::classified(
+                    SqlErrorKind::FeatureNotSupported,
+                    "a FROM alias column list is supported on a subquery only when each of its columns is named or is a VALUES column",
+                ))
+            })?;
+            let mut seen = std::collections::HashSet::new();
+            if !declared.iter().all(|c| seen.insert(c.to_ascii_lowercase())) {
+                return Err(ParseError::ParseError(SqlErrorMessage::classified(
+                    SqlErrorKind::FeatureNotSupported,
+                    "a FROM alias column list is not supported on a subquery that names two columns alike",
+                )));
+            }
+            if a.colnames.len() > declared.len() {
+                return Err(ParseError::ParseError(SqlErrorMessage::classified(SqlErrorKind::InvalidColumnReference, format!(
+                    "table \"{}\" has {} columns available but {} columns specified",
+                    a.aliasname,
+                    declared.len(),
+                    a.colnames.len()
+                ))));
+            }
+            let mut renamed = declared.clone();
+            rename_columns(&mut renamed, &a.colnames);
+            let columns = declared
+                .iter()
+                .zip(&renamed)
+                .map(|(from, to)| ast::ResultColumn::Expr(Box::new(ast::Expr::Id(pg_name(from))), Some(ast::As::As(pg_name(to)))))
+                .collect();
+            let wrapper = ast::Select {
+                with: None,
+                body: ast::SelectBody {
+                    select: ast::OneSelect::Select {
+                        distinctness: None,
+                        columns,
+                        from: Some(ast::FromClause {
+                            select: Box::new(ast::SelectTable::Select(select, alias.clone())),
+                            joins: vec![],
+                        }),
+                        where_clause: None,
+                        group_by: None,
+                        window_clause: vec![],
+                    },
+                    compounds: vec![],
+                },
+                order_by: vec![],
+                limit: None,
+            };
+            return Ok(ast::SelectTable::Select(wrapper, alias));
+        }
         Ok(ast::SelectTable::Select(select, alias))
     }
 
