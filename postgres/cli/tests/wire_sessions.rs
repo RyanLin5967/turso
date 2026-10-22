@@ -17995,6 +17995,44 @@ fn a_float_cast_to_text_is_written_as_its_output_routine_writes_it() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// numfuzz seed 5676 at 4c7bc6102 (artie bbd556e95e): an expression cast to an integer type is refused as PostgreSQL's
+/// cast refuses it: past the type 22003 with the type's message, numeric infinity 0A000 'cannot convert infinity to
+/// <type>', a float's infinity 22003. ceil(-Infinity numeric)::bigint answered -9223372036854775808. Expected answers:
+/// PG 18.6, recorded (artie fcfd1405f9,
+/// rec55-expression-int-cast-range/pg18-wirefuzz-an_expression_cast_to_an_integer_refuses_as_postgresql_refuses.out); its
+/// NaN row is asserted by code alone: the server refuses the NaN literal itself, 0A000, before any cast (the NaN ruling).
+#[test]
+fn an_expression_cast_to_an_integer_refuses_as_postgresql_refuses() {
+    let dir = Scratch::new("expression-int-cast-range");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in ["CREATE TABLE xr (id int PRIMARY KEY, n numeric(12,2), f float8)", "INSERT INTO xr VALUES (1, 30000.5, 1e300)"] {
+        a.q(sql).ok(sql);
+    }
+    let mut wrong = Vec::new();
+    for (sql, code, message) in [
+        ("SELECT (ceil(('-Infinity'::numeric * 00015494.760)))::bigint AS v", "0A000", "cannot convert infinity to bigint"),
+        ("SELECT (n * 100000)::int FROM xr", "22003", "integer out of range"),
+        ("SELECT (n * 2)::smallint FROM xr", "22003", "smallint out of range"),
+        ("SELECT (f * 1)::bigint FROM xr", "22003", "bigint out of range"),
+        ("SELECT (('Infinity'::float8) * 1)::int AS v", "22003", "integer out of range"),
+    ] {
+        let r = a.q(sql);
+        if !r.error.as_ref().is_some_and(|e| e.code == code && e.message == message) {
+            wrong.push(format!("{sql}: PG {code} {message:?}; got {:?} {:?}", r.rows, r.error));
+        }
+    }
+    let r = a.q("SELECT (('NaN'::numeric + 1))::int AS v");
+    if r.error.as_ref().map(|e| e.code.as_str()) != Some("0A000") {
+        wrong.push(format!("NaN: PG 0A000; got {:?} {:?}", r.rows, r.error));
+    }
+    let r = a.q("SELECT (n + 0.4)::int FROM xr");
+    if r.error.is_some() || r.rows != vec![vec![Some("30001".to_string())]] {
+        wrong.push(format!("(n + 0.4)::int: PG [[30001]]; got {:?} {:?}", r.rows, r.error));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// numfuzz seed 3504 at d5600475b (artie c098a7ed4d), PGDIV-INT-CAST-TRUNCATES: an expression cast to an integer type
 /// rounds as its type's cast rounds, in a target list, a WHERE and a view: a numeric half away from zero, a float8 or
 /// real half to even, where the engine's CAST truncated (-((-('1.5'::numeric))::bigint) answered 1 for PG's 2).
