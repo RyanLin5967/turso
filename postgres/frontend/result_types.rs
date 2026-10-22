@@ -456,6 +456,12 @@ fn expression_type(node: &PgNode) -> Option<u32> {
             return match type_name.names.last()?.node.as_ref()? {
                 Node::String(s) if s.sval == "bool" => Some(BOOL),
                 Node::String(s) if s.sval == "float4" => Some(FLOAT4),
+                // A cast to an integer type is that type, whatever its operand: the translator
+                // casts to the engine's INTEGER, so x::bigint was announced int4 and a value past
+                // int4 refused, 22003 (recorded, rec47-text-int-cast: '99999999999'::bigint).
+                Node::String(s) if s.sval == "int8" => Some(INT8),
+                Node::String(s) if s.sval == "int4" => Some(23),
+                Node::String(s) if s.sval == "int2" => Some(21),
                 // The translator casts to the engine's own date and timestamp types (each value
                 // checked by its ENCODE): typed as PostgreSQL types them.
                 Node::String(s) if s.sval == "date" => Some(1082),
