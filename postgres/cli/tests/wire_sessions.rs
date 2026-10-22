@@ -17743,7 +17743,8 @@ fn a_constant_cast_past_numeric_p_s_is_22003_with_no_row() {
 /// overflow', Infinity past every p), boolin, an integer into a boolean column 42804, and a numeric NaN or Infinity
 /// into an integer column 0A000. Expected answers: PG 18.6, recorded (artie 73a27af044,
 /// rec42-float-numeric-bool-assign/pg18-wirefuzz-a_float_numeric_or_boolean_column_reads_its_literal_as_its_input_routine_does.out),
-/// but its bare numeric column (the registered float8 class) and the ' 1.5 ' PG refused as a duplicate key.
+/// but its bare numeric column (the registered float8 class), the ' 1.5 ' PG refused as a duplicate key, and its 'NaN'
+/// into a double precision column and that row (the engine's REAL stores no NaN, its own class).
 #[test]
 fn a_float_numeric_or_boolean_column_reads_its_literal_as_its_input_routine_does() {
     let dir = Scratch::new("float-numeric-bool-assign");
@@ -17759,7 +17760,6 @@ fn a_float_numeric_or_boolean_column_reads_its_literal_as_its_input_routine_does
         ("INSERT INTO fb (id, r) VALUES (1, '1e39')", "22003", r#""1e39" is out of range for type real"#),
         ("INSERT INTO fb (id, r) VALUES (1, '0x1F')", "", ""),
         ("INSERT INTO fb (id, d) VALUES (2, '-inf')", "", ""),
-        ("INSERT INTO fb (id, d) VALUES (3, 'NaN')", "", ""),
         ("INSERT INTO fb (id, r) VALUES (4, 1e39)", "22003", r#""1000000000000000000000000000000000000000" is out of range for type real"#),
         ("INSERT INTO fb (id, d) VALUES (4, 1e400)", "22003", expanded.as_str()),
         ("INSERT INTO fb (id, n) VALUES (4, 'abc')", "22P02", r#"invalid input syntax for type numeric: "abc""#),
@@ -17790,7 +17790,6 @@ fn a_float_numeric_or_boolean_column_reads_its_literal_as_its_input_routine_does
     let want: Vec<Vec<Option<String>>> = [
         ["1", "31", "", "", ""],
         ["2", "", "-Infinity", "", ""],
-        ["3", "", "NaN", "", ""],
         ["4", "", "", "1.56", ""],
         ["8", "", "", "", "t"],
         ["9", "", "", "", "f"],
