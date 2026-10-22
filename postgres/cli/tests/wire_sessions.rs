@@ -18006,6 +18006,25 @@ fn a_float_cast_to_text_is_written_as_its_output_routine_writes_it() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// numfuzz seed 6261 at 4c7bc6102 (artie numfuzz-4c7bc6102-s6221-6420, PG 18.6's answer recorded by the fuzzer on
+/// eceubuntu2): abs of a smallint is a smallint, so abs(-32768) is 22003 'smallint out of range'; it answered 32768.
+/// The engine holds every integer as an i64, so only the declared width can refuse it.
+#[test]
+fn abs_of_the_smallest_smallint_is_out_of_range() {
+    let dir = Scratch::new("abs-smallint");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE nt (id int PRIMARY KEY, c0 double precision, c1 smallint, c2 real, c3 numeric)").ok("create");
+    a.q("INSERT INTO nt (id, c0, c1, c2, c3) VALUES (3, 0b101, (-32768), (-9223372036854775808), NUMERIC '-7')").ok("row");
+    let r = a.q("SELECT abs(c1) AS u FROM (SELECT id, c0, c1, c2, c3 FROM nt) s ORDER BY id");
+    assert!(
+        r.error.as_ref().is_some_and(|e| e.code == "22003" && e.message == "smallint out of range"),
+        "PG 22003 \"smallint out of range\"; got {:?} {:?}",
+        r.rows,
+        r.error
+    );
+}
+
 /// numfuzz shard 8421-8620 at f1dc48429 (artie 62179ffdbb), four loud classes answered as PostgreSQL answers them:
 /// int4in's overflow during the digits is 22003 before any junk after them is 22P02; trunc with a scale over a numeric
 /// (two arguments: 42601 here) and over a numeric(p, s) cast (42883 here, read as float8) answers PG's truncation; a
