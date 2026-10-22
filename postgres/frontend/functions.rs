@@ -28,7 +28,7 @@ pub(crate) fn resolve_scalar(name: &str, arg_count: usize) -> bool {
         "pg_get_expr" => &[2, 3],
         "to_char" | "pg_input_is_valid" | "booleq" | "boolne" | "col_description" | "bpchareq"
         | "encode" | "bpcharlt" | "pg_text_int" | "pg_assign_int" => &[2],
-        "pg_float_text" | "pg_numeric_mod" | "pg_trunc_scale" => &[2],
+        "pg_float_text" | "pg_numeric_mod" => &[2],
         "pg_assign_int_value" | "pg_assign_numeric_value" => &[3],
         "version" | "current_database" | "current_schema" | "pg_backend_pid" => &[0],
         "now" | "transaction_timestamp" | "statement_timestamp" => &[0],
@@ -121,34 +121,6 @@ pub(crate) fn exec_scalar(conn: &Connection, name: &str, args: &[Value]) -> Resu
                     _ => Value::Null,
                 }),
             }
-        }
-        // PostgreSQL's trunc(numeric, int): the value's decimal digits past the scale dropped (toward
-        // zero), a negative scale zeroing digits left of the point. Written by the translator for a
-        // trunc with a scale, which PostgreSQL resolves over numeric alone (the engine's trunc takes
-        // one argument: numfuzz seeds 8436, 8462 at f1dc48429, recorded rec60-loud-classes). Each
-        // value is read as the decimal its shortest text spells, exact for the numerics of at most
-        // 15 significant digits held here, and truncated on those digits: a float's 5.79 * 100 is
-        // 578.99..., so a floor of it is 5.78 where PostgreSQL's is 5.79.
-        "pg_trunc_scale" => {
-            let (Some(a), Some(b)) = (args.first(), args.get(1)) else { return Ok(Value::Null) };
-            if matches!(a, Value::Null) || matches!(b, Value::Null) {
-                return Ok(Value::Null);
-            }
-            let refused = || LimboError::Constraint(SqlErrorMessage::classified(SqlErrorKind::FeatureNotSupported, "trunc over this value is not supported"));
-            let Value::Numeric(turso_core::Numeric::Integer(scale)) = b else { return Err(refused()) };
-            let text = match a {
-                Value::Numeric(turso_core::Numeric::Integer(i)) => i.to_string(),
-                Value::Numeric(turso_core::Numeric::Float(f)) if f64::from(*f).is_finite() => format!("{}", f64::from(*f)),
-                Value::Numeric(turso_core::Numeric::Float(_)) => return Ok(a.clone()),
-                Value::Text(t) => t.as_str().trim().to_string(),
-                _ => return Err(refused()),
-            };
-            let truncated = truncate_decimal(&text, *scale).ok_or_else(refused)?;
-            Ok(match (a, truncated.parse::<i64>()) {
-                (Value::Numeric(turso_core::Numeric::Integer(_)), Ok(i)) => Value::from_i64(i),
-                // PostgreSQL's numeric has no negative zero: trunc(-0.5) is 0.
-                _ => truncated.parse::<f64>().map(|f| Value::from_f64(if f == 0.0 { 0.0 } else { f })).map_err(|_| refused())?,
-            })
         }
         // An expression's value assigned to an integer column, cast as PostgreSQL's assignment cast
         // casts it: an integer range-checked, a float or decimal text rounded ("numeric" half away
@@ -832,33 +804,6 @@ fn pg_get_indexdef(conn: &Connection, target_oid: i64) -> Option<String> {
     }
 
     None
-}
-
-/// `text`, a decimal (an optional sign, digits, an optional fraction), with the digits past `scale`
-/// decimal places dropped toward zero, as numeric's trunc drops them; a negative scale zeroes that
-/// many digits left of the point. None for a spelling it does not read.
-fn truncate_decimal(text: &str, scale: i64) -> Option<String> {
-    let (sign, body) = match text.as_bytes().first() {
-        Some(b'-') => ("-", &text[1..]),
-        Some(b'+') => ("", &text[1..]),
-        _ => ("", text),
-    };
-    let (whole, fraction) = body.split_once('.').unwrap_or((body, ""));
-    if (whole.is_empty() && fraction.is_empty()) || !whole.bytes().chain(fraction.bytes()).all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    let whole = if whole.is_empty() { "0" } else { whole };
-    Some(if scale >= 0 {
-        let keep = fraction.len().min(usize::try_from(scale).unwrap_or(usize::MAX));
-        if keep == 0 { format!("{sign}{whole}") } else { format!("{sign}{whole}.{}", &fraction[..keep]) }
-    } else {
-        let zeroed = usize::try_from(scale.unsigned_abs()).unwrap_or(usize::MAX);
-        if zeroed >= whole.len() {
-            "0".to_string()
-        } else {
-            format!("{sign}{}{}", &whole[..whole.len() - zeroed], "0".repeat(zeroed))
-        }
-    })
 }
 
 /// Validate input for a PostgreSQL type, returning error info if invalid.

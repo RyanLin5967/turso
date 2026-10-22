@@ -5721,11 +5721,18 @@ impl PostgreSQLTranslator {
         // regular function call with operands already in `(haystack, needle)`
         // order — the same shape SQLite's `instr` and PostgreSQL's `strpos`
         // take — so the rewrite is purely a name change.
+        // trunc with a scale is PostgreSQL's numeric one, which the engine does not have (its trunc
+        // takes one argument, 42601): refused 0A000 until the engine's exact NUMERIC class lands,
+        // never computed here (the lead's ruling LEAD-RULINGS e790b95e57: no new frontend numeric
+        // arithmetic). A float argument was refused 42883 by the walk before this.
+        if func_name == "trunc" && args.len() == 2 {
+            return Err(ParseError::ParseError(SqlErrorMessage::classified(
+                SqlErrorKind::FeatureNotSupported,
+                "trunc with a scale is not supported: the engine has no exact numeric trunc",
+            )));
+        }
         let func_name = match func_name.as_str() {
             "position" => "strpos".to_string(),
-            // trunc with a scale is PostgreSQL's numeric one, truncated on the value's decimal
-            // digits by the frontend's pg_trunc_scale: the engine's trunc takes one argument.
-            "trunc" if args.len() == 2 => "pg_trunc_scale".to_string(),
             _ => func_name,
         };
 
