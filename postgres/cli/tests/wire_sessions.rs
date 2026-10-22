@@ -17736,6 +17736,44 @@ fn a_constant_cast_past_numeric_p_s_is_22003_with_no_row() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// The lead's ruling (LEAD-RULINGS 0fac7e134e), the condition on 8f49aa6f1: ALTER COLUMN SET DEFAULT, which this server
+/// does not implement, is refused loudly, 0A000, and changes nothing: the column keeps its default (none) and an
+/// INSERT omitting it stores NULL.
+#[test]
+fn alter_column_set_default_is_refused_and_changes_nothing() {
+    let dir = Scratch::new("set-default-refused");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE sd (id int PRIMARY KEY, b int)").ok("create");
+    for sql in ["ALTER TABLE sd ALTER COLUMN b SET DEFAULT 40", "ALTER TABLE sd ALTER COLUMN b SET DEFAULT 'y'"] {
+        let r = a.q(sql);
+        assert_eq!(r.error.as_ref().map(|e| e.code.as_str()), Some("0A000"), "{sql}: {:?} {:?}", r.tags, r.error);
+    }
+    a.q("INSERT INTO sd (id) VALUES (1)").ok("insert");
+    let r = a.q("SELECT b IS NULL FROM sd WHERE id = 1");
+    assert_eq!(r.rows, vec![vec![Some("t".to_string())]], "SET DEFAULT changed the column: {:?}", r.rows);
+}
+
+/// The lead's ruling (LEAD-RULINGS 0fac7e134e), the condition on cbe01fb3a: a two-dimensional literal into an integer
+/// array column (PostgreSQL stores {{1,2},{3,4}}; the engine's arrays have one dimension) is refused loudly, never
+/// stored flattened or truncated: no row is written.
+#[test]
+fn a_two_dimensional_literal_into_an_integer_array_is_refused_not_flattened() {
+    let dir = Scratch::new("array-2d-refused");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE a2 (id int PRIMARY KEY, xs int[])").ok("create");
+    for (id, literal) in [(1, "{{1,2},{3,4}}"), (2, "{{1},{2}}"), (3, "{{0x1F,1_000},{3,4}}")] {
+        let sql = format!("INSERT INTO a2 VALUES ({id}, '{literal}')");
+        let r = a.q(&sql);
+        assert!(r.error.is_some(), "{sql} was stored: {:?}", r.tags);
+        let r = a.q(&format!("UPDATE a2 SET xs = '{literal}' WHERE id = 0"));
+        let _ = r;
+    }
+    let r = a.q("SELECT count(*) FROM a2");
+    assert_eq!(r.rows, vec![vec![Some("0".to_string())]], "a two-dimensional literal left a row: {:?}", r.rows);
+}
+
 /// The lead's ruling (LEAD-RULINGS 3abd61b6d3 (b), arrays and domains): an integer array column reads a string literal
 /// element by element as its element type's input routine reads it, and a domain over an integer type as its base type
 /// (a 42804 names the domain), even when no row matches. Expected answers: PG 18.6, recorded (artie 3b8380247f,
