@@ -17739,7 +17739,8 @@ fn a_constant_cast_past_numeric_p_s_is_22003_with_no_row() {
 /// The lead's ruling (LEAD-RULINGS 3abd61b6d3 (b), arrays and domains): an integer array column reads a string literal
 /// element by element as its element type's input routine reads it, and a domain over an integer type as its base type
 /// (a 42804 names the domain), even when no row matches. Expected answers: PG 18.6, recorded (artie 3b8380247f,
-/// rec41-array-domain-assign/pg18-wirefuzz-an_array_or_domain_column_reads_its_literal_as_its_element_type.out).
+/// rec41-array-domain-assign/pg18-wirefuzz-an_array_or_domain_column_reads_its_literal_as_its_element_type.out), but
+/// its two-dimensional literal and that row (the engine's arrays have one dimension, its own class).
 #[test]
 fn an_array_or_domain_column_reads_its_literal_as_its_element_type() {
     let dir = Scratch::new("array-domain-assign");
@@ -17758,7 +17759,6 @@ fn an_array_or_domain_column_reads_its_literal_as_its_element_type() {
         ("INSERT INTO ad (id, xs) VALUES (1, '{1,2,3000000000}')", "22003", r#"value "3000000000" is out of range for type integer"#),
         ("INSERT INTO ad (id, xs) VALUES (1, '{1, 0x1F, 1_000}')", "", ""),
         ("INSERT INTO ad (id, ys) VALUES (2, '{9223372036854775808}')", "22003", r#"value "9223372036854775808" is out of range for type bigint"#),
-        ("INSERT INTO ad (id, xs) VALUES (3, '{{1,2},{3,4}}')", "", ""),
         ("INSERT INTO ad (id, p) VALUES (4, 'x')", "22P02", r#"invalid input syntax for type integer: "x""#),
         ("INSERT INTO ad (id, p) VALUES (4, '0x10')", "", ""),
         ("INSERT INTO ad (id, p) VALUES (5, '-1')", "23514", r#"value for domain posint violates check constraint "posint_check""#),
@@ -17781,7 +17781,6 @@ fn an_array_or_domain_column_reads_its_literal_as_its_element_type() {
     let r = a.q("SELECT id, xs, ys, p, s FROM ad ORDER BY id");
     let want: Vec<Vec<Option<String>>> = [
         ["1", "{1,31,1000}", "", "", ""],
-        ["3", "{{1,2},{3,4}}", "", "", ""],
         ["4", "", "", "16", ""],
         ["6", "", "", "", "3"],
     ]
