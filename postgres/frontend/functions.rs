@@ -745,6 +745,101 @@ pub(crate) fn pg_strtoint(input: &str, bits: u32) -> PgInt {
     PgInt::Value(if negative { (value as i64).wrapping_neg() } else { value as i64 })
 }
 
+/// A decimal constant's value rounded half away from zero, as numeric's int2/int4/int8 casts round
+/// it (-0.5 is -1, 2.5e-1 is 0; recorded, rec29-constant-assign, artie c9722422e1); i128::MAX for
+/// one past any integer type. None for a spelling that is not plain decimal (a 0x prefix, an
+/// underscore), which the caller leaves alone.
+pub(crate) fn round_decimal(text: &str) -> Option<i128> {
+    let t = text.trim();
+    let (negative, t) = match t.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, t.strip_prefix('+').unwrap_or(t)),
+    };
+    let (mantissa, exponent) = match t.find(['e', 'E']) {
+        Some(p) => (&t[..p], t[p + 1..].parse::<i64>().ok()?),
+        None => (t, 0),
+    };
+    let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    if (whole.is_empty() && fraction.is_empty())
+        || !whole.bytes().chain(fraction.bytes()).all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    let all = format!("{whole}{fraction}");
+    let digits = all.trim_start_matches('0');
+    if digits.is_empty() {
+        return Some(0);
+    }
+    // The value is digits x 10^shift.
+    let shift = exponent.saturating_sub(fraction.len() as i64);
+    let kept = digits.len() as i64 + shift;
+    if kept > 30 {
+        return Some(i128::MAX);
+    }
+    let (integer, next) = if shift >= 0 {
+        (format!("{digits}{}", "0".repeat(shift as usize)), 0)
+    } else if kept > 0 {
+        (digits[..kept as usize].to_string(), digits.as_bytes()[kept as usize] - b'0')
+    } else if kept == 0 {
+        (String::new(), digits.as_bytes()[0] - b'0')
+    } else {
+        (String::new(), 0)
+    };
+    let mut value: i128 = if integer.is_empty() { 0 } else { integer.parse().ok()? };
+    if next >= 5 {
+        value += 1;
+    }
+    Some(if negative { -value } else { value })
+}
+
+/// Whether numeric `text` (a constant's spelling, or numeric input: blanks, a sign, 'NaN',
+/// 'Infinity') is past numeric(precision, scale): rounded half away from zero to `scale` places,
+/// it reaches 10^(precision - scale), a negative scale or one past the precision included, as
+/// apply_typmod judges it (recorded, rec31-constant-numeric-cast, artie 8ceb58f30a). None for a
+/// spelling it does not read (a 0x prefix, an underscore), which the caller leaves alone.
+pub(crate) fn numeric_overflows(text: &str, precision: i32, scale: i32) -> Option<bool> {
+    let t = text.trim();
+    let unsigned = t.strip_prefix(['-', '+']).unwrap_or(t);
+    if unsigned.eq_ignore_ascii_case("nan") {
+        return Some(false);
+    }
+    if unsigned.eq_ignore_ascii_case("infinity") || unsigned.eq_ignore_ascii_case("inf") {
+        return Some(true);
+    }
+    let (mantissa, exponent) = match unsigned.find(['e', 'E']) {
+        Some(p) => (&unsigned[..p], unsigned[p + 1..].parse::<i64>().ok()?),
+        None => (unsigned, 0),
+    };
+    let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    if (whole.is_empty() && fraction.is_empty())
+        || !whole.bytes().chain(fraction.bytes()).all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    let all = format!("{whole}{fraction}");
+    let digits = all.trim_start_matches('0');
+    if digits.is_empty() {
+        return Some(false);
+    }
+    // The value times 10^scale is digits x 10^shift; its rounded integer's digit count decides.
+    let shift = exponent.saturating_sub(fraction.len() as i64).saturating_add(i64::from(scale));
+    let n = digits.len() as i64;
+    let rounded = if shift >= 0 {
+        n.saturating_add(shift)
+    } else {
+        let kept = n + shift;
+        if kept < 0 {
+            0
+        } else if kept == 0 {
+            i64::from(digits.as_bytes()[0] >= b'5')
+        } else {
+            let up = digits.as_bytes()[kept as usize] >= b'5';
+            if up && digits[..kept as usize].bytes().all(|b| b == b'9') { kept + 1 } else { kept }
+        }
+    };
+    Some(rounded > i64::from(precision))
+}
+
 /// int2in/int4in/int8in's refusal of `input`, if any, with PostgreSQL's message.
 fn pg_int_input_error(input: &str, bits: u32, name: &str) -> Option<(String, SqlErrorKind)> {
     match pg_strtoint(input, bits) {

@@ -5249,7 +5249,8 @@ fn resolve_pg_type_for_column(stmt: &turso_core::Statement, idx: usize) -> Type 
         ColumnTypeKind::Custom if info.declared_name.eq_ignore_ascii_case("numeric") => Type::NUMERIC,
         // A smallint column is PostgreSQL's int2: the name table below gives the SQLite affinity,
         // INTEGER, int4 (wirefuzz vs PG 18.6, wire-fuzz1/2). Binary int2 refuses a stored value
-        // past its range (22003); the engine does not refuse one on INSERT (PGDIV-INT-RANGE).
+        // past its range (22003); the engine does not refuse an expression's value past it on
+        // INSERT (PGDIV-INT-RANGE; a constant is range-checked by the frontend).
         _ if ["smallint", "int2", "smallserial"]
             .iter()
             .any(|n| info.declared_name.eq_ignore_ascii_case(n)) =>

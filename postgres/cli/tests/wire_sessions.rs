@@ -12554,7 +12554,6 @@ replays_postgresql!(
         (13, "PGDIV-NUMERIC-CAST-FLOAT8 value [wire]: a CAST to NUMERIC(p,s) is computed and typed as the engine's REAL (701, '2.5, 10') where PG types it 1700 with its scale ('2.50, 10.00'); it sorts and compares as a number (wire-rev-2a68496d0 H1); numeric waits for the engine's typed CAST (437f337be)"),
         (14, "PGDIV-NUMERIC-CAST-FLOAT8 value [wire]: a CAST to NUMERIC(p,s) is computed and typed as the engine's REAL (701, '123456.78, 2.5') where PG types it 1700 with its scale ('123456.78, 2.50'); it sorts and compares as a number (wire-rev-2a68496d0 H1); numeric waits for the engine's typed CAST (437f337be)"),
         (15, "PGDIV-NUMERIC-TYPMOD-CODE value [engine]: NUMERIC(2,-1), a negative scale PG 15+ accepts (123 rounds to 120), is refused 23000 by the engine's numeric_encode"),
-        (17, "PGDIV-NUMERIC-TYPMOD-CODE error-code [engine]: NUMERIC(2,5) is refused 23000 'scale must not exceed precision' where PG accepts the type and answers 22003 numeric field overflow"),
         (18, "PGDIV-NUMERIC-CAST-FLOAT8 value [wire]: a CAST to NUMERIC(p,s) is computed and typed as the engine's REAL (701, '2, 4, 6') where PG types it 1700 with its scale ('2.00, 4.00, 6.00'); it sorts and compares as a number (wire-rev-2a68496d0 H1); numeric waits for the engine's typed CAST (437f337be)"),
         (19, "PGDIV-NUMERIC-CAST-FLOAT8 value [wire]: a CAST to NUMERIC(p,s) is computed and typed as the engine's REAL (701, '2.5') where PG types it 1700 with its scale ('2.50'); it sorts and compares as a number (wire-rev-2a68496d0 H1); numeric waits for the engine's typed CAST (437f337be)"),
     ]
@@ -13556,8 +13555,6 @@ replays_postgresql!(
         (13, "PGDIV-INT-RANGE error-step [engine]: i * 2 is 22003 integer out of range as PG; PG sends the RowDescription (23) first, ours refuses before it"),
         (14, "PGDIV-INT-RANGE error-text [engine]: '2147483648'::int4 is 22003 as PG, saying 'integer out of range'; PG 'value \"2147483648\" is out of range for type integer'"),
         (16, "PGDIV-INT-RANGE error-text [engine]: CAST(9.5e18 AS BIGINT) is 22003 as PG, saying 'integer out of range'; PG 'bigint out of range'"),
-        (18, "PGDIV-INT-RANGE value [engine]: SILENT: INSERT of 2147483648 into an INT column succeeds; PG 22003 integer out of range"),
-        (19, "PGDIV-INT-RANGE cascade [engine]: sum(i) 4294967296 vs 2147483648 because #18 stored the out-of-range row (cascade of #18)"),
         (20, "PGDIV-SUM-INT8-NUMERIC value [engine]: sum(bigint) past int8: ours 22003 'integer overflow'; PG sum(int8) is numeric and answers 9223372036854775808 typed 1700"),
     ]
 );
@@ -17601,6 +17598,159 @@ fn a_string_parameter_assigned_to_another_category_is_42804() {
         if !agrees {
             wrong.push(format!("{sql}: PG {want:?}; got {:?} {:?}", r.tags, r.error));
         }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// numfuzz (seeds 285 at 6e17acc9a, 875 at 45de98440; artie 9b32cd5149, dcbd0e0179): a constant cast past
+/// numeric(p, s) is 22003 'numeric field overflow' at planning, wherever it stands, so a statement matching no row is
+/// refused too; each was answered (UPDATE 0). The bound is the value rounded half away from zero to s places reaching
+/// 10^(p - s), s negative or past p included; 'Infinity' overflows, 'NaN' does not. Expected answers: PG 18.6, recorded
+/// (artie 8ceb58f30a, rec31-constant-numeric-cast/pg18-wirefuzz-a_constant_cast_past_numeric_p_s_is_22003_with_no_row.out),
+/// but its five casts PG answers with no row whose refusal here is another class: -99999::numeric(5,0) (the interim 0A000
+/// of a minus over a numeric(p, s) cast), 1.5::numeric(3,-1), 12345::numeric(3,-2), 0.00123::numeric(2,4) and
+/// 'NaN'::numeric(5,2) (the engine's numeric, PGDIV-NUMERIC-TYPMOD-CODE and its NaN).
+#[test]
+fn a_constant_cast_past_numeric_p_s_is_22003_with_no_row() {
+    let dir = Scratch::new("numeric-cast-constant");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let ddl = "CREATE TABLE nt (id int PRIMARY KEY, c0 numeric(20,5), c1 int)";
+    a.q(ddl).ok(ddl);
+    let mut wrong = Vec::new();
+    for (sql, overflow) in [
+        ("UPDATE nt SET c0 = (47654686040.1)::numeric(6,2) WHERE id = 1", true),
+        ("UPDATE nt SET c0 = ((-9223372036854775808))::numeric(10,0) WHERE id = 1", true),
+        ("DELETE FROM nt WHERE c0 = 1000::numeric(3,0)", true),
+        ("SELECT id FROM nt WHERE c0 > 12345.678::numeric(5,2)", true),
+        ("SELECT id FROM nt WHERE c0 > 999.995::numeric(5,2)", true),
+        ("SELECT id FROM nt WHERE c0 > 999.994::numeric(5,2)", false),
+        ("SELECT id FROM nt WHERE c0 > '123456'::numeric(5,2)", true),
+        ("SELECT id FROM nt WHERE c0 > CAST(1e10 AS numeric(6,0))", true),
+        ("SELECT id FROM nt WHERE c0 > 0.5::numeric(1,1)", false),
+        ("SELECT id FROM nt WHERE c0 > 1::numeric(1,1)", true),
+        ("SELECT id FROM nt WHERE c0 > 0.0123::numeric(2,4)", true),
+        ("INSERT INTO nt SELECT 1, 1e9::numeric(4,0), 1 WHERE false", true),
+        ("SELECT id FROM nt WHERE c0 > 'Infinity'::numeric(5,2)", true),
+        ("SELECT id FROM nt WHERE c0 > 1e10::numeric", false),
+    ] {
+        let r = a.q(sql);
+        let fine = if overflow {
+            r.error.as_ref().is_some_and(|e| e.code == "22003" && e.message == "numeric field overflow")
+        } else {
+            r.error.is_none() && r.rows.is_empty()
+        };
+        if !fine {
+            let want = if overflow { "22003 numeric field overflow" } else { "no row" };
+            wrong.push(format!("{sql}: PG {want}; got {:?} {:?} {:?}", r.tags, r.rows, r.error));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// numfuzz (seeds 343 at 6e17acc9a, 1144 at 45de98440; artie 9b32cd5149, 52ca04164d): a real is written in the
+/// shortest digits that read back as it from strictly inside its rounding interval, as float4out writes it: a decimal on
+/// the interval's edge reads back only by ties-to-even, and PostgreSQL passes over it (-337198016 is -3.3719802e+08,
+/// written -3.37198e+08). Expected answers: PG 18.6, recorded (artie 8534fb40a0,
+/// rec30-float4-ties/pg18-wirefuzz-a_real_is_written_in_the_shortest_digits_strictly_inside_its_interval.out),
+/// but its v::float8 (-337198016, 16999999488): the engine stores a real column's value unrounded to float4, its own
+/// class (routed to the engine).
+#[test]
+fn a_real_is_written_in_the_shortest_digits_strictly_inside_its_interval() {
+    let dir = Scratch::new("float4-ties");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in [
+        "CREATE TABLE r (id int PRIMARY KEY, v real)",
+        "INSERT INTO r VALUES (1, '-337198023.9225'), (2, 1.70e10), (3, 979207168), (4, -61659648), (5, -59204712), (6, 74746384), (7, 37812272), (8, 0.1), (9, 1.5), (10, 3.4028235e38), (11, 1e-45), (12, 100), (13, -2.5e-5)",
+    ] {
+        a.q(sql).ok(sql);
+    }
+    let mut wrong = Vec::new();
+    let col = |v: &[&str]| -> Vec<Vec<Option<String>>> { v.iter().map(|x| vec![Some(x.to_string())]).collect() };
+    for (sql, want) in [
+        (
+            "SELECT v FROM r ORDER BY id",
+            col(&[
+                "-3.3719802e+08", "1.6999999e+10", "9.7920717e+08", "-6.1659648e+07", "-5.9204712e+07", "7.4746384e+07",
+                "3.7812272e+07", "0.1", "1.5", "3.4028235e+38", "1e-45", "100", "-2.5e-05",
+            ]),
+        ),
+        ("SELECT DISTINCT v FROM r WHERE id = 1", col(&["-3.3719802e+08"])),
+    ] {
+        let r = a.q(sql);
+        if r.error.is_some() || r.rows != want {
+            wrong.push(format!("{sql}: PG {want:?}; got {:?} {:?}", r.rows, r.error));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// numfuzz (seed 622 at 45de98440; artie e49c37285f): a numeric or int8 constant assigned to an integer column is
+/// rounded half away from zero and range-checked as the assignment cast does, at planning, so a statement matching no
+/// row is refused too: 15341459444911775 into an int column was stored. Expected answers: PG 18.6, recorded (artie
+/// c9722422e1, rec29-constant-assign/pg18-wirefuzz-a_numeric_constant_assigned_to_an_integer_column_is_rounded_and_range_checked.out),
+/// but its #16 (9223372036854775807.4 into a bigint, stored by PG as 9223372036854775807) and that row: a decimal past 15
+/// significant digits within the column stays the interim 0A000 (a_decimal_past_15_digits_is_refused_on_every_path, the
+/// lead's ruling d2bf57effb).
+#[test]
+fn a_numeric_constant_assigned_to_an_integer_column_is_rounded_and_range_checked() {
+    let dir = Scratch::new("constant-int");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let ddl = "CREATE TABLE nt (id int PRIMARY KEY, a smallint, b int, c bigint)";
+    a.q(ddl).ok(ddl);
+    let mut wrong = Vec::new();
+    for (sql, message) in [
+        ("INSERT INTO nt (id, b) VALUES (1, 15341459444911775)", "integer out of range"),
+        ("INSERT INTO nt (id, a) VALUES (1, 40000)", "smallint out of range"),
+        ("INSERT INTO nt (id, b) VALUES (1, 2147483648)", "integer out of range"),
+        ("INSERT INTO nt (id, c) VALUES (1, 9223372036854775808)", "bigint out of range"),
+        ("INSERT INTO nt (id, b) VALUES (1, 2147483647.5)", "integer out of range"),
+        ("INSERT INTO nt (id, a) VALUES (1, 32767.5)", "smallint out of range"),
+        ("INSERT INTO nt (id, b) VALUES (1, 1.5e10)", "integer out of range"),
+        ("INSERT INTO nt (id, b) VALUES (1, -2147483648)", ""),
+        ("INSERT INTO nt (id, b) VALUES (2, 1.5)", ""),
+        ("INSERT INTO nt (id, b) VALUES (3, -2.5)", ""),
+        ("INSERT INTO nt (id, a) VALUES (4, 32767.4)", ""),
+        ("INSERT INTO nt (id, b) VALUES (5, 1e3)", ""),
+        ("INSERT INTO nt (id, b) VALUES (6, 0.4999)", ""),
+        ("INSERT INTO nt (id, b) VALUES (7, -0.5)", ""),
+        ("INSERT INTO nt (id, c) VALUES (9, -9223372036854775808)", ""),
+        ("INSERT INTO nt (id, b) VALUES (10, 2.5e-1)", ""),
+        ("INSERT INTO nt (id, b) VALUES (11, 7), (12, 3000000000)", "integer out of range"),
+        ("UPDATE nt SET b = 15341459444911775 WHERE id = 1000", "integer out of range"),
+        ("UPDATE nt SET a = 1e5 WHERE id = 1000", "smallint out of range"),
+        ("INSERT INTO nt (id, b) VALUES (2, 7) ON CONFLICT (id) DO UPDATE SET b = 4294967296", "integer out of range"),
+        ("INSERT INTO nt (id, b) VALUES (2, 7) ON CONFLICT (id) DO UPDATE SET b = 6.5", ""),
+    ] {
+        let r = a.q(sql);
+        let fine = if message.is_empty() {
+            r.error.is_none()
+        } else {
+            r.error.as_ref().is_some_and(|e| e.code == "22003" && e.message == message)
+        };
+        if !fine {
+            wrong.push(format!("{sql}: PG {message:?}; got {:?} {:?}", r.tags, r.error));
+        }
+    }
+    let r = a.q("SELECT id, a, b, c FROM nt ORDER BY id");
+    let want: Vec<Vec<Option<String>>> = [
+        ["1", "", "-2147483648", ""],
+        ["2", "", "7", ""],
+        ["3", "", "-3", ""],
+        ["4", "32767", "", ""],
+        ["5", "", "1000", ""],
+        ["6", "", "0", ""],
+        ["7", "", "-1", ""],
+        ["9", "", "", "-9223372036854775808"],
+        ["10", "", "0", ""],
+    ]
+    .iter()
+    .map(|row| row.iter().map(|v| (!v.is_empty()).then(|| v.to_string())).collect())
+    .collect();
+    if r.error.is_some() || r.rows != want {
+        wrong.push(format!("SELECT id, a, b, c: PG {want:?}; got {:?} {:?}", r.rows, r.error));
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
 }

@@ -652,6 +652,10 @@ fn refuse_long_decimals(
     if !may_hold_long_numeric(sql) {
         return Ok(());
     }
+    // A constant assigned to an integer column past its range is PostgreSQL's 22003 first (numfuzz
+    // seed 622 at 45de98440); one within it stays refused here, under the ruling above, though the
+    // assignment would read it exactly (12345678901234567.00 into a bigint: PG stores it).
+    literal_assignments(pg_conn, parse).map_err(LimboError::InvalidArgument)?;
     let exempt = float_target_literals(pg_conn, parse);
     match turso_pg_parser::long_decimal_literal(sql, &exempt) {
         Some(literal) => Err(LimboError::ParseError(SqlErrorMessage::classified(
@@ -2371,7 +2375,8 @@ pub(crate) fn session_translation(
     let text_casts = text_integer_casts(pg_conn, sql, parse_result);
     // Each value assigned to a column is coerced as parse analysis coerces it, here so the
     // re-prepare judges it alike; a literal an integer column reads is written as its value.
-    let integer_literals = literal_assignments(pg_conn, sql, parse_result).map_err(LimboError::InvalidArgument)?;
+    let integer_literals = literal_assignments(pg_conn, parse_result).map_err(LimboError::InvalidArgument)?;
+    constant_numeric_casts(sql, parse_result).map_err(LimboError::InvalidArgument)?;
     let translator = || {
         let t = translator();
         let t = if text_casts.is_empty() { t } else { t.with_text_integer_casts(text_casts.clone()) };
@@ -2514,27 +2519,26 @@ fn text_integer_casts(
 }
 
 /// The values an INSERT's VALUES rows, an UPDATE's SET and an ON CONFLICT's SET assign, coerced as
-/// PostgreSQL's parse analysis coerces each to its column, in row and column order: a string
-/// literal to an integer column is read as int2in/int4in/int8in read it (22P02, 22003), and a cast
-/// to a string type to a numeric or boolean column is 42804, so a statement matching no row is
-/// refused as well (numfuzz seeds 26, 249, 328, 181; recorded, rec27-literal-assign, artie
-/// 0f7b0647a8). Each was stored. Returns the literals whose spelling the engine's integer column
-/// does not read ('0x1F', '1_000', ' 7'), by parse location, with their values. Bounded by the
-/// text: a statement with no quote and no `::` has no such value. BLIND SPOTS: a schema-qualified
-/// or attached table, an array or domain column, a column of another relation or an expression of
-/// a string type (upper('x')), INSERT ... SELECT, a DEFAULT, and a literal to a float, numeric or
-/// boolean column (stored as the engine reads it).
+/// PostgreSQL's parse analysis and planner coerce each to its column, in row and column order, so
+/// a statement matching no row is refused as well (numfuzz seeds 26, 249, 328, 181, 477, 486, 622;
+/// recorded, rec27-literal-assign 0f7b0647a8, rec28-numeric-assign 2a98f248a8,
+/// rec29-constant-assign c9722422e1). Each was stored. To an integer column, a string literal is
+/// read as int2in/int4in/int8in read it (22P02, 22003), and a numeric or int8 constant is rounded
+/// half away from zero and range-checked (22003 'integer out of range'); a cast to a string type
+/// to a numeric or boolean column is 42804. Returns the literals whose spelling the engine's
+/// integer column does not read ('0x1F', '1_000', ' 7', 1.5), by parse location, with their values.
+/// Every INSERT and UPDATE passes here, so nothing is allocated per value. BLIND SPOTS: a
+/// schema-qualified or attached table, an array or domain column, a column of another relation or
+/// an expression of a string type (upper('x')), a negated or hexadecimal constant, INSERT ...
+/// SELECT, a DEFAULT, and a literal to a float, numeric or boolean column (stored as the engine
+/// reads it).
 fn literal_assignments(
     pg_conn: &PgConnectionInner,
-    sql: &str,
     parse: &turso_pg_parser::pg_query::ParseResult,
 ) -> Result<std::collections::HashMap<i32, i64>, SqlErrorMessage> {
     use turso_pg_parser::pg_query::protobuf::node::Node;
     use turso_pg_parser::pg_query::protobuf::{a_const::Val, Node as PgNode};
     let mut rewrites = std::collections::HashMap::new();
-    if !sql.as_bytes().contains(&b'\'') && !sql.as_bytes().windows(2).any(|w| w == b"::") {
-        return Ok(rewrites);
-    }
     let Some(stmt) = parse.protobuf.stmts.first().and_then(|r| r.stmt.as_ref()).and_then(|s| s.node.as_ref()) else {
         return Ok(rewrites);
     };
@@ -2548,10 +2552,25 @@ fn literal_assignments(
     };
     let schema = pg_conn.conn.current_schema();
     let Some(table) = schema.get_btree_table(&relation.relname) else { return Ok(rewrites) };
-    let declared = |column: &str| -> Option<u32> {
-        let (_, c) = table.get_column(column).filter(|(_, c)| c.array_dimensions() == 0)?;
-        u32::try_from(crate::catalog::sqlite_type_to_pg_oid(&c.ty_str)).ok()
+    // An integer column's width from its declared type, read without allocating.
+    let integer_bits = |ty: &str| -> u32 {
+        let base = ty.split('(').next().unwrap_or("").trim();
+        let is = |names: &[&str]| names.iter().any(|n| base.eq_ignore_ascii_case(n));
+        if is(&["INTEGER", "INT", "INT4", "TINYINT", "MEDIUMINT"]) {
+            32
+        } else if is(&["SMALLINT", "INT2"]) {
+            16
+        } else if is(&["BIGINT", "INT8"]) {
+            64
+        } else {
+            0
+        }
     };
+    let column_type = |column: &str| -> Option<&str> {
+        table.get_column(column).filter(|(_, c)| c.array_dimensions() == 0).map(|(_, c)| c.ty_str.as_str())
+    };
+    // An int4 constant can fail only a smallint column.
+    let has_smallint = table.columns().iter().any(|c| c.array_dimensions() == 0 && integer_bits(&c.ty_str) == 16);
     let string_cast = |c: &turso_pg_parser::pg_query::protobuf::TypeCast| -> Option<u32> {
         let t = c.type_name.as_ref().filter(|t| t.array_bounds.is_empty())?;
         match t.names.last().and_then(|n| n.node.as_ref())? {
@@ -2565,13 +2584,39 @@ fn literal_assignments(
             _ => None,
         }
     };
-    // One value assigned to the column named `column`.
     let mut coerce = |column: &str, value: &PgNode| -> Result<(), SqlErrorMessage> {
-        let Some(target) = declared(column) else { return Ok(()) };
         match value.node.as_ref() {
             Some(Node::AConst(c)) if !c.isnull => {
-                if let Some(Val::Sval(text)) = c.val.as_ref().filter(|_| matches!(target, 20 | 21 | 23)) {
-                    let name = crate::result_types::type_name(target);
+                if matches!(c.val, Some(Val::Ival(_))) && !has_smallint {
+                    return Ok(());
+                }
+                if !matches!(c.val, Some(Val::Ival(_) | Val::Fval(_) | Val::Sval(_))) {
+                    return Ok(());
+                }
+                let bits = column_type(column).map_or(0, integer_bits);
+                if bits == 0 {
+                    return Ok(());
+                }
+                let name = match bits {
+                    16 => "smallint",
+                    32 => "integer",
+                    _ => "bigint",
+                };
+                let constant = match c.val.as_ref() {
+                    Some(Val::Ival(i)) => Some((i128::from(i.ival), None)),
+                    Some(Val::Fval(f)) => crate::functions::round_decimal(&f.fval).map(|v| (v, Some(&f.fval))),
+                    _ => None,
+                };
+                if let Some((value, text)) = constant {
+                    let limit = 1i128 << (bits - 1);
+                    if value < -limit || value >= limit {
+                        return Err(SqlErrorMessage::classified(SqlErrorKind::NumericValueOutOfRange, format!("{name} out of range")));
+                    }
+                    if text.is_some_and(|t| *t != value.to_string()) {
+                        rewrites.insert(c.location, value as i64);
+                    }
+                }
+                if let Some(Val::Sval(text)) = c.val.as_ref() {
                     if let Some((message, kind)) = crate::functions::validate_pg_input(&text.sval, name) {
                         return Err(SqlErrorMessage::classified(kind, message));
                     }
@@ -2583,15 +2628,18 @@ fn literal_assignments(
                 }
             }
             Some(Node::TypeCast(c)) => {
-                if let Some(from) = string_cast(c).filter(|_| matches!(target, 16 | 20 | 21 | 23 | 700 | 701 | 1700)) {
-                    return Err(SqlErrorMessage::classified(
-                        SqlErrorKind::DatatypeMismatch,
-                        format!(
-                            "column \"{column}\" is of type {} but expression is of type {}",
-                            crate::result_types::type_name(target),
-                            crate::result_types::type_name(from)
-                        ),
-                    ));
+                if let Some(from) = string_cast(c) {
+                    let target = column_type(column).map_or(25, |ty| crate::catalog::sqlite_type_to_pg_oid(ty) as u32);
+                    if matches!(target, 16 | 20 | 21 | 23 | 700 | 701 | 1700) {
+                        return Err(SqlErrorMessage::classified(
+                            SqlErrorKind::DatatypeMismatch,
+                            format!(
+                                "column \"{column}\" is of type {} but expression is of type {}",
+                                crate::result_types::type_name(target),
+                                crate::result_types::type_name(from)
+                            ),
+                        ));
+                    }
                 }
             }
             _ => {}
@@ -2610,22 +2658,23 @@ fn literal_assignments(
     };
     match stmt {
         Node::InsertStmt(i) => {
-            let columns: Vec<String> = if i.cols.is_empty() {
-                table.columns().iter().filter_map(|c| c.name.clone()).collect()
-            } else {
-                i.cols
-                    .iter()
-                    .filter_map(|c| match c.node.as_ref() {
-                        Some(Node::ResTarget(r)) if r.indirection.is_empty() => Some(r.name.clone()),
+            let column_at = |k: usize| -> Option<&str> {
+                if i.cols.is_empty() {
+                    table.columns().get(k)?.name.as_deref()
+                } else {
+                    match i.cols.get(k)?.node.as_ref() {
+                        Some(Node::ResTarget(r)) if r.indirection.is_empty() => Some(r.name.as_str()),
                         _ => None,
-                    })
-                    .collect()
+                    }
+                }
             };
             if let Some(Node::SelectStmt(select)) = i.select_stmt.as_deref().and_then(|s| s.node.as_ref()) {
                 for row in &select.values_lists {
                     if let Some(Node::List(items)) = row.node.as_ref() {
-                        for (column, value) in columns.iter().zip(&items.items) {
-                            coerce(column, value)?;
+                        for (k, value) in items.items.iter().enumerate() {
+                            if let Some(column) = column_at(k) {
+                                coerce(column, value)?;
+                            }
                         }
                     }
                 }
@@ -2639,6 +2688,59 @@ fn literal_assignments(
     }
     drop(coerce);
     Ok(rewrites)
+}
+
+/// A constant cast to numeric(p, s) past it is 22003 'numeric field overflow', as the planner's
+/// constant folding raises it wherever the cast stands, so a statement matching no row is refused
+/// as well (numfuzz seeds 285 at 6e17acc9a, 875 at 45de98440: UPDATE 0; recorded,
+/// rec31-constant-numeric-cast, artie 8ceb58f30a). Bounded by the text: a statement that does not
+/// spell numeric or decimal holds no such cast. BLIND SPOT: a cast over an expression of constants
+/// ((1 + 2)::numeric(1,0)), which the engine judges at run time, only when a row reaches it.
+fn constant_numeric_casts(sql: &str, parse: &turso_pg_parser::pg_query::ParseResult) -> std::result::Result<(), SqlErrorMessage> {
+    use turso_pg_parser::pg_query::{protobuf::a_const::Val, protobuf::node::Node, NodeRef};
+    let b = sql.as_bytes();
+    let spelled = |w: &[u8]| b.windows(w.len()).any(|x| x.eq_ignore_ascii_case(w));
+    if !spelled(b"numeric") && !spelled(b"decimal") {
+        return Ok(());
+    }
+    for (n, ..) in parse.protobuf.nodes().iter() {
+        let NodeRef::TypeCast(c) = n else { continue };
+        let Some(t) = c.type_name.as_ref().filter(|t| t.array_bounds.is_empty() && !t.typmods.is_empty()) else {
+            continue;
+        };
+        if !t.names.last().is_some_and(|n| matches!(&n.node, Some(Node::String(s)) if s.sval == "numeric")) {
+            continue;
+        }
+        let modifier = |i: usize| match t.typmods.get(i).and_then(|m| m.node.as_ref()) {
+            Some(Node::AConst(a)) => match a.val.as_ref() {
+                Some(Val::Ival(v)) => Some(v.ival),
+                _ => None,
+            },
+            _ => None,
+        };
+        let Some(precision) = modifier(0).filter(|p| *p >= 1) else { continue };
+        let scale = if t.typmods.len() > 1 {
+            match modifier(1) {
+                Some(s) => s,
+                None => continue,
+            }
+        } else {
+            0
+        };
+        let text = match c.arg.as_deref().and_then(|a| a.node.as_ref()) {
+            Some(Node::AConst(a)) if !a.isnull => match a.val.as_ref() {
+                Some(Val::Ival(i)) => i.ival.to_string(),
+                Some(Val::Fval(f)) => f.fval.clone(),
+                Some(Val::Sval(s)) => s.sval.clone(),
+                _ => continue,
+            },
+            _ => continue,
+        };
+        if crate::functions::numeric_overflows(&text, precision, scale) == Some(true) {
+            return Err(SqlErrorMessage::classified(SqlErrorKind::NumericValueOutOfRange, "numeric field overflow"));
+        }
+    }
+    Ok(())
 }
 
 /// A translation's refusal as the engine error it is reported with: PostgreSQL's own message, with

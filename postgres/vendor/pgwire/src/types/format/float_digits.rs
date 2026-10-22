@@ -84,7 +84,7 @@ impl ExtraFloatDigits {
         // This preserves the original binary float value exactly
         // At most 9 digits for f32
         if extra >= 1 {
-            return postgres_shortest(&format!("{value:e}"), Self::FLT_DIG as i32);
+            return postgres_shortest(&strictly_shortest_f32(value), Self::FLT_DIG as i32);
         }
 
         // For negative values, round to FLT_DIG + extra_float_digits significant digits
@@ -92,6 +92,32 @@ impl ExtraFloatDigits {
         let sig_digits = (Self::FLT_DIG + extra).max(0) as usize;
         format_with_significant_digits(value as f64, sig_digits)
     }
+}
+
+/// float4out's digits (src/common/f2s.c, built without STRICTLY_SHORTEST, so acceptBounds is
+/// false): the shortest that read back as `value` from strictly inside its rounding interval. Rust's
+/// `{:e}` may give a decimal on the interval's edge, which reads back only by ties-to-even:
+/// -337198016 was -3.37198e+08, PostgreSQL's -3.3719802e+08 (turso fastest-wire, numfuzz seeds 343
+/// and 1144; PG 18.6 recorded, rec30-float4-ties). The edges, halfway to each neighbour, are exact
+/// in an f64, and a candidate of at most 9 digits equal to one parses to it exactly. BLIND SPOT:
+/// float8 at an edge (its halfway points need 54 bits) keeps Rust's digits.
+fn strictly_shortest_f32(value: f32) -> String {
+    let shortest = format!("{value:e}");
+    let x = f64::from(value);
+    let bits = value.to_bits();
+    let up = f64::from(f32::from_bits(bits.wrapping_add(1)));
+    let down = f64::from(f32::from_bits(bits.wrapping_sub(1)));
+    let on_edge = |s: &str| s.parse::<f64>().is_ok_and(|v| v == (x + up) / 2.0 || v == (x + down) / 2.0);
+    if !on_edge(&shortest) {
+        return shortest;
+    }
+    for digits in 2..=9 {
+        let candidate = format!("{value:.*e}", digits - 1);
+        if candidate.parse::<f32>() == Ok(value) && !on_edge(&candidate) {
+            return candidate;
+        }
+    }
+    shortest
 }
 
 /// PostgreSQL's shortest-exact float text (float8out / float4out at extra_float_digits >= 1,
