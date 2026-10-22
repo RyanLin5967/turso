@@ -51,7 +51,7 @@ impl ExtraFloatDigits {
         // This preserves the original binary float value exactly
         // At most 17 digits for f64
         if extra >= 1 {
-            return postgres_shortest(&format!("{value:e}"), Self::DBL_DIG as i32);
+            return postgres_shortest(&strictly_shortest_f64(value), Self::DBL_DIG as i32);
         }
 
         // For negative values, round to DBL_DIG + extra_float_digits significant digits
@@ -94,13 +94,92 @@ impl ExtraFloatDigits {
     }
 }
 
+/// float8out's digits (src/common/d2s.c, built without STRICTLY_SHORTEST, so acceptBounds is
+/// false): the shortest that read back as `value` from strictly inside its rounding interval, as
+/// [`strictly_shortest_f32`] for float4 (20197275871653528 is 2.0197275871653528e+16, not Rust's
+/// 2.019727587165353e+16; turso fastest-wire, PG 18.6 recorded, rec36-float8-ties). The edge test is
+/// exact ([`on_f64_edge`]).
+fn strictly_shortest_f64(value: f64) -> String {
+    let shortest = format!("{value:e}");
+    if !on_f64_edge(value, &shortest) {
+        return shortest;
+    }
+    for digits in 2..=17 {
+        let candidate = format!("{value:.*e}", digits - 1);
+        if candidate.parse::<f64>() == Ok(value) && !on_f64_edge(value, &candidate) {
+            return candidate;
+        }
+    }
+    shortest
+}
+
+/// Whether the decimal `candidate` (Rust's `{:e}` text) is exactly halfway between `value` and a
+/// neighbouring double. With the candidate as D x 10^e and the halfway point as M x 2^k (M odd),
+/// they are equal exactly when D's powers of two make up k and D's odd part times 5^e is M (each
+/// side's power of five moved across), all within u128: M has at most 55 bits and D at most 17
+/// digits, so a power of five past 5^27 already makes the sides differ.
+fn on_f64_edge(value: f64, candidate: &str) -> bool {
+    let Some((d, e)) = decimal_parts(candidate) else { return false };
+    if d == 0 {
+        return false;
+    }
+    let bits = value.abs().to_bits();
+    let parts = |b: u64| -> (u128, i64) {
+        let exp = ((b >> 52) & 0x7ff) as i64;
+        let frac = u128::from(b & ((1u64 << 52) - 1));
+        if exp == 0 { (frac, -1074) } else { (frac | (1u128 << 52), exp - 1075) }
+    };
+    let (dv2, dodd) = (d.trailing_zeros() as i64, d >> d.trailing_zeros());
+    let halfway = |n: u64| -> bool {
+        if (n >> 52) & 0x7ff == 0x7ff {
+            return false;
+        }
+        let ((a, ea), (b, eb)) = (parts(bits), parts(n));
+        let e0 = ea.min(eb);
+        let sum = (a << (ea - e0)) + (b << (eb - e0));
+        let tz = sum.trailing_zeros() as i64;
+        let (m, k) = (sum >> tz, e0 - 1 + tz);
+        if dv2 + e != k {
+            return false;
+        }
+        let five = |p: i64| (0..p).try_fold(1u128, |acc, _| acc.checked_mul(5));
+        match (dodd.checked_mul(five(e.max(0)).unwrap_or(0)), m.checked_mul(five((-e).max(0)).unwrap_or(0))) {
+            (Some(l), Some(r)) => l != 0 && l == r,
+            _ => false,
+        }
+    };
+    halfway(bits + 1) || (bits > 0 && halfway(bits - 1))
+}
+
+/// A decimal text `[-]d.ddde[-]N` (or without the point or exponent) as its digits D and the power
+/// of ten e with value D x 10^e; None past u128.
+fn decimal_parts(text: &str) -> Option<(u128, i64)> {
+    let t = text.trim_start_matches('-');
+    let (mantissa, exp) = match t.split_once(['e', 'E']) {
+        Some((m, x)) => (m, x.parse::<i64>().ok()?),
+        None => (t, 0),
+    };
+    let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    if whole.is_empty() && fraction.is_empty() {
+        return None;
+    }
+    let mut d: u128 = 0;
+    for b in whole.bytes().chain(fraction.bytes()) {
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        d = d.checked_mul(10)?.checked_add(u128::from(b - b'0'))?;
+    }
+    Some((d, exp - fraction.len() as i64))
+}
+
 /// float4out's digits (src/common/f2s.c, built without STRICTLY_SHORTEST, so acceptBounds is
 /// false): the shortest that read back as `value` from strictly inside its rounding interval. Rust's
 /// `{:e}` may give a decimal on the interval's edge, which reads back only by ties-to-even:
 /// -337198016 was -3.37198e+08, PostgreSQL's -3.3719802e+08 (turso fastest-wire, numfuzz seeds 343
 /// and 1144; PG 18.6 recorded, rec30-float4-ties). The edges, halfway to each neighbour, are exact
-/// in an f64, and a candidate of at most 9 digits equal to one parses to it exactly. BLIND SPOT:
-/// float8 at an edge (its halfway points need 54 bits) keeps Rust's digits.
+/// in an f64, and a candidate of at most 9 digits equal to one parses to it exactly. float8's
+/// halfway points need 54 bits, so [`on_f64_edge`] tests them exactly instead.
 fn strictly_shortest_f32(value: f32) -> String {
     let shortest = format!("{value:e}");
     let x = f64::from(value);

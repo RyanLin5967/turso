@@ -2545,6 +2545,49 @@ fn an_engine_side_rollback_inside_a_block_still_aborts_it() {
     assert_eq!(code, "22003", "abs(int8 minimum) is not PostgreSQL's code");
 }
 
+/// The lead's ruling (LEAD-RULINGS 82dcec6b66, item 2): an error the ENGINE raises at execution inside a block aborts the
+/// block as PostgreSQL does, its premise asserted: the statement is parsed and bound (ParseComplete, BindComplete) and
+/// its 22003 comes at Execute, from the engine's int8 arithmetic, so no frontend refusal at prepare stands in for it
+/// (an_engine_side_rollback_inside_a_block_still_aborts_it's abs(-9223372036854775808::int8) is now refused at prepare).
+/// Every expected value is PostgreSQL 18.6's (recorded, pg18/pg18-c33-engineerr.out #13-#18, the v + 1 block).
+#[test]
+fn an_error_the_engine_raises_at_execution_aborts_the_block() {
+    let dir = Scratch::new("engine-exec-abort");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in [
+        "CREATE TABLE t(id INT PRIMARY KEY, v TEXT)",
+        "INSERT INTO t VALUES (1, 'one')",
+        "CREATE TABLE big(v BIGINT)",
+        "INSERT INTO big VALUES (9223372036854775807), (1)",
+    ] {
+        a.q(sql).ok(sql);
+    }
+    a.q("BEGIN").ok("begin");
+    a.q("INSERT INTO t VALUES (2, 'two')").ok("insert 2");
+    let (types, error) = a.bind_round("SELECT v + 1 FROM big WHERE v > 1", &[], &[], &[]);
+    let at = |m: u8| types.iter().position(|t| *t == m);
+    assert!(
+        matches!((at(b'1'), at(b'2'), at(b'E')), (Some(p), Some(b), Some(e)) if p < b && b < e),
+        "premise: the error must come at Execute, after ParseComplete and BindComplete; messages {:?}",
+        String::from_utf8_lossy(&types)
+    );
+    let error = error.expect("v + 1 past int8 raised nothing");
+    assert_eq!((error.code.as_str(), error.message.as_str()), ("22003", "bigint out of range"));
+    assert_eq!(types.last(), Some(&b'Z'));
+    let r = a.q("INSERT INTO t VALUES (3, 'three')");
+    assert_eq!(r.status, b'E');
+    let e = r.err("insert 3");
+    assert_eq!(
+        (e.code.as_str(), e.message.as_str()),
+        ("25P02", "current transaction is aborted, commands ignored until end of transaction block")
+    );
+    let r = a.q("COMMIT").ok("commit");
+    assert_eq!(r.tags, vec!["ROLLBACK".to_string()]);
+    assert_eq!(r.status, b'I');
+    assert_eq!(a.q("SELECT count(*) FROM t WHERE id IN (2, 3)").single("rows"), "0", "part of a failed block committed");
+}
+
 /// sum() over int8 is a numeric in PostgreSQL and does not overflow; int8 + and * past the int8
 /// range raise 22003 "bigint out of range" (recorded, artie raw
 /// loud-20261015/pg18-diff/pg18-c33-engineerr.out, every case of its first part). The two tests
@@ -16652,7 +16695,6 @@ fn a_decimal_past_15_digits_is_refused_on_every_path() {
         "UPDATE nm SET (n, t) = (12345678901234567.88, 'y') WHERE id = 1",
         "INSERT INTO nm (id, n) VALUES (1, 2) ON CONFLICT (id) DO UPDATE SET n = 12345678901234567.87",
         "INSERT INTO nm (id, t) VALUES (4, 12345678901234567.89)",
-        "INSERT INTO nm (id, b) VALUES (5, 12345678901234567.00)",
         "INSERT INTO nm (id, n) VALUES (6, 1234567890123456789012345678)",
         "INSERT INTO nm (id, n) VALUES (7, 1.234567890123456789e10)",
         "INSERT INTO nm (id, n) VALUES (8, 12_345_678_901_234_567.89)",
@@ -16692,9 +16734,21 @@ fn a_decimal_past_15_digits_is_refused_on_every_path() {
             wrong.push(format!("bound '12345678901234567.89' (declared {declared}): tags {:?} error {:?}, refused 0A000", r.tags, r.error));
         }
     }
+    // The lead's ruling LEAD-RULINGS 82dcec6b66 lifts the refusal for an integer column on the assignment paths: a
+    // bigint takes 12345678901234567.00 exactly, as PostgreSQL 18.6 stores it (recorded, artie b6b2626a77,
+    // rec35-long-decimal-bigint-case).
+    let sql = "INSERT INTO nm (id, b) VALUES (5, 12345678901234567.00)";
+    let r = a.q(sql);
+    if r.error.is_some() {
+        wrong.push(format!("{sql}: error {:?}, PostgreSQL INSERT 0 1", r.error));
+    }
+    let r = a.q("SELECT b FROM nm WHERE id = 5");
+    if r.rows != vec![vec![Some("12345678901234567".to_string())]] {
+        wrong.push(format!("id 5 holds {:?}, PostgreSQL 12345678901234567", r.rows));
+    }
     let r = a.q("SELECT count(*) FROM nm");
-    if r.rows != vec![vec![Some("1".to_string())]] {
-        wrong.push(format!("nm holds {:?} rows after the refusals, want 1", r.rows));
+    if r.rows != vec![vec![Some("2".to_string())]] {
+        wrong.push(format!("nm holds {:?} rows after the refusals and id 5, want 2", r.rows));
     }
     for (sql, want) in [
         ("SELECT 1234567890123.45", "1234567890123.45"),
@@ -17586,6 +17640,60 @@ fn a_string_parameter_assigned_to_another_category_is_42804() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// The lead's ruling (LEAD-RULINGS 82dcec6b66, lifting d2bf57effb's interim refusal for integer columns): a decimal
+/// past 15 significant digits assigned to an integer column (INSERT VALUES, INSERT ... SELECT, SET, ON CONFLICT SET) is
+/// stored exactly, rounded half away from zero, as PostgreSQL's assignment cast stores it; through a float8 it would
+/// round (12345678901234567 is 12345678901234568 there). Past the column it is 22003. Expected answers: PG 18.6,
+/// recorded (artie afd9557309, rec34-long-decimal-integer/pg18-wirefuzz-a_long_decimal_assigned_to_an_integer_column_is_stored_exactly.out),
+/// but its comparison and numeric(30,2) column, which stay refused under the interim ruling.
+#[test]
+fn a_long_decimal_assigned_to_an_integer_column_is_stored_exactly() {
+    let dir = Scratch::new("long-decimal-integer");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let ddl = "CREATE TABLE li (id int PRIMARY KEY, b bigint, i int)";
+    a.q(ddl).ok(ddl);
+    let mut wrong = Vec::new();
+    for (sql, message) in [
+        ("INSERT INTO li (id, b) VALUES (1, 12345678901234567.00)", ""),
+        ("INSERT INTO li (id, b) VALUES (2, 9223372036854775807.4)", ""),
+        ("INSERT INTO li (id, b) VALUES (3, 1234567890123456789.5)", ""),
+        ("INSERT INTO li (id, b) VALUES (4, -1234567890123456789.5)", ""),
+        ("INSERT INTO li (id, i) VALUES (5, 2147483646.9999999999999999)", ""),
+        ("INSERT INTO li (id, b) VALUES (6, 9223372036854775807.5)", "bigint out of range"),
+        ("INSERT INTO li (id, b) SELECT 7, 98765432109876543.21", ""),
+        ("UPDATE li SET b = 11111111111111111.49 WHERE id = 1", ""),
+        ("UPDATE li SET b = 22222222222222222.5 WHERE id = 1000", ""),
+        ("INSERT INTO li (id, b) VALUES (2, 0) ON CONFLICT (id) DO UPDATE SET b = 33333333333333333.5", ""),
+    ] {
+        let r = a.q(sql);
+        let fine = if message.is_empty() {
+            r.error.is_none()
+        } else {
+            r.error.as_ref().is_some_and(|e| e.code == "22003" && e.message == message)
+        };
+        if !fine {
+            wrong.push(format!("{sql}: PG {message:?}; got {:?} {:?}", r.tags, r.error));
+        }
+    }
+    let r = a.q("SELECT id, b, i FROM li ORDER BY id");
+    let want: Vec<Vec<Option<String>>> = [
+        ["1", "11111111111111111", ""],
+        ["2", "33333333333333334", ""],
+        ["3", "1234567890123456790", ""],
+        ["4", "-1234567890123456790", ""],
+        ["5", "", "2147483647"],
+        ["7", "98765432109876543", ""],
+    ]
+    .iter()
+    .map(|row| row.iter().map(|v| (!v.is_empty()).then(|| v.to_string())).collect())
+    .collect();
+    if r.error.is_some() || r.rows != want {
+        wrong.push(format!("SELECT id, b, i: PG {want:?}; got {:?} {:?}", r.rows, r.error));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// numfuzz (seeds 1442, 1458 and 1600 at 1d8a8b230; artie 00a35c0147): a constant past a numeric(p, s) column is 22003
 /// 'numeric field overflow', a constant cast past an integer type is 22003 wherever it stands, and an INSERT ... SELECT's
 /// targets are coerced to their columns as VALUES items are, each at planning, so a statement matching no row is refused
@@ -17735,6 +17843,35 @@ fn a_constant_cast_past_numeric_p_s_is_22003_with_no_row() {
         }
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// The lead's ruling (LEAD-RULINGS 82dcec6b66 item 5; the float8 blind spot of c8b6e2916): a double is written in the
+/// shortest digits that read back as it from strictly inside its rounding interval, as float8out writes it (d2s.c
+/// without STRICTLY_SHORTEST): 20197275871653528's 16-digit form 2.019727587165353e+16 is the halfway point to its
+/// neighbour, read back only by ties-to-even, and PostgreSQL writes 2.0197275871653528e+16. Expected answers: PG 18.6,
+/// recorded (artie 021bdded45, rec36-float8-ties/pg18-wirefuzz-a_double_is_written_in_the_shortest_digits_strictly_inside_its_interval.out),
+/// but its v::numeric (the engine's numeric).
+#[test]
+fn a_double_is_written_in_the_shortest_digits_strictly_inside_its_interval() {
+    let dir = Scratch::new("float8-ties");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in [
+        "CREATE TABLE d (id int PRIMARY KEY, v double precision)",
+        "INSERT INTO d VALUES (1, 20197275871653528), (2, 35152180762487008), (3, 23204398328858688), (4, 69924194935583344), (5, 37949282877879376), (6, 37220404050695536), (7, -20197275871653528), (8, 9007199254740993), (9, 0.1), (10, 1e22), (11, 123456789012345680), (12, 5e-324)",
+    ] {
+        a.q(sql).ok(sql);
+    }
+    let want: Vec<Vec<Option<String>>> = [
+        "2.0197275871653528e+16", "3.5152180762487008e+16", "2.3204398328858688e+16", "6.9924194935583344e+16",
+        "3.7949282877879376e+16", "3.7220404050695536e+16", "-2.0197275871653528e+16", "9.007199254740992e+15", "0.1",
+        "1e+22", "1.2345678901234568e+17", "5e-324",
+    ]
+    .iter()
+    .map(|v| vec![Some(v.to_string())])
+    .collect();
+    let r = a.q("SELECT v FROM d ORDER BY id");
+    assert!(r.error.is_none() && r.rows == want, "PG {want:?}; got {:?} {:?}", r.rows, r.error);
 }
 
 /// numfuzz (seeds 343 at 6e17acc9a, 1144 at 45de98440; artie 9b32cd5149, 52ca04164d): a real is written in the

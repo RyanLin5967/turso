@@ -653,10 +653,12 @@ fn refuse_long_decimals(
         return Ok(());
     }
     // A constant assigned to an integer column past its range is PostgreSQL's 22003 first (numfuzz
-    // seed 622 at 45de98440); one within it stays refused here, under the ruling above, though the
-    // assignment would read it exactly (12345678901234567.00 into a bigint: PG stores it).
-    literal_assignments(pg_conn, parse).map_err(LimboError::InvalidArgument)?;
-    let exempt = float_target_literals(pg_conn, parse);
+    // seed 622 at 45de98440). One within it is exempt: literal_assignments reads it exactly and the
+    // translator writes its value, never a float (the lead's ruling LEAD-RULINGS 82dcec6b66, for
+    // integer columns on its paths alone; recorded, rec34-long-decimal-integer, artie afd9557309).
+    let integer = literal_assignments(pg_conn, parse).map_err(LimboError::InvalidArgument)?;
+    let mut exempt = float_target_literals(pg_conn, parse);
+    exempt.extend(integer.keys().filter_map(|l| usize::try_from(*l).ok()));
     match turso_pg_parser::long_decimal_literal(sql, &exempt) {
         Some(literal) => Err(LimboError::ParseError(SqlErrorMessage::classified(
             SqlErrorKind::FeatureNotSupported,
