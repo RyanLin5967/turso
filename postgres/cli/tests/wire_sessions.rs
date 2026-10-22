@@ -17797,6 +17797,56 @@ fn a_float_numeric_or_boolean_column_reads_its_literal_as_its_input_routine_does
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// numfuzz seed 2952 at d5600475b (artie 5b9cc1446d): a text value cast to smallint, integer or bigint is read by
+/// int2in/int4in/int8in, whatever produced the text (a column, a function, a cast of another type): a spelling the
+/// routine refuses ('Infinity', '1.5', '', 'abc') is 22P02 and one past the type 22003, never a number; a 0x prefix,
+/// underscores and blanks are read as the routine reads them. ('Infinity'::numeric)::text::bigint answered
+/// 9223372036854775807. Expected answers: PG 18.6, recorded (artie 8d1dd2d784,
+/// rec47-text-int-cast/pg18-wirefuzz-a_text_value_cast_to_an_integer_type_is_read_by_its_input_routine.out).
+#[test]
+fn a_text_value_cast_to_an_integer_type_is_read_by_its_input_routine() {
+    let dir = Scratch::new("text-int-cast");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in [
+        "CREATE TABLE tc (id int PRIMARY KEY, s text, v varchar(20))",
+        "INSERT INTO tc VALUES (1, 'Infinity', ' 42 '), (2, '0x1F', '1_000'), (3, '1.5', '-0'), (4, '99999999999', 'abc'), (5, '', '7')",
+    ] {
+        a.q(sql).ok(sql);
+    }
+    let mut wrong = Vec::new();
+    for (sql, want) in [
+        ("SELECT (('Infinity'::numeric)::text)::bigint AS v", Err(("22P02", r#"invalid input syntax for type bigint: "Infinity""#))),
+        ("SELECT ((('Infinity'::numeric)::text)::bigint + 9223372036854775807) AS v", Err(("22P02", r#"invalid input syntax for type bigint: "Infinity""#))),
+        ("SELECT s::bigint FROM tc WHERE id = 1", Err(("22P02", r#"invalid input syntax for type bigint: "Infinity""#))),
+        ("SELECT s::int FROM tc WHERE id = 2", Ok(vec!["31"])),
+        ("SELECT s::int FROM tc WHERE id = 3", Err(("22P02", r#"invalid input syntax for type integer: "1.5""#))),
+        ("SELECT s::int FROM tc WHERE id = 4", Err(("22003", r#"value "99999999999" is out of range for type integer"#))),
+        ("SELECT s::bigint FROM tc WHERE id = 4", Ok(vec!["99999999999"])),
+        ("SELECT s::smallint FROM tc WHERE id = 5", Err(("22P02", r#"invalid input syntax for type smallint: """#))),
+        ("SELECT v::int FROM tc WHERE id = 1", Ok(vec!["42"])),
+        ("SELECT v::int FROM tc WHERE id = 2", Ok(vec!["1000"])),
+        ("SELECT v::int FROM tc WHERE id = 3", Ok(vec!["0"])),
+        ("SELECT v::int FROM tc WHERE id = 4", Err(("22P02", r#"invalid input syntax for type integer: "abc""#))),
+        ("SELECT CAST(v AS bigint) FROM tc WHERE id = 5", Ok(vec!["7"])),
+        ("SELECT (upper('12'))::int AS v", Ok(vec!["12"])),
+        ("SELECT ('1' || '2')::int AS v", Ok(vec!["12"])),
+        ("SELECT (lower(' 0X10 '))::int AS v", Ok(vec!["16"])),
+        ("SELECT id, s::int FROM tc WHERE id IN (2, 3) ORDER BY id", Err(("22P02", r#"invalid input syntax for type integer: "1.5""#))),
+        ("SELECT sum(v::int) FROM tc WHERE id IN (1, 2, 5)", Ok(vec!["1049"])),
+    ] {
+        let r = a.q(sql);
+        let fine = match &want {
+            Ok(values) => r.error.is_none() && r.rows.iter().map(|row| row.last().cloned().flatten().unwrap_or_default()).collect::<Vec<_>>() == *values,
+            Err((code, message)) => r.error.as_ref().is_some_and(|e| e.code == *code && e.message == *message),
+        };
+        if !fine {
+            wrong.push(format!("{sql}: PG {want:?}; got {:?} {:?} {:?}", r.tags, r.rows, r.error));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// The lead's ruling (LEAD-RULINGS 9d87841628, 4): an array literal assigned to a float, real, numeric(p,s), boolean or
 /// varchar(n) array column is read element by element by the element type's input routine: out-of-range and
 /// malformed elements are refused with the element routine's code (22003, 22P02, 22001), even when no row matches,
