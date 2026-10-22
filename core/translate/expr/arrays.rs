@@ -61,7 +61,19 @@ pub(super) fn emit_array_element_loop(
         dest: reg_offset,
     });
 
-    let loop_start = program.offset();
+    // The back edge targets a LABEL, never a raw `program.offset()`: `emit_constant_insns` remaps
+    // labels when it hoists constants and leaves raw offsets as they were, so a constant hoisted
+    // from code emitted before this loop (an earlier array column's encode arguments, `b[1]`'s
+    // index) made a raw back edge land past the exit test below, and the loop never ended
+    // (fastest-engine, the lead's HIGH: a session spinning in Program::normal_step). Mutant
+    // `array_loop_raw_offset` (test builds only): the raw offset, as before.
+    let loop_start = if crate::branch::store::fe_mutant("array_loop_raw_offset") {
+        program.offset()
+    } else {
+        let label = program.allocate_label();
+        program.preassign_label_to_next_insn(label);
+        label
+    };
     let loop_end_label = program.allocate_label();
 
     program.emit_insn(Insn::Gt {
