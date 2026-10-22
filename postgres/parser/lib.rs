@@ -3,6 +3,7 @@ use thiserror::Error;
 
 pub use turso_parser::sql_error::{SqlErrorKind, SqlErrorMessage};
 
+pub mod pg_input;
 pub mod translator;
 pub mod volatility;
 

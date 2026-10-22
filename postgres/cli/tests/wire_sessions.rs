@@ -17845,6 +17845,129 @@ fn a_constant_cast_past_numeric_p_s_is_22003_with_no_row() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// The lead's ruling (LEAD-RULINGS 3abd61b6d3 (b), DEFAULT): a column's DEFAULT is coerced as PostgreSQL coerces it. A
+/// string constant to an integer column is read by its input routine when the table is made or altered (22P02,
+/// 22003); a cast to a string type is 42804 ('default expression'); a numeric constant is cast at each INSERT that
+/// uses it, rounded half away from zero and range-checked (22003 at the INSERT), except under ADD COLUMN, which
+/// evaluates it at once. Expected answers: PG 18.6, recorded (artie 32951be31a,
+/// rec39-default-coercion/pg18-wirefuzz-a_default_is_coerced_to_its_column_as_postgresql_coerces_it.out), but its
+/// boolean default (a boolean target, the next blind spot), its numeric(6,2) default (the engine's numeric) and its
+/// ALTER COLUMN SET DEFAULT statements (refused 0A000 here, a statement this server does not implement).
+#[test]
+fn a_default_is_coerced_to_its_column_as_postgresql_coerces_it() {
+    let dir = Scratch::new("default-coercion");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let mut wrong = Vec::new();
+    for (sql, code, message) in [
+        ("CREATE TABLE d1 (id int PRIMARY KEY, b int DEFAULT 'x')", "22P02", r#"invalid input syntax for type integer: "x""#),
+        ("CREATE TABLE d2 (id int PRIMARY KEY, b int DEFAULT 3000000000)", "", ""),
+        ("INSERT INTO d2 (id) VALUES (1)", "22003", "integer out of range"),
+        ("CREATE TABLE d3 (id int PRIMARY KEY, b int DEFAULT '0x1F', c int DEFAULT 2.5, e bigint DEFAULT 12345678901234567.00, f smallint DEFAULT ' 7 ')", "", ""),
+        ("INSERT INTO d3 (id) VALUES (1)", "", ""),
+        ("CREATE TABLE d4 (id int PRIMARY KEY, b int DEFAULT 'abc'::text)", "42804", r#"column "b" is of type integer but default expression is of type text"#),
+        ("CREATE TABLE d6 (id int PRIMARY KEY, b int)", "", ""),
+        ("ALTER TABLE d6 ADD COLUMN c int DEFAULT 'z'", "22P02", r#"invalid input syntax for type integer: "z""#),
+        ("ALTER TABLE d6 ADD COLUMN c bigint DEFAULT '9223372036854775808'", "22003", r#"value "9223372036854775808" is out of range for type bigint"#),
+        ("ALTER TABLE d6 ADD COLUMN c smallint DEFAULT 40000", "22003", "smallint out of range"),
+        ("INSERT INTO d6 (id) VALUES (1)", "", ""),
+        ("CREATE TABLE d8 (id int PRIMARY KEY, b int DEFAULT '1e3')", "22P02", r#"invalid input syntax for type integer: "1e3""#),
+    ] {
+        let r = a.q(sql);
+        let fine = if code.is_empty() {
+            r.error.is_none()
+        } else {
+            r.error.as_ref().is_some_and(|e| e.code == code && e.message == message)
+        };
+        if !fine {
+            wrong.push(format!("{sql}: PG {code:?} {message:?}; got {:?} {:?}", r.tags, r.error));
+        }
+    }
+    for (sql, want) in [
+        ("SELECT id, b, c, e, f FROM d3", vec!["1", "31", "3", "12345678901234567", "7"]),
+    ] {
+        let r = a.q(sql);
+        let want = vec![want.iter().map(|v| Some(v.to_string())).collect::<Vec<_>>()];
+        if r.error.is_some() || r.rows != want {
+            wrong.push(format!("{sql}: PG {want:?}; got {:?} {:?}", r.rows, r.error));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// The lead's ruling (LEAD-RULINGS 3abd61b6d3 (b)), literal_assignments' table: an assignment is judged against the
+/// table the name resolves to, the search path's: with search_path s, public, 'x' into t.b is s.t's text column and is
+/// stored, where literal_assignments judged public.t's int column and refused it 22P02. Expected answers: PG 18.6,
+/// recorded (artie 8d9065d8e9, rec38-search-path-assign/pg18-wirefuzz-an_assignment_is_judged_against_the_table_the_name_resolves_to.out).
+#[test]
+fn an_assignment_is_judged_against_the_table_the_name_resolves_to() {
+    let dir = Scratch::new("search-path-assign");
+    // The branch server refuses CREATE SCHEMA, so the schema is made through the CLI first.
+    cli_script(&dir, b"CREATE SCHEMA s;\nCREATE TABLE t (id int PRIMARY KEY, b int);\nCREATE TABLE s.t (id int PRIMARY KEY, b text);\n");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("SET search_path = s, public").ok("set");
+    let mut wrong = Vec::new();
+    for sql in ["INSERT INTO t (id, b) VALUES (1, 'x')", "INSERT INTO t (id, b) VALUES (2, 'x'::text)", "UPDATE t SET b = 'y' WHERE id = 1"] {
+        let r = a.q(sql);
+        if r.error.is_some() {
+            wrong.push(format!("{sql}: PG answers it; got {:?}", r.error));
+        }
+    }
+    let r = a.q("SELECT id, b FROM s.t ORDER BY id");
+    let want = vec![vec![Some("1".to_string()), Some("y".to_string())], vec![Some("2".to_string()), Some("x".to_string())]];
+    if r.error.is_some() || r.rows != want {
+        wrong.push(format!("s.t: PG {want:?}; got {:?} {:?}", r.rows, r.error));
+    }
+    a.q("SET search_path = public").ok("set");
+    let r = a.q("INSERT INTO t (id, b) VALUES (1, 'x')");
+    if !r.error.as_ref().is_some_and(|e| e.code == "22P02" && e.message == r#"invalid input syntax for type integer: "x""#) {
+        wrong.push(format!("public.t: PG 22P02; got {:?} {:?}", r.tags, r.error));
+    }
+    let r = a.q("SELECT count(*) FROM public.t");
+    if r.rows != vec![vec![Some("0".to_string())]] {
+        wrong.push(format!("public.t holds {:?}, PG 0", r.rows));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// The lead's ruling (LEAD-RULINGS 3abd61b6d3 (a); 5d2f9d25f's stated blind spot; numfuzz seeds 53 at e4882aaed and 603
+/// at 5d2f9d25f): a CREATE VIEW whose query has a function or operator with no candidate is 42883 as the query alone is,
+/// and the view is not created; each was created. Expected answers: PG 18.6, recorded (artie 73c95898ea,
+/// rec37-view-numeric-refusals/pg18-wirefuzz-a_view_whose_query_has_no_candidate_is_42883.out), but nv6's column type
+/// (the engine's numeric), nv1 (its numeric(10,0) cast is typed float8 here, the registered PGDIV-NUMERIC-CAST-FLOAT8,
+/// so its message names double precision) and the missing view's wording (PGDIV-SQLITE-NAME-MESSAGE; its 42P01 is
+/// checked).
+#[test]
+fn a_view_whose_query_has_no_candidate_is_42883() {
+    let dir = Scratch::new("view-resolve");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let ddl = "CREATE TABLE nt (id int PRIMARY KEY, c0 numeric(38,10), c1 real, c2 double precision, c3 real)";
+    a.q(ddl).ok(ddl);
+    let mut wrong = Vec::new();
+    for (sql, message) in [
+        ("CREATE VIEW nv2 AS SELECT id, (c1 % ((c1)::bigint * ((-1))::float8)) AS v FROM nt", "operator does not exist: real % double precision"),
+        ("CREATE VIEW nv3 AS SELECT id, ceil((c0)::text) AS v FROM nt", "function ceil(text) does not exist"),
+        ("CREATE VIEW nv4 AS SELECT id, round(c2, 2) AS v FROM nt", "function round(double precision, integer) does not exist"),
+        ("CREATE VIEW nv5 AS SELECT id, -((c0)::text) AS v FROM nt", "operator does not exist: - text"),
+        ("CREATE VIEW nv6 AS SELECT id, ceil(c0) AS v, round(c0, 2) AS w, c0 % 3 AS x FROM nt", ""),
+        ("SELECT id FROM nv3", "relation"),
+        ("SELECT v FROM nv6", ""),
+    ] {
+        let r = a.q(sql);
+        let fine = match message {
+            "" => r.error.is_none(),
+            "relation" => r.error.as_ref().is_some_and(|e| e.code == "42P01"),
+            m => r.error.as_ref().is_some_and(|e| e.code == "42883" && e.message == m),
+        };
+        if !fine {
+            wrong.push(format!("{sql}: PG {message:?}; got {:?} {:?}", r.tags, r.error));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// numfuzz (seed 2116 at 5d9c4fe5e; PG 18.6's answer in its finding, artie baedf0d84d): a typed literal (NUMERIC '0.1')
 /// has no parse location, so 1d8a8b230's rewrite of one cast constant assigned to an integer column was keyed by -1 and
 /// written over every other such literal: NUMERIC '-7' into a numeric(20,5) column was stored as 0, SILENTLY. A rewrite

@@ -300,6 +300,58 @@ struct LateralScope {
     merged: bool,
 }
 
+/// An integer column's constant DEFAULT as PostgreSQL coerces it (the lead's ruling LEAD-RULINGS
+/// 3abd61b6d3 (b); recorded, rec39-default-coercion, artie 32951be31a), decided from the
+/// definition alone because a table's text is stored as written and translated again at each
+/// schema load: a string constant is its int2in/int4in/int8in value ('0x1F' is 31; one those
+/// refuse is refused at the CREATE by the frontend), a numeric constant its value rounded half
+/// away from zero (2.5 is 3, 12345678901234567.00 exact), and one past the column
+/// `pg_assign_int(text, type)`, which refuses 22003 at each INSERT that uses it, where PostgreSQL
+/// casts it. None for any other column or default, translated as before.
+fn integer_default(col_def: &pg_query::protobuf::ColumnDef, expr: &pg_query::protobuf::Node) -> Option<ast::Expr> {
+    use crate::pg_input::{pg_strtoint, round_decimal, PgInt};
+    use pg_query::protobuf::{a_const::Val, node::Node};
+    let t = col_def.type_name.as_ref().filter(|t| t.array_bounds.is_empty())?;
+    let (bits, name) = match t.names.last()?.node.as_ref()? {
+        Node::String(s) => match s.sval.as_str() {
+            "int2" => (16u32, "smallint"),
+            "int4" => (32, "integer"),
+            "int8" => (64, "bigint"),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    let Node::AConst(c) = expr.node.as_ref()? else { return None };
+    if c.isnull {
+        return None;
+    }
+    let limit = 1i128 << (bits - 1);
+    let (value, text) = match c.val.as_ref()? {
+        Val::Sval(s) => match pg_strtoint(&s.sval, bits) {
+            PgInt::Value(v) => (i128::from(v), s.sval.clone()),
+            _ => return None,
+        },
+        Val::Ival(i) => (i128::from(i.ival), i.ival.to_string()),
+        Val::Fval(f) => (round_decimal(&f.fval)?, f.fval.clone()),
+        _ => return None,
+    };
+    if value < -limit || value >= limit {
+        return Some(ast::Expr::FunctionCall {
+            name: pg_name("pg_assign_int"),
+            distinctness: None,
+            args: vec![Box::new(ast::Expr::Literal(sql_string(&text))), Box::new(ast::Expr::Literal(sql_string(name)))],
+            order_by: vec![],
+            within_group: vec![],
+            filter_over: ast::FunctionTail { filter_clause: None, over_clause: None },
+        });
+    }
+    // An integer already spelled as its value is left to the usual translation.
+    if !matches!(c.val, Some(Val::Sval(_))) && text == value.to_string() {
+        return None;
+    }
+    Some(ast::Expr::Literal(ast::Literal::Numeric(value.to_string())))
+}
+
 /// The key a cast's rewrite ([`PostgreSQLTranslator::with_integer_literals`]) stands under: the
 /// cast's own parse location, or, for a typed literal (NUMERIC '0.1'), which has none (-1, shared by
 /// every typed literal), its constant's; None when neither is known.
@@ -1037,7 +1089,10 @@ impl PostgreSQLTranslator {
                 ConstrType::ConstrUnique => is_unique = true,
                 ConstrType::ConstrDefault => {
                     if let Some(ref raw_expr) = constraint.raw_expr {
-                        default_expr = Some(self.translate_expr(raw_expr)?);
+                        default_expr = Some(match integer_default(col_def, raw_expr) {
+                            Some(e) => e,
+                            None => self.translate_expr(raw_expr)?,
+                        });
                     }
                 }
                 ConstrType::ConstrCheck => {
@@ -1535,7 +1590,10 @@ impl PostgreSQLTranslator {
                 }),
                 ConstrType::ConstrUnique => Some(ast::ColumnConstraint::Unique(None)),
                 ConstrType::ConstrDefault => match constraint.raw_expr.as_ref() {
-                    Some(raw_expr) => Some(column_default(self.translate_expr(raw_expr)?)),
+                    Some(raw_expr) => Some(column_default(match integer_default(col_def, raw_expr) {
+                        Some(e) => e,
+                        None => self.translate_expr(raw_expr)?,
+                    })),
                     None => None,
                 },
                 _ => None,

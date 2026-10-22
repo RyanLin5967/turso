@@ -657,8 +657,9 @@ fn refuse_long_decimals(
     // translator writes its value, never a float (the lead's ruling LEAD-RULINGS 82dcec6b66, for
     // integer columns on its paths alone; recorded, rec34-long-decimal-integer, artie afd9557309).
     let integer = literal_assignments(pg_conn, parse).map_err(LimboError::InvalidArgument)?;
+    let (default_values, deferred_defaults) = default_coercions(parse).map_err(LimboError::InvalidArgument)?;
     let mut exempt = float_target_literals(pg_conn, parse);
-    exempt.extend(integer.keys().filter_map(|l| usize::try_from(*l).ok()));
+    exempt.extend(integer.keys().chain(default_values.keys()).chain(deferred_defaults.keys()).filter_map(|l| usize::try_from(*l).ok()));
     match turso_pg_parser::long_decimal_literal(sql, &exempt) {
         Some(literal) => Err(LimboError::ParseError(SqlErrorMessage::classified(
             SqlErrorKind::FeatureNotSupported,
@@ -2155,8 +2156,10 @@ fn prepare_statement_parsed(
         };
         // ... and for a statement calling a numeric function the walk resolves (ceil(text),
         // round(float8, 2): numfuzz at e4882aaed, answered where PostgreSQL has no candidate),
-        // bounded by the text. BLIND SPOT: a CREATE VIEW is not walked for it (walking every view
-        // as it is made warms the view memo, which changes how a deep chain is read later).
+        // bounded by the text. A CREATE VIEW that spells one is walked too (its query, for its
+        // refusals alone: a_view_whose_query_has_no_candidate_is_42883); one that spells none is not,
+        // since walking every view as it is made warms the view memo, which changes how a deep chain
+        // is read later. (5d2f9d25f called the whole of CREATE VIEW a blind spot, which was wrong.)
         // So is one with a `%` or a cast to a string type, whose arithmetic the walk resolves
         // (float8 % bigint, numeric * x::text: numfuzz seeds 482, 483 at 5d2f9d25f, answered).
         let numeric_call = || {
@@ -2378,6 +2381,10 @@ pub(crate) fn session_translation(
     // Each value assigned to a column is coerced as parse analysis coerces it, here so the
     // re-prepare judges it alike; a literal an integer column reads is written as its value.
     let integer_literals = literal_assignments(pg_conn, parse_result).map_err(LimboError::InvalidArgument)?;
+    // ... and a CREATE TABLE's or ADD COLUMN's DEFAULT as DDL coerces it: its refusals here, its
+    // values by the translator itself (integer_default), since the table's text is translated
+    // again at each schema load.
+    default_coercions(parse_result).map_err(LimboError::InvalidArgument)?;
     constant_numeric_casts(sql, parse_result).map_err(LimboError::InvalidArgument)?;
     let translator = || {
         let t = translator();
@@ -2529,13 +2536,186 @@ fn text_integer_casts(
 /// half away from zero and range-checked (22003 'integer out of range'); a cast to a string type
 /// to a numeric or boolean column is 42804. Returns the literals whose spelling the engine's
 /// integer column does not read ('0x1F', '1_000', ' 7', 1.5), by parse location, with their values.
-/// Every INSERT and UPDATE passes here, so nothing is allocated per value. BLIND SPOTS: a
-/// schema-qualified or attached table, an array or domain column, a column of another relation or
+/// Every INSERT and UPDATE passes here, so nothing is allocated per value. BLIND SPOTS: an
+/// attached schema's table ([`resolves_to_main`]), an array or domain column, a column of another relation or
 /// an expression of a string type (upper('x')), a negated or hexadecimal constant, a set
 /// operation's branches, a DEFAULT, and a literal to a float or boolean column (stored as the
 /// engine reads it). A constant to a numeric(p, s) column past it is 22003 'numeric field
 /// overflow', and an INSERT ... SELECT's targets are judged as VALUES items are (numfuzz seeds
 /// 1442, 1600 at 1d8a8b230; recorded, rec33-assign-numeric-select, artie 555adcffb6).
+/// A CREATE TABLE's and an ALTER TABLE ADD COLUMN's DEFAULTs, coerced to their columns as
+/// PostgreSQL coerces them (the lead's ruling LEAD-RULINGS 3abd61b6d3 (b); recorded,
+/// rec39-default-coercion, artie 32951be31a): a string constant to an integer column is read by
+/// its input routine at once (22P02, 22003), a cast to a string type to a numeric or boolean column
+/// is 42804 ('default expression'), and a numeric constant to an integer column is cast at each
+/// INSERT that uses it (CREATE TABLE) or at once (ADD COLUMN, which evaluates it). Returns, by parse
+/// location, the constants the translator writes as their value ('0x1F' is 31, 2.5 is 3) and those
+/// a CREATE TABLE gives past their column, written as pg_assign_int(text, type), which refuses at
+/// the INSERT (the translator's integer_default; here for the long-decimal exemption).
+/// BLIND SPOTS: ALTER COLUMN SET DEFAULT (refused 0A000 here), an expression's default, array and
+/// domain columns, and float, numeric and boolean targets but the 42804.
+#[allow(clippy::type_complexity)]
+fn default_coercions(
+    parse: &turso_pg_parser::pg_query::ParseResult,
+) -> std::result::Result<(std::collections::HashMap<i32, i64>, std::collections::HashMap<i32, (String, String)>), SqlErrorMessage> {
+    use turso_pg_parser::pg_query::protobuf::{a_const::Val, node::Node, AlterTableType, ColumnDef, ConstrType};
+    let mut values = std::collections::HashMap::new();
+    let mut deferred = std::collections::HashMap::new();
+    let Some(stmt) = parse.protobuf.stmts.first().and_then(|r| r.stmt.as_ref()).and_then(|s| s.node.as_ref()) else {
+        return Ok((values, deferred));
+    };
+    // (the column, whether its default is evaluated at once)
+    let columns: Vec<(&ColumnDef, bool)> = match stmt {
+        Node::CreateStmt(c) => c
+            .table_elts
+            .iter()
+            .filter_map(|e| match e.node.as_ref() {
+                Some(Node::ColumnDef(d)) => Some((d.as_ref(), false)),
+                _ => None,
+            })
+            .collect(),
+        Node::AlterTableStmt(a) => a
+            .cmds
+            .iter()
+            .filter_map(|c| match c.node.as_ref() {
+                Some(Node::AlterTableCmd(cmd)) if cmd.subtype() == AlterTableType::AtAddColumn => match cmd.def.as_deref().and_then(|d| d.node.as_ref()) {
+                    Some(Node::ColumnDef(d)) => Some((d.as_ref(), true)),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect(),
+        _ => return Ok((values, deferred)),
+    };
+    for (def, at_once) in columns {
+        let Some(t) = def.type_name.as_ref().filter(|t| t.array_bounds.is_empty()) else { continue };
+        let Some(Node::String(ty)) = t.names.last().and_then(|n| n.node.as_ref()) else { continue };
+        let target: Option<u32> = match ty.sval.as_str() {
+            "int2" => Some(21),
+            "int4" => Some(23),
+            "int8" => Some(20),
+            "float4" => Some(700),
+            "float8" => Some(701),
+            "numeric" => Some(1700),
+            "bool" => Some(16),
+            _ => None,
+        };
+        let Some(target) = target else { continue };
+        let bits = match target {
+            21 => 16,
+            23 => 32,
+            20 => 64,
+            _ => 0,
+        };
+        let name = crate::result_types::type_name(target);
+        let defaults = def.raw_default.as_deref().into_iter().chain(def.constraints.iter().filter_map(|c| match c.node.as_ref() {
+            Some(Node::Constraint(k)) if k.contype() == ConstrType::ConstrDefault => k.raw_expr.as_deref(),
+            _ => None,
+        }));
+        for expr in defaults {
+            match expr.node.as_ref() {
+                Some(Node::AConst(c)) if !c.isnull && bits > 0 && c.location >= 0 => match c.val.as_ref() {
+                    Some(Val::Sval(text)) => {
+                        if let Some((message, kind)) = crate::functions::validate_pg_input(&text.sval, name) {
+                            return Err(SqlErrorMessage::classified(kind, message));
+                        }
+                        if let crate::functions::PgInt::Value(v) = crate::functions::pg_strtoint(&text.sval, 64) {
+                            if v.to_string() != text.sval {
+                                values.insert(c.location, v);
+                            }
+                        }
+                    }
+                    Some(v @ (Val::Ival(_) | Val::Fval(_))) => {
+                        let (value, text) = match v {
+                            Val::Ival(i) => (Some(i128::from(i.ival)), i.ival.to_string()),
+                            Val::Fval(f) => (crate::functions::round_decimal(&f.fval), f.fval.clone()),
+                            _ => continue,
+                        };
+                        let Some(value) = value else { continue };
+                        let limit = 1i128 << (bits - 1);
+                        if value < -limit || value >= limit {
+                            if at_once {
+                                return Err(SqlErrorMessage::classified(SqlErrorKind::NumericValueOutOfRange, format!("{name} out of range")));
+                            }
+                            deferred.insert(c.location, (text, name.to_string()));
+                        } else if text != value.to_string() {
+                            values.insert(c.location, value as i64);
+                        }
+                    }
+                    _ => {}
+                },
+                Some(Node::TypeCast(c)) => {
+                    let from = c.type_name.as_ref().filter(|t| t.array_bounds.is_empty()).and_then(|t| match t.names.last()?.node.as_ref()? {
+                        Node::String(s) => match s.sval.as_str() {
+                            "text" => Some(25),
+                            "varchar" => Some(1043),
+                            "bpchar" => Some(1042),
+                            "name" => Some(19),
+                            _ => None,
+                        },
+                        _ => None,
+                    });
+                    if let Some(from) = from {
+                        return Err(SqlErrorMessage::classified(
+                            SqlErrorKind::DatatypeMismatch,
+                            format!(
+                                "column \"{}\" is of type {name} but default expression is of type {}",
+                                def.colname,
+                                crate::result_types::type_name(from)
+                            ),
+                        ));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok((values, deferred))
+}
+
+/// Whether an INSERT's or UPDATE's relation is main's table, resolved as the engine resolves it:
+/// public or main by name; unqualified, a temp table first, then the search path's entries in order
+/// (public is main, another is an attached schema; with no path, main first), the first holding
+/// the name deciding, a view there included (the engine's own resolver, which answers None for one,
+/// is asked last). literal_assignments judges main's tables alone: under search_path s, public an
+/// unqualified t is s.t (recorded, rec38-search-path-assign, artie 8d9065d8e9), and it judged
+/// public.t. BLIND SPOT: an attached schema's table, whose declared types no public core accessor
+/// gives (its column names alone), is not judged.
+fn resolves_to_main(pg_conn: &PgConnectionInner, relation: &turso_pg_parser::pg_query::protobuf::RangeVar) -> bool {
+    use turso_pg_parser::SchemaQualifier;
+    let conn = &pg_conn.conn;
+    let table = relation.relname.as_str();
+    if !relation.catalogname.is_empty() {
+        return false;
+    }
+    match turso_pg_parser::schema_qualifier(&relation.schemaname) {
+        SchemaQualifier::Main => true,
+        SchemaQualifier::Unqualified => {
+            if conn.resident_table_columns("temp", table).is_some() {
+                return false;
+            }
+            let path = written_search_path(pg_conn);
+            let main_holds = || conn.current_schema().get_btree_table(table).is_some() && conn.resident_unqualified_table_columns(table, &path).is_some();
+            // With no path the engine reads main after temp, and main cannot hold a view and a
+            // table of one name: no resolver call (which allocates) on the common INSERT.
+            if path.is_empty() {
+                return conn.current_schema().get_btree_table(table).is_some();
+            }
+            let attached = conn.attached_database_names();
+            for entry in &path {
+                if entry == "public" || entry == "main" {
+                    return main_holds();
+                }
+                if attached.iter().any(|a| a == entry) && conn.resident_table_columns(entry, table).is_some() {
+                    return false;
+                }
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
 fn literal_assignments(
     pg_conn: &PgConnectionInner,
     parse: &turso_pg_parser::pg_query::ParseResult,
@@ -2551,7 +2731,7 @@ fn literal_assignments(
         Node::UpdateStmt(u) => u.relation.as_ref(),
         _ => return Ok(rewrites),
     };
-    let Some(relation) = relation.filter(|r| r.schemaname.is_empty() || r.schemaname.eq_ignore_ascii_case("public")) else {
+    let Some(relation) = relation.filter(|r| resolves_to_main(pg_conn, r)) else {
         return Ok(rewrites);
     };
     let schema = pg_conn.conn.current_schema();
