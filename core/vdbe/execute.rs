@@ -15060,7 +15060,7 @@ fn op_parse_schema_step(
                 let attached_resolver = |alias: &str| -> Option<usize> {
                     conn.attached_databases()
                         .read()
-                        .get_database_by_name(&crate::util::normalize_ident(alias))
+                        .get_database_by_name(alias)
                         .map(|(idx, _)| idx)
                 };
                 schema.handle_schema_row(

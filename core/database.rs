@@ -2924,7 +2924,9 @@ impl Database {
             cdc_transaction_id: AtomicI64::new(-1),
             closed: AtomicBool::new(false),
             temp: crate::connection::TempDbContext::new(),
-            attached_databases: RwLock::new(DatabaseCatalog::new()),
+            attached_databases: RwLock::new(DatabaseCatalog::with_exact_names(
+                self.dialect().database_names_exact(),
+            )),
             query_only: AtomicBool::new(false),
             recipe_backfill: AtomicBool::new(false),
             vdbe_trace: AtomicBool::new(false),
@@ -3785,8 +3787,12 @@ impl Database {
 
 // Optimized for fast get() operations and supports unlimited attached databases.
 pub(crate) struct DatabaseCatalog {
-    /// Keyed by the name case-folded (`normalize_ident`): names match in any case, as SQLite's do.
+    /// Keyed by [DatabaseCatalog::key]: the name case-folded (`normalize_ident`), so names match
+    /// in any case, as SQLite's do; or, under a dialect whose `database_names_exact`, the name as
+    /// written.
     name_to_index: HashMap<String, usize>,
+    /// The dialect's `database_names_exact` (PostgreSQL: schema `"Q1"` is not `q1`).
+    exact_names: bool,
     /// Each database's name as written at ATTACH (fastest-wire: `"MixedCase"` listed as mixedcase),
     /// for every list and every message.
     display_names: HashMap<usize, String>,
@@ -3797,7 +3803,14 @@ pub(crate) struct DatabaseCatalog {
 #[allow(unused)]
 impl DatabaseCatalog {
     pub(crate) fn new() -> Self {
+        Self::with_exact_names(false)
+    }
+
+    /// A catalog that keys names as written when `exact_names` (the dialect's
+    /// `database_names_exact`), else case-folded.
+    pub(crate) fn with_exact_names(exact_names: bool) -> Self {
         Self {
+            exact_names,
             name_to_index: HashMap::default(),
             display_names: HashMap::default(),
             index_to_data: HashMap::default(),
@@ -3815,9 +3828,19 @@ impl DatabaseCatalog {
         self.display_names.get(&index).cloned()
     }
 
-    /// The index of the database named `s`, in any case.
+    /// The key a name is stored and found under: as written under an exact dialect, else
+    /// case-folded.
+    pub(crate) fn key(&self, s: &str) -> String {
+        if self.exact_names && !crate::branch::store::fe_mutant("database_names_folded") {
+            s.to_string()
+        } else {
+            crate::util::normalize_ident(s)
+        }
+    }
+
+    /// The index of the database named `s` (in any case, unless the names are exact).
     pub(crate) fn index_of(&self, s: &str) -> Option<usize> {
-        self.name_to_index.get(&crate::util::normalize_ident(s)).copied()
+        self.name_to_index.get(&self.key(s)).copied()
     }
 
     /// Every attached database's name as written, with its index.
@@ -3826,7 +3849,7 @@ impl DatabaseCatalog {
     }
 
     pub(crate) fn get_database_by_name(&self, s: &str) -> Option<(usize, Arc<Database>)> {
-        match self.name_to_index.get(&crate::util::normalize_ident(s)) {
+        match self.name_to_index.get(&self.key(s)) {
             None => None,
             Some(idx) => self
                 .index_to_data
@@ -3844,7 +3867,7 @@ impl DatabaseCatalog {
     }
 
     fn add(&mut self, s: &str) -> usize {
-        let key = crate::util::normalize_ident(s);
+        let key = self.key(s);
         turso_assert!(
             !self.name_to_index.contains_key(&key),
             "lib: database name already exists in catalog",
@@ -3864,7 +3887,7 @@ impl DatabaseCatalog {
     }
 
     pub(crate) fn remove(&mut self, s: &str) -> Option<usize> {
-        if let Some(index) = self.name_to_index.remove(&crate::util::normalize_ident(s)) {
+        if let Some(index) = self.name_to_index.remove(&self.key(s)) {
             // Should be impossible to remove main or temp.
             turso_assert_greater_than_or_equal!(index, 2);
             self.deallocate_index(index);

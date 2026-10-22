@@ -1769,7 +1769,7 @@ impl Connection {
                     let attached_resolver = |name: &str| -> Option<usize> {
                         self.attached_databases
                             .read()
-                            .get_database_by_name(&crate::util::normalize_ident(name))
+                            .get_database_by_name(name)
                             .map(|(idx, _)| idx)
                     };
                     crate::return_if_io!(crate::util::parse_schema_rows(
@@ -3294,7 +3294,7 @@ impl Connection {
             let attached_resolver = |name: &str| -> Option<usize> {
                 self.attached_databases
                     .read()
-                    .get_database_by_name(&crate::util::normalize_ident(name))
+                    .get_database_by_name(name)
                     .map(|(idx, _)| idx)
             };
             for (ty, name, table_name, root_page, sql) in &rows_data {
@@ -3666,7 +3666,7 @@ impl Connection {
             _ => self
                 .attached_databases
                 .read()
-                .get_database_by_name(&normalized)
+                .get_database_by_name(name)
                 .map(|(idx, _)| idx)
                 .ok_or_else(|| LimboError::InvalidArgument(format!("no such database: {name}"))),
         }

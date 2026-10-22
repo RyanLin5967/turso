@@ -220,9 +220,9 @@ impl PostgreSQLTranslator {
             .map(|a| ast::Name::from_string(&a.aliasname));
         // information_schema's views are virtual tables named information_schema_<view>, so a
         // user table that shares a view's name stays the user's.
-        let name = if range_var
-            .schemaname
-            .eq_ignore_ascii_case("information_schema")
+        // Schema names are as written: libpg_query has folded unquoted ones, and a quoted
+        // `"Public"` is not public (fastest-engine, lead RESUME item 10).
+        let name = if range_var.schemaname == "information_schema"
             && matches!(
                 range_var.relname.to_lowercase().as_str(),
                 "columns" | "tables" | "table_constraints" | "key_column_usage"
@@ -235,12 +235,10 @@ impl PostgreSQLTranslator {
             name
         };
         let mut qn = if range_var.schemaname.is_empty()
-            || matches!(
-                range_var.schemaname.to_lowercase().as_str(),
-                "pg_catalog" | "information_schema"
-            ) {
+            || matches!(range_var.schemaname.as_str(), "pg_catalog" | "information_schema")
+        {
             ast::QualifiedName::single(name)
-        } else if range_var.schemaname.eq_ignore_ascii_case("public") {
+        } else if range_var.schemaname == "public" {
             // An explicit public is the main database's relation whatever the search path: read as
             // unqualified, `INSERT INTO public.t` under `search_path TO s, public` wrote into s.t
             // (wire review 17 item 1). pg_catalog's relations stay unqualified, as the engine
@@ -1129,7 +1127,7 @@ impl PostgreSQLTranslator {
         // bare name found, enforcing on the wrong table. public is the main database, as in
         // qualified_name_from_range_var (wire review 17 item 1).
         let index_name = ast::Name::from_string(&idx.idxname);
-        let idx_name = match relation.schemaname.to_lowercase().as_str() {
+        let idx_name = match relation.schemaname.as_str() {
             "" | "pg_catalog" | "information_schema" => ast::QualifiedName::single(index_name),
             "public" => ast::QualifiedName::fullname(ast::Name::from_string("main"), index_name),
             _ => ast::QualifiedName::fullname(
@@ -5560,10 +5558,8 @@ pub fn try_extract_copy_from(parse_result: &ParseResult) -> Option<PgCopyFromStm
     let relation = copy.relation.as_ref()?;
     let table_name = relation.relname.clone();
     let schema_name = if relation.schemaname.is_empty()
-        || matches!(
-            relation.schemaname.to_lowercase().as_str(),
-            "public" | "pg_catalog"
-        ) {
+        || matches!(relation.schemaname.as_str(), "public" | "pg_catalog")
+    {
         None
     } else {
         Some(relation.schemaname.clone())

@@ -8691,7 +8691,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 connection
                     .attached_databases()
                     .read()
-                    .get_database_by_name(&crate::util::normalize_ident(alias))
+                    .get_database_by_name(alias)
                     .map(|(idx, _)| idx)
             };
             fresh.handle_schema_row(
@@ -9644,7 +9644,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 connection
                     .attached_databases()
                     .read()
-                    .get_database_by_name(&crate::util::normalize_ident(alias))
+                    .get_database_by_name(alias)
                     .map(|(idx, _)| idx)
             };
             fresh.handle_schema_row(

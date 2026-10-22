@@ -381,11 +381,16 @@ pub fn attach_schema_files(conn: &PgConnection, db_file: &str) {
         let Some(schema) = name
             .strip_prefix("turso-postgres-schema-")
             .and_then(|s| s.strip_suffix(".db"))
+            .and_then(schema_name_from_file_component)
         else {
             continue;
         };
         let path = entry.path().to_string_lossy().to_string();
-        let sql = format!("ATTACH '{path}' AS \"{schema}\"");
+        let sql = format!(
+            "ATTACH '{}' AS {}",
+            path.replace('\'', "''"),
+            turso_core::double_quote_identifier(&schema)
+        );
         tracing::info!("Auto-attaching PG schema '{}' from {}", schema, path);
         if let Err(e) = conn.inner().execute(&sql) {
             tracing::warn!("Failed to attach schema '{}': {}", schema, e);
@@ -580,7 +585,7 @@ fn prepare_statement_checked(
             let names = pg_conn.conn.attached_database_names();
             let probed = std::cell::RefCell::new(std::collections::HashMap::new());
             let holds = |schema: &str, name: &str| {
-                let key = (schema.to_ascii_lowercase(), name.to_ascii_lowercase());
+                let key = (schema.to_string(), name.to_ascii_lowercase());
                 if let Some(held) = probed.borrow().get(&key) {
                     return *held;
                 }
@@ -957,8 +962,10 @@ fn handle_pg_show(pg_conn: &Arc<PgConnectionInner>, show: &PgShowStmt) -> Result
     ))
 }
 
+/// `CREATE SCHEMA name`: attaches a database file for it. The name is as written: libpg_query has
+/// folded an unquoted one, and a quoted one keeps its case (`"Q1"` and `q1` are two schemas).
 fn handle_pg_create_schema(conn: &Arc<Connection>, stmt: &PgCreateSchemaStmt) -> Result<()> {
-    let name = stmt.name.to_lowercase();
+    let name = stmt.name.clone();
     if name == "public" {
         if stmt.if_not_exists {
             return Ok(());
@@ -980,14 +987,58 @@ fn handle_pg_create_schema(conn: &Arc<Connection>, stmt: &PgCreateSchemaStmt) ->
     let path = schema_file_path(conn, &name);
     execute_sqlite_internal(
         conn,
-        format!("ATTACH '{}' AS \"{}\"", path.replace('\'', "''"), name),
+        format!(
+            "ATTACH '{}' AS {}",
+            path.replace('\'', "''"),
+            turso_core::double_quote_identifier(&name)
+        ),
     )?;
     Ok(())
 }
 
+/// A schema name as a file-name component, one to one: ASCII lower-case letters, digits, `_` and
+/// `-` stand for themselves, and every other byte is `%XX`. So `"Q1"` and `q1` never share a file
+/// on a case-insensitive file system, and no name puts a path separator into the path (a quoted
+/// `"a/b"` named a file under a directory `turso-postgres-schema-a`, which does not exist, so its
+/// CREATE SCHEMA failed). A name of those characters only keeps its old file, and an older file
+/// whose name holds any other character still attaches under its old name
+/// ([`schema_name_from_file_component`] reads a character that is not `%XX` as itself).
+fn schema_file_component(schema_name: &str) -> String {
+    let mut out = String::with_capacity(schema_name.len());
+    for b in schema_name.bytes() {
+        if b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-' {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// The schema a file-name component names ([`schema_file_component`]'s inverse; any other
+/// character stands for itself, as in a file from before that rule). None when it is not UTF-8.
+fn schema_name_from_file_component(component: &str) -> Option<String> {
+    let bytes = component.as_bytes();
+    let hex = |b: u8| (b as char).to_digit(16);
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(high), Some(low)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+                out.push((high * 16 + low) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(out).ok()
+}
+
 fn schema_file_path(conn: &Connection, schema_name: &str) -> String {
     let main_path = conn.db_file_path();
-    let filename = format!("turso-postgres-schema-{schema_name}.db");
+    let filename = format!("turso-postgres-schema-{}.db", schema_file_component(schema_name));
     if main_path == ":memory:" {
         filename
     } else {
@@ -999,7 +1050,7 @@ fn schema_file_path(conn: &Connection, schema_name: &str) -> String {
 }
 
 fn handle_pg_drop_schema(conn: &Arc<Connection>, stmt: &PgDropSchemaStmt) -> Result<()> {
-    let name = stmt.name.to_lowercase();
+    let name = stmt.name.clone();
     if name == "public" {
         return handle_pg_drop_schema_public(conn, stmt.cascade);
     }
@@ -1017,7 +1068,10 @@ fn handle_pg_drop_schema(conn: &Arc<Connection>, stmt: &PgDropSchemaStmt) -> Res
         drop_all_tables_in_schema(conn, &name)?;
     }
 
-    execute_sqlite_internal(conn, format!("DETACH \"{name}\""))?;
+    execute_sqlite_internal(
+        conn,
+        format!("DETACH {}", turso_core::double_quote_identifier(&name)),
+    )?;
     Ok(())
 }
 
@@ -1037,8 +1091,12 @@ fn handle_pg_drop_schema_public(conn: &Arc<Connection>, cascade: bool) -> Result
 }
 
 fn drop_all_tables_in_schema(conn: &Arc<Connection>, schema_name: &str) -> Result<()> {
-    for table_name in list_user_tables(conn, Some(schema_name))? {
-        let mut stmt = conn.prepare(format!("DROP TABLE \"{schema_name}\".\"{table_name}\"",))?;
+    for table_name in list_user_tables(conn, Some(&schema_name.replace('"', "\"\"")))? {
+        let mut stmt = conn.prepare(format!(
+            "DROP TABLE {}.{}",
+            turso_core::double_quote_identifier(schema_name),
+            turso_core::double_quote_identifier(&table_name)
+        ))?;
         stmt.run_ignore_rows()?;
     }
     Ok(())
@@ -1062,7 +1120,7 @@ fn handle_pg_add_constraints(
     if add
         .schema
         .as_deref()
-        .is_some_and(|s| !s.eq_ignore_ascii_case("public"))
+        .is_some_and(|s| s != "public")
     {
         return Err(LimboError::ParseError(
             "ALTER TABLE ADD CONSTRAINT is supported only for tables in schema public".to_string(),
@@ -1851,6 +1909,27 @@ fn schema_exists(conn: &Arc<Connection>, schema_name: &str) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A schema's file-name component is one to one even on a case-insensitive file system, holds
+    /// no path separator or dot, and reads back as the name: names that differ in case, quotes,
+    /// slashes, dots and non-ASCII stay apart; a plain lower-case name keeps its pre-encoding file
+    /// name; an older file holding another character reads as itself.
+    #[test]
+    fn a_schema_file_component_round_trips_and_names_one_file() {
+        let names = ["q1", "Q1", "a\"b", "a/b", "../x", "x.y", "é", "my_schema-2", "%41", "A"];
+        let mut seen = std::collections::HashSet::new();
+        for name in names {
+            let c = schema_file_component(name);
+            assert!(
+                !c.contains('/') && !c.contains('\\') && !c.contains('.'),
+                "{name:?} -> {c:?} holds a separator or a dot"
+            );
+            assert!(seen.insert(c.to_ascii_lowercase()), "{name:?} -> {c:?} shares a file with another name on a case-insensitive file system");
+            assert_eq!(schema_name_from_file_component(&c).as_deref(), Some(name), "{c:?} does not read back as {name:?}");
+        }
+        assert_eq!(schema_file_component("my_schema-2"), "my_schema-2");
+        assert_eq!(schema_name_from_file_component("old.é").as_deref(), Some("old.é"));
+    }
 
     fn slow(sql: &str) -> Option<PgBranchCall> {
         try_extract_branch_call(&turso_pg_parser::parse(sql).ok()?)

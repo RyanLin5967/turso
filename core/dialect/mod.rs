@@ -55,6 +55,14 @@ pub trait Dialect: Send + Sync + 'static {
         false
     }
 
+    /// Whether an attached database's name matches only as written (PostgreSQL: a quoted schema
+    /// name keeps its case, `"Q1"` is not `q1`; the frontend has already folded unquoted names),
+    /// rather than in any case (SQLite). Default false. Read once per connection, by its
+    /// attached-database catalog (`DatabaseCatalog::key`).
+    fn database_names_exact(&self) -> bool {
+        false
+    }
+
     /// Parse `sql` again for a statement the engine re-prepares on `conn` (after a
     /// prepare-generation bump or another session's schema change), so a frontend whose
     /// translation needs the connection (its schema, for a column lookup: DELETE ... USING, a

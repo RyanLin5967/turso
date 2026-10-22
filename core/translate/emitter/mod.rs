@@ -836,14 +836,12 @@ impl<'a> Resolver<'a> {
                 "temp" => Ok(crate::TEMP_DB_ID),
                 _ => {
                     // Look up attached database
-                    if let Some((idx, _attached_db)) =
-                        self.get_attached_database(&db_name_normalized)
+                    if let Some((idx, _attached_db)) = self.get_attached_database(db_name.as_str())
                     {
                         Ok(idx)
                     } else {
-                        Err(LimboError::InvalidArgument(format!(
-                            "no such database: {db_name_normalized}"
-                        )))
+                        let shown = self.attached_databases.read().key(db_name.as_str());
+                        Err(LimboError::InvalidArgument(format!("no such database: {shown}")))
                     }
                 }
             }

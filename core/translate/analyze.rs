@@ -59,7 +59,7 @@ fn resolve_analyze_targets(
             }
 
             // Check if it's an attached database name
-            if let Some((db_id, _)) = resolver.get_attached_database(&normalized) {
+            if let Some((db_id, _)) = resolver.get_attached_database(target.name.as_str()) {
                 let targets = collect_all_tables_in_db(db_id, resolver);
                 return Ok((db_id, targets));
             }
