@@ -17995,6 +17995,47 @@ fn a_float_cast_to_text_is_written_as_its_output_routine_writes_it() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// numfuzz seed 4912 at 783dee075 (artie 4f001ce3aa): a float column compared with a numeric constant past the type the
+/// comparison resolves to is 22003 with numeric_out's text of the constant: an IN list takes the column's type (real), so
+/// -0.330e300 is past it; = and < compare a real as float8, so 1e39 is not, and 1e400 is past float8. The IN list
+/// answered no rows. Expected answers: PG 18.6, recorded on eceubuntu2 (artie dc1092962a,
+/// rec59-float-compare-range/pg18-wirefuzz-a_float_column_compared_with_a_constant_past_its_range_is_22003.out).
+#[test]
+fn a_float_column_compared_with_a_constant_past_its_range_is_22003() {
+    let dir = Scratch::new("float-compare-range");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in ["CREATE TABLE fr (id int PRIMARY KEY, r real, f float8)", "INSERT INTO fr VALUES (1, 1.5, 2.5)"] {
+        a.q(sql).ok(sql);
+    }
+    let mut wrong = Vec::new();
+    for (sql, message) in [
+        ("SELECT id FROM fr WHERE r IN ((-0.330e300), (-32768)) ORDER BY id", format!("\"-33{}\" is out of range for type real", "0".repeat(298))),
+        ("SELECT id FROM fr WHERE f = 1e400", format!("\"1{}\" is out of range for type double precision", "0".repeat(400))),
+    ] {
+        let r = a.q(sql);
+        if !r.error.as_ref().is_some_and(|e| e.code == "22003" && e.message == message) {
+            wrong.push(format!("{sql}: PG 22003; got {:?} {:?}", r.rows, r.error.as_ref().map(|e| (&e.code, e.message.chars().take(60).collect::<String>()))));
+        }
+    }
+    let one = vec![vec![Some("1".to_string())]];
+    for (sql, want) in [
+        ("SELECT id FROM fr WHERE r = 1e39", vec![]),
+        ("SELECT id FROM fr WHERE r < 1e-50", vec![]),
+        ("SELECT id FROM fr WHERE 1e39 > r", one.clone()),
+        ("SELECT id FROM fr WHERE r = 1.5", one.clone()),
+        ("SELECT id FROM fr WHERE r IN (1.5, 2) ORDER BY id", one.clone()),
+        ("SELECT id FROM fr WHERE f < 1e300", one.clone()),
+        ("SELECT id FROM fr WHERE r BETWEEN 0 AND 1e39", one.clone()),
+    ] {
+        let r = a.q(sql);
+        if r.error.is_some() || r.rows != want {
+            wrong.push(format!("{sql}: PG {want:?}; got {:?} {:?}", r.rows, r.error));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// numfuzz seeds 7472, 7552 at b46404e66 (artie 875b49ec51): a constant expression with integer functions (abs, floor,
 /// ceil, round, trunc) or a numeric(p, s) cast inside, assigned to an integer or numeric(p, s) column, is refused past
 /// the column or the cast even when no row matches, as PostgreSQL folds it before any row is read (it answered UPDATE
