@@ -6987,6 +6987,13 @@ pub fn op_decr_jump_zero(
     Ok(InsnFunctionStepResult::Step)
 }
 
+/// The connection's `integer_math_is_float8` (the PostgreSQL dialect: trunc, floor, ceil, ceiling
+/// and sign of an integer are float8). Mutant `integer_math_stays_integer` (test builds only):
+/// SQLite's integer, as before.
+fn integer_math_is_float8(program: &Program) -> bool {
+    program.connection.integer_math_is_float8 && !crate::branch::store::fe_mutant("integer_math_stays_integer")
+}
+
 /// The connection's `float_sum_naive` (the PostgreSQL dialect: float sums add left to right, as
 /// PostgreSQL's do). Mutant `float_sum_compensated` (test builds only): compensated, as before.
 fn naive_float_sum(program: &Program) -> bool {
@@ -10062,7 +10069,13 @@ pub fn op_function(
             | ScalarFunc::ZeroBlob => {
                 let reg_value = state.registers[*start_reg].borrow_mut().get_value();
                 let result = match scalar_func {
-                    ScalarFunc::Sign => reg_value.exec_sign(),
+                    ScalarFunc::Sign => match reg_value.exec_sign() {
+                        // PostgreSQL's sign of an integer or a float8 is a float8.
+                        Some(Value::Numeric(Numeric::Integer(n))) if integer_math_is_float8(program) => {
+                            Some(Value::from_f64(n as f64))
+                        }
+                        other => other,
+                    },
                     ScalarFunc::Abs => Some(reg_value.exec_abs()?),
                     ScalarFunc::Lower => reg_value.exec_lower(),
                     ScalarFunc::Upper => reg_value.exec_upper(),
@@ -11298,7 +11311,14 @@ pub fn op_function(
 
             MathFuncArity::Unary => {
                 let reg_value = &state.registers[*start_reg];
-                let result = reg_value.get_value().exec_math_unary(math_func);
+                let result = match reg_value.get_value() {
+                    // Under `integer_math_is_float8` (PostgreSQL) an integer is computed over
+                    // float8, where SQLite's rule hands ceil/floor/trunc's integer back as is.
+                    Value::Numeric(Numeric::Integer(i)) if integer_math_is_float8(program) => {
+                        Value::from_f64(*i as f64).exec_math_unary(math_func)
+                    }
+                    v => v.exec_math_unary(math_func),
+                };
                 state.registers[*dest].set_value(result);
             }
 

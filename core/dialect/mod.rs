@@ -70,6 +70,13 @@ pub trait Dialect: Send + Sync + 'static {
         false
     }
 
+    /// Whether trunc, floor, ceil, ceiling and sign of an INTEGER answer a float (PostgreSQL
+    /// resolves them over double precision) rather than SQLite's integer. Default false. Read once
+    /// per connection (`Connection::integer_math_is_float8`).
+    fn integer_math_is_float8(&self) -> bool {
+        false
+    }
+
     /// Whether an attached database's name matches only as written (PostgreSQL: a quoted schema
     /// name keeps its case, `"Q1"` is not `q1`; the frontend has already folded unquoted names),
     /// rather than in any case (SQLite). Default false. Read once per connection, by its

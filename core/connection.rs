@@ -640,6 +640,8 @@ pub struct Connection {
     pub(crate) division_by_zero_raises: bool,
     /// The dialect's `float_sum_naive`, read at connect.
     pub(crate) float_sum_naive: bool,
+    /// The dialect's `integer_math_is_float8`, read at connect.
+    pub(crate) integer_math_is_float8: bool,
     /// Maximum execution time for a single statement on this connection.
     /// `Duration::ZERO` means disabled.
     pub(super) query_timeout_ms: AtomicU64,
