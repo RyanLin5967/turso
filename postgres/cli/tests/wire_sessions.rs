@@ -17808,6 +17808,50 @@ fn a_float_numeric_or_boolean_column_reads_its_literal_as_its_input_routine_does
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// numfuzz seeds 4681 and 4784 at 783dee075 (artie f1fec7d3cc): a real or double precision value cast to text, varchar or
+/// concatenated with || is written as float4out or float8out writes it (the shortest text that reads back exactly):
+/// a real column's -683390.3 was written -683390.3125, a float8 expression's -2837.7029749885614 as -2837.70297498856.
+/// Expected answers: PG 18.6, recorded (artie 31bae8c279,
+/// rec51-float-text-cast/pg18-wirefuzz-a_float_cast_to_text_is_written_as_its_output_routine_writes_it.out).
+#[test]
+fn a_float_cast_to_text_is_written_as_its_output_routine_writes_it() {
+    let dir = Scratch::new("float-text-cast");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in [
+        "CREATE TABLE ft (id int PRIMARY KEY, r real, f float8)",
+        "INSERT INTO ft VALUES (1, -683390.3, 0.1), (2, 0.75318, 1e20), (3, 1.1, 1e-5), (4, 100, 2837.7029749885614)",
+    ] {
+        a.q(sql).ok(sql);
+    }
+    let rows = |rows: &[&[&str]]| -> Vec<Vec<Option<String>>> { rows.iter().map(|r| r.iter().map(|v| Some(v.to_string())).collect()).collect() };
+    let columns = rows(&[&["1", "-683390.3", "0.1"], &["2", "0.75318", "1e+20"], &["3", "1.1", "1e-05"], &["4", "100", "2837.7029749885614"]]);
+    let mut wrong = Vec::new();
+    for (sql, want) in [
+        ("SELECT id, r::text, f::text FROM ft ORDER BY id", columns.clone()),
+        ("SELECT id, CAST(r AS text), CAST(f AS varchar) FROM ft ORDER BY id", columns.clone()),
+        (
+            "SELECT id, (r * 2)::text, (f + f)::text, (f / 3)::text FROM ft ORDER BY id",
+            rows(&[
+                &["1", "-1366780.625", "0.2", "0.03333333333333333"],
+                &["2", "1.5063600540161133", "2e+20", "3.333333333333333e+19"],
+                &["3", "2.200000047683716", "2e-05", "3.3333333333333337e-06"],
+                &["4", "200", "5675.405949977123", "945.9009916628538"],
+            ]),
+        ),
+        ("SELECT (((32767)::float8 / ((-3.5840e0) - 7.963015416626570000)))::text AS v", rows(&[&["-2837.7029749885614"]])),
+        ("SELECT (0.1::float8 + 0.2::float8)::text AS v, (1.1::real)::text AS w, ('1e300'::float8 * 10)::text AS x", rows(&[&["0.30000000000000004", "1.1", "1e+301"]])),
+        ("SELECT id, r || 'x', f || '' FROM ft ORDER BY id", rows(&[&["1", "-683390.3x", "0.1"], &["2", "0.75318x", "1e+20"], &["3", "1.1x", "1e-05"], &["4", "100x", "2837.7029749885614"]])),
+        ("SELECT length(f::text) FROM ft WHERE id = 4", rows(&[&["18"]])),
+    ] {
+        let r = a.q(sql);
+        if r.error.is_some() || r.rows != want {
+            wrong.push(format!("{sql}: PG {want:?}; got {:?} {:?}", r.rows, r.error));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// numfuzz seed 3504 at d5600475b (artie c098a7ed4d), PGDIV-INT-CAST-TRUNCATES: an expression cast to an integer type
 /// rounds as its type's cast rounds, in a target list, a WHERE and a view: a numeric half away from zero, a float8 or
 /// real half to even, where the engine's CAST truncated (-((-('1.5'::numeric))::bigint) answered 1 for PG's 2).
