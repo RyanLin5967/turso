@@ -17799,15 +17799,17 @@ fn a_float_numeric_or_boolean_column_reads_its_literal_as_its_input_routine_does
 /// numfuzz seed 3504 at d5600475b (artie c098a7ed4d), PGDIV-INT-CAST-TRUNCATES: an expression cast to an integer type
 /// rounds as its type's cast rounds, in a target list, a WHERE and a view: a numeric half away from zero, a float8 or
 /// real half to even, where the engine's CAST truncated (-((-('1.5'::numeric))::bigint) answered 1 for PG's 2).
-/// Expected answers: PG 18.6, recorded (artie 0de472ed9d,
-/// rec50-expression-int-cast/pg18-wirefuzz-an_expression_cast_to_an_integer_rounds_as_its_type_rounds.out).
+/// The numeric column is numeric(10, 2): a bare numeric column is stored and announced float8 here (the bare-NUMERIC
+/// divergence), so it rounds as a float8. Expected answers: PG 18.6, recorded (artie 9b5648cdfd,
+/// rec50b-expression-int-cast-typmod/pg18-wirefuzz-an_expression_cast_to_an_integer_rounds_as_its_type_rounds.out; the
+/// same answers as with a bare numeric, rec50, artie 0de472ed9d).
 #[test]
 fn an_expression_cast_to_an_integer_rounds_as_its_type_rounds() {
     let dir = Scratch::new("expression-int-cast");
     let server = Server::start(&dir.db(), &[]);
     let mut a = server.connect();
     for sql in [
-        "CREATE TABLE ec (id int PRIMARY KEY, n numeric, f float8, r real)",
+        "CREATE TABLE ec (id int PRIMARY KEY, n numeric(10,2), f float8, r real)",
         "INSERT INTO ec VALUES (1, 2.5, 2.5, 2.5), (2, -2.5, -2.5, -2.5), (3, 1.5, 1.5, 1.5), (4, 0.5, 0.5, 0.5)",
         "CREATE VIEW ecv AS SELECT id, (n * 1)::int AS ni, (f / 1)::int AS fi FROM ec",
     ] {
