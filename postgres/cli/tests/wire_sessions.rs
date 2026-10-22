@@ -17494,6 +17494,52 @@ fn a_string_parameter_assigned_to_another_category_is_42804() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// numfuzz (seeds 285 at 6e17acc9a, 875 at 45de98440; artie 9b32cd5149, dcbd0e0179): a constant cast past
+/// numeric(p, s) is 22003 'numeric field overflow' at planning, wherever it stands, so a statement matching no row is
+/// refused too; each was answered (UPDATE 0). The bound is the value rounded half away from zero to s places reaching
+/// 10^(p - s), s negative or past p included; 'Infinity' overflows, 'NaN' does not. Expected answers: PG 18.6, recorded
+/// (artie 8ceb58f30a, rec31-constant-numeric-cast/pg18-wirefuzz-a_constant_cast_past_numeric_p_s_is_22003_with_no_row.out),
+/// but its five casts PG answers with no row whose refusal here is another class: -99999::numeric(5,0) (the interim 0A000
+/// of a minus over a numeric(p, s) cast), 1.5::numeric(3,-1), 12345::numeric(3,-2), 0.00123::numeric(2,4) and
+/// 'NaN'::numeric(5,2) (the engine's numeric, PGDIV-NUMERIC-TYPMOD-CODE and its NaN).
+#[test]
+fn a_constant_cast_past_numeric_p_s_is_22003_with_no_row() {
+    let dir = Scratch::new("numeric-cast-constant");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let ddl = "CREATE TABLE nt (id int PRIMARY KEY, c0 numeric(20,5), c1 int)";
+    a.q(ddl).ok(ddl);
+    let mut wrong = Vec::new();
+    for (sql, overflow) in [
+        ("UPDATE nt SET c0 = (47654686040.1)::numeric(6,2) WHERE id = 1", true),
+        ("UPDATE nt SET c0 = ((-9223372036854775808))::numeric(10,0) WHERE id = 1", true),
+        ("DELETE FROM nt WHERE c0 = 1000::numeric(3,0)", true),
+        ("SELECT id FROM nt WHERE c0 > 12345.678::numeric(5,2)", true),
+        ("SELECT id FROM nt WHERE c0 > 999.995::numeric(5,2)", true),
+        ("SELECT id FROM nt WHERE c0 > 999.994::numeric(5,2)", false),
+        ("SELECT id FROM nt WHERE c0 > '123456'::numeric(5,2)", true),
+        ("SELECT id FROM nt WHERE c0 > CAST(1e10 AS numeric(6,0))", true),
+        ("SELECT id FROM nt WHERE c0 > 0.5::numeric(1,1)", false),
+        ("SELECT id FROM nt WHERE c0 > 1::numeric(1,1)", true),
+        ("SELECT id FROM nt WHERE c0 > 0.0123::numeric(2,4)", true),
+        ("INSERT INTO nt SELECT 1, 1e9::numeric(4,0), 1 WHERE false", true),
+        ("SELECT id FROM nt WHERE c0 > 'Infinity'::numeric(5,2)", true),
+        ("SELECT id FROM nt WHERE c0 > 1e10::numeric", false),
+    ] {
+        let r = a.q(sql);
+        let fine = if overflow {
+            r.error.as_ref().is_some_and(|e| e.code == "22003" && e.message == "numeric field overflow")
+        } else {
+            r.error.is_none() && r.rows.is_empty()
+        };
+        if !fine {
+            let want = if overflow { "22003 numeric field overflow" } else { "no row" };
+            wrong.push(format!("{sql}: PG {want}; got {:?} {:?} {:?}", r.tags, r.rows, r.error));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// numfuzz (seeds 343 at 6e17acc9a, 1144 at 45de98440; artie 9b32cd5149, 52ca04164d): a real is written in the
 /// shortest digits that read back as it from strictly inside its rounding interval, as float4out writes it: a decimal on
 /// the interval's edge reads back only by ties-to-even, and PostgreSQL passes over it (-337198016 is -3.3719802e+08,
