@@ -3865,6 +3865,28 @@ impl PostgreSQLTranslator {
                 if let Some(v) = cast_rewrite_key(type_cast).and_then(|key| self.integer_literals.as_ref()?.get(&key)) {
                     return Ok(ast::Expr::Literal(ast::Literal::Numeric(v.to_string())));
                 }
+                // A string constant cast to an integer type is int2in/int4in/int8in's value, decided
+                // here from the text alone ('0x1F'::int is 31, '1_000'::int8 is 1000): the engine's
+                // CAST of the text read '0x1F' as 0 (recorded, rec45-setop-assign). One the input
+                // refuses is refused by the frontend before translation.
+                if let (Some(t), Some(pg_query::protobuf::node::Node::AConst(c))) =
+                    (type_cast.type_name.as_ref().filter(|t| t.array_bounds.is_empty()), type_cast.arg.as_deref().and_then(|a| a.node.as_ref()))
+                {
+                    let bits = match t.names.last().and_then(|n| n.node.as_ref()) {
+                        Some(pg_query::protobuf::node::Node::String(s)) => match s.sval.as_str() {
+                            "int2" => 16,
+                            "int4" => 32,
+                            "int8" => 64,
+                            _ => 0,
+                        },
+                        _ => 0,
+                    };
+                    if let (true, Some(pg_query::protobuf::a_const::Val::Sval(text))) = (bits > 0 && !c.isnull, c.val.as_ref()) {
+                        if let crate::pg_input::PgInt::Value(v) = crate::pg_input::pg_strtoint(&text.sval, bits) {
+                            return Ok(ast::Expr::Literal(ast::Literal::Numeric(v.to_string())));
+                        }
+                    }
+                }
                 // An explicit cast to varchar(n) cuts its value to n characters, as PostgreSQL's
                 // explicit-cast length coercion does: the cast without its length, then the cut
                 // (wire-rev-351702a43 MED-5: $1::varchar(10) stored the whole text).

@@ -2511,7 +2511,9 @@ fn text_integer_casts(
 /// an expression of a string type (upper('x')), a negated or hexadecimal constant, a set
 /// operation's branches, a DEFAULT, and a literal to a float or boolean column (stored as the
 /// engine reads it). A constant to a numeric(p, s) column past it is 22003 'numeric field
-/// overflow', and an INSERT ... SELECT's targets are judged as VALUES items are (numfuzz seeds
+/// overflow', an INSERT ... SELECT's set operation is judged after its branches' types resolve
+/// (rec45; a plain UNION's non-integral constants are left to the engine, whose rounding would
+/// come before the UNION's duplicate removal), and an INSERT ... SELECT's targets are judged as VALUES items are (numfuzz seeds
 /// 1442, 1600 at 1d8a8b230; recorded, rec33-assign-numeric-select, artie 555adcffb6).
 /// A CREATE TABLE's and an ALTER TABLE ADD COLUMN's DEFAULTs, coerced to their columns as
 /// PostgreSQL coerces them (the lead's ruling LEAD-RULINGS 3abd61b6d3 (b); recorded,
@@ -2851,6 +2853,8 @@ fn literal_assignments(
         Some((target, typmods, text))
     };
     let mut float_rewrites: std::collections::HashMap<i32, f64> = std::collections::HashMap::new();
+    // A set operation's branch constants written as their value, applied once coerce is done.
+    let mut setop_rewrites: Vec<(i32, i64)> = Vec::new();
     // The relation a value's column reference reads, with the names it is known by: an UPDATE's
     // target (with no FROM), an INSERT ... SELECT's one FROM table; none for VALUES.
     let source: Option<(std::sync::Arc<turso_core::schema::BTreeTable>, String, String)> = match stmt {
@@ -3285,6 +3289,131 @@ fn literal_assignments(
                         }
                     }
                 }
+                // A set operation (rec45): each output column's branches resolve to one type first,
+                // as select_common_type resolves them, then that type is assigned to the column.
+                if select.larg.is_some() {
+                    use turso_pg_parser::pg_query::protobuf::{SelectStmt, SetOperation};
+                    fn leaves<'a>(s: &'a SelectStmt, out: &mut Vec<&'a SelectStmt>, union_only: &mut bool, union_all: &mut bool) {
+                        match (s.larg.as_deref(), s.rarg.as_deref()) {
+                            (Some(l), Some(r)) => {
+                                if s.op() != SetOperation::SetopUnion {
+                                    *union_only = false;
+                                }
+                                if !s.all {
+                                    *union_all = false;
+                                }
+                                leaves(l, out, union_only, union_all);
+                                leaves(r, out, union_only, union_all);
+                            }
+                            _ => out.push(s),
+                        }
+                    }
+                    let (mut branches, mut union_only, mut union_all) = (Vec::new(), true, true);
+                    leaves(select, &mut branches, &mut union_only, &mut union_all);
+                    union_all &= union_only;
+                    // Every branch row is produced: no FROM, no WHERE, no VALUES.
+                    let constant = branches.iter().all(|b| b.from_clause.is_empty() && b.where_clause.is_none() && b.values_lists.is_empty());
+                    let width = branches.first().map_or(0, |b| b.target_list.len());
+                    for k in 0..width {
+                        let Some(column) = column_at(k) else { continue };
+                        let values: Option<Vec<&PgNode>> = branches
+                            .iter()
+                            .map(|b| match b.target_list.get(k)?.node.as_ref() {
+                                Some(Node::ResTarget(r)) => r.val.as_deref(),
+                                _ => None,
+                            })
+                            .collect();
+                        let Some(values) = values else { continue };
+                        // (untyped texts, string types, integer constants (value, is int8, location, text), decimals)
+                        let (mut untyped, mut strings, mut numbers, mut other) = (Vec::new(), Vec::new(), Vec::new(), false);
+                        let mut decimal = false;
+                        let mut int8 = false;
+                        for v in &values {
+                            match v.node.as_ref() {
+                                Some(Node::AConst(c)) if !c.isnull => match c.val.as_ref() {
+                                    Some(Val::Sval(t)) => untyped.push(t.sval.as_str()),
+                                    Some(Val::Ival(i)) => numbers.push((Some(i128::from(i.ival)), c.location, i.ival.to_string())),
+                                    Some(Val::Fval(f)) => {
+                                        let whole = crate::functions::round_decimal(&f.fval).filter(|v| v.to_string() == f.fval);
+                                        match whole {
+                                            Some(_) => int8 = true,
+                                            None => decimal = true,
+                                        }
+                                        numbers.push((crate::functions::round_decimal(&f.fval), c.location, f.fval.clone()));
+                                    }
+                                    _ => other = true,
+                                },
+                                Some(Node::AConst(_)) => {}
+                                _ => match string_type(v, &None) {
+                                    Some(t) => strings.push(t),
+                                    None => other = true,
+                                },
+                            }
+                        }
+                        if other {
+                            continue;
+                        }
+                        let target = column_type(column).map_or(25, |ty| crate::catalog::sqlite_type_to_pg_oid(&ty) as u32);
+                        let numeric_target = matches!(target, 16 | 20 | 21 | 23 | 700 | 701 | 1700);
+                        if numbers.is_empty() {
+                            // All strings: text, or the one string type every typed branch has.
+                            let common = match strings.first() {
+                                Some(first) if strings.iter().all(|t| t == first) => *first,
+                                Some(_) => 25,
+                                None => 25,
+                            };
+                            if numeric_target && (!untyped.is_empty() || !strings.is_empty()) {
+                                return Err(SqlErrorMessage::classified(
+                                    SqlErrorKind::DatatypeMismatch,
+                                    format!(
+                                        "column \"{column}\" is of type {} but expression is of type {}",
+                                        crate::result_types::type_name(target),
+                                        crate::result_types::type_name(common)
+                                    ),
+                                ));
+                            }
+                            continue;
+                        }
+                        if !strings.is_empty() {
+                            continue;
+                        }
+                        // Untyped branches take the numbers' type, read by its input routine.
+                        let common_name = if decimal { "numeric" } else if int8 { "bigint" } else { "integer" };
+                        for t in &untyped {
+                            let refused = if decimal {
+                                turso_pg_parser::pg_input::pg_numeric_in(t).is_none().then(|| (format!("invalid input syntax for type numeric: \"{t}\""), SqlErrorKind::InvalidTextRepresentation))
+                            } else {
+                                crate::functions::validate_pg_input(t, common_name)
+                            };
+                            if let Some((message, kind)) = refused {
+                                return Err(SqlErrorMessage::classified(kind, message));
+                            }
+                        }
+                        let bits = column_type(column).map_or(0, |t| integer_bits(&t));
+                        if bits == 0 || !union_only || !constant {
+                            continue;
+                        }
+                        let limit = 1i128 << (bits - 1);
+                        for (value, location, text) in &numbers {
+                            let Some(value) = value else { continue };
+                            if *value < -limit || *value >= limit {
+                                return Err(SqlErrorMessage::classified(
+                                    SqlErrorKind::NumericValueOutOfRange,
+                                    format!("{} out of range", match bits {
+                                        16 => "smallint",
+                                        32 => "integer",
+                                        _ => "bigint",
+                                    }),
+                                ));
+                            }
+                            // UNION ALL keeps every row, so a rounded value is the same rows; UNION
+                            // removes duplicates before the column's rounding, so it is left alone.
+                            if union_all && *location >= 0 && *text != value.to_string() {
+                                setop_rewrites.push((*location, *value as i64));
+                            }
+                        }
+                    }
+                }
             }
             if let Some(conflict) = i.on_conflict_clause.as_ref() {
                 set_list(&conflict.target_list, &mut coerce)?;
@@ -3294,6 +3423,7 @@ fn literal_assignments(
         _ => {}
     }
     drop(coerce);
+    rewrites.extend(setop_rewrites);
     Ok((rewrites, text_rewrites, float_rewrites))
 }
 
