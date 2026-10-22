@@ -2132,7 +2132,7 @@ fn prepare_statement_parsed(
             [b"ceil(".as_slice(), b"ceiling(", b"floor(", b"round(", b"trunc(", b"abs(", b"sign(", b"sqrt(", b"exp(", b"ln(", b"log(", b"log10(", b"pow(", b"power("]
                 .iter()
                 .any(|w| may_name(w))
-                || [b"%".as_slice(), b"::text", b"::varchar", b"::char", b"::bpchar", b"::name", b"as text", b"as varchar", b"as char"]
+                || [b"%".as_slice(), b"::text", b"::varchar", b"::char", b"::bpchar", b"::name", b"as text", b"as varchar", b"as char", b"-'", b"- '", b"+'", b"+ '"]
                     .iter()
                     .any(|w| may_name(w))
         };
@@ -3073,54 +3073,36 @@ fn literal_assignments(
                     }
                 }
             }
+            // A minus over a constant cast (- 3000000000::bigint, - 2.5::numeric; rec43): the cast's
+            // value, negated, then the column's range; rewritten where the minus stands.
+            Some(Node::AExpr(e))
+                if e.lexpr.is_none()
+                    && e.location >= 0
+                    && matches!(e.name.as_slice(), [n] if matches!(&n.node, Some(Node::String(s)) if s.sval == "-")) =>
+            {
+                let bits = column_type(column).map_or(0, |t| integer_bits(&t));
+                let Some(Node::TypeCast(c)) = e.rexpr.as_deref().and_then(|r| r.node.as_ref()) else { return Ok(()) };
+                let Some((target, typmods, text)) = constant_cast(c).filter(|_| bits > 0) else { return Ok(()) };
+                let Some(value) = judge_constant_cast(target, &typmods, &text)? else { return Ok(()) };
+                let value = -value;
+                let limit = 1i128 << (bits - 1);
+                if value < -limit || value >= limit {
+                    return Err(SqlErrorMessage::classified(
+                        SqlErrorKind::NumericValueOutOfRange,
+                        format!("{} out of range", match bits {
+                            16 => "smallint",
+                            32 => "integer",
+                            _ => "bigint",
+                        }),
+                    ));
+                }
+                rewrites.insert(e.location, value as i64);
+            }
             Some(Node::TypeCast(c)) if constant_cast(c).is_some() => {
                 let bits = column_type(column).map_or(0, |t| integer_bits(&t));
                 let Some((target, typmods, text)) = constant_cast(c).filter(|_| bits > 0) else { return Ok(()) };
-                let width = |name: &str| match name {
-                    "int2" => Some((16, "smallint")),
-                    "int4" => Some((32, "integer")),
-                    "int8" => Some((64, "bigint")),
-                    _ => None,
-                };
                 let out_of_range = |name: &str| SqlErrorMessage::classified(SqlErrorKind::NumericValueOutOfRange, format!("{name} out of range"));
-                // The cast's own value first, as the planner folds the inner cast first.
-                let value = if target == "numeric" {
-                    // A bare numeric keeps every digit, so only a typmod rounds before the column.
-                    let scale = match typmods.as_slice() {
-                        [_, scale] => *scale,
-                        _ => 0,
-                    };
-                    if let Some(precision) = typmods.first() {
-                        if crate::functions::numeric_overflows(&text, *precision, scale) == Some(true) {
-                            return Err(SqlErrorMessage::classified(SqlErrorKind::NumericValueOutOfRange, "numeric field overflow"));
-                        }
-                    }
-                    let rounded = if typmods.is_empty() {
-                        crate::functions::round_decimal(&text)
-                    } else {
-                        crate::functions::round_decimal_at(&text, scale)
-                    };
-                    match rounded {
-                        Some(v) => v,
-                        None => return Ok(()),
-                    }
-                } else {
-                    let Some((cast_bits, cast_name)) = width(target) else { return Ok(()) };
-                    if let Some((message, kind)) = crate::functions::validate_pg_input(&text, cast_name) {
-                        return Err(SqlErrorMessage::classified(kind, message));
-                    }
-                    let Some(v) = (match crate::functions::pg_strtoint(&text, 64) {
-                        crate::functions::PgInt::Value(v) => Some(i128::from(v)),
-                        _ => crate::functions::round_decimal(&text),
-                    }) else {
-                        return Ok(());
-                    };
-                    let limit = 1i128 << (cast_bits - 1);
-                    if v < -limit || v >= limit {
-                        return Err(out_of_range(cast_name));
-                    }
-                    v
-                };
+                let Some(value) = judge_constant_cast(target, &typmods, &text)? else { return Ok(()) };
                 let limit = 1i128 << (bits - 1);
                 if value < -limit || value >= limit {
                     return Err(out_of_range(match bits {
@@ -3208,6 +3190,48 @@ fn literal_assignments(
     }
     drop(coerce);
     Ok((rewrites, text_rewrites, float_rewrites))
+}
+
+/// A constant cast's own value, as the planner folds it before an integer column's assignment
+/// (rec32, rec43): a cast to numeric(p, s) checked against its modifiers (22003 'numeric field
+/// overflow') and rounded half away from zero to its scale, a bare numeric keeping every digit; a
+/// cast to an integer type read by its input routine or rounded, and range-checked (22003). None
+/// for a spelling it does not read, which the caller leaves alone.
+fn judge_constant_cast(target: &str, typmods: &[i32], text: &str) -> std::result::Result<Option<i128>, SqlErrorMessage> {
+    let width = |name: &str| match name {
+        "int2" => Some((16, "smallint")),
+        "int4" => Some((32, "integer")),
+        "int8" => Some((64, "bigint")),
+        _ => None,
+    };
+    let out_of_range = |name: &str| SqlErrorMessage::classified(SqlErrorKind::NumericValueOutOfRange, format!("{name} out of range"));
+    if target == "numeric" {
+        let scale = match typmods {
+            [_, scale] => *scale,
+            _ => 0,
+        };
+        if let Some(precision) = typmods.first() {
+            if crate::functions::numeric_overflows(text, *precision, scale) == Some(true) {
+                return Err(SqlErrorMessage::classified(SqlErrorKind::NumericValueOutOfRange, "numeric field overflow"));
+            }
+        }
+        return Ok(if typmods.is_empty() { crate::functions::round_decimal(text) } else { crate::functions::round_decimal_at(text, scale) });
+    }
+    let Some((cast_bits, cast_name)) = width(target) else { return Ok(None) };
+    if let Some((message, kind)) = crate::functions::validate_pg_input(text, cast_name) {
+        return Err(SqlErrorMessage::classified(kind, message));
+    }
+    let Some(v) = (match crate::functions::pg_strtoint(text, 64) {
+        crate::functions::PgInt::Value(v) => Some(i128::from(v)),
+        _ => crate::functions::round_decimal(text),
+    }) else {
+        return Ok(None);
+    };
+    let limit = 1i128 << (cast_bits - 1);
+    if v < -limit || v >= limit {
+        return Err(out_of_range(cast_name));
+    }
+    Ok(Some(v))
 }
 
 /// An integer array literal read as array_in reads it, each element by int2in/int4in/int8in

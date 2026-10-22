@@ -77,10 +77,47 @@ pub fn pg_strtoint(input: &str, bits: u32) -> PgInt {
 
 /// A decimal constant's value rounded half away from zero, as numeric's int2/int4/int8 casts round
 /// it (-0.5 is -1, 2.5e-1 is 0; recorded, rec29-constant-assign, artie c9722422e1); i128::MAX for
-/// one past any integer type. None for a spelling that is not plain decimal (a 0x prefix, an
-/// underscore), which the caller leaves alone.
+/// one past any integer type. A 0x, 0o or 0b integer and underscores between digits are read;
+/// None for any other spelling, which the caller leaves alone.
 pub fn round_decimal(text: &str) -> Option<i128> {
     let t = text.trim();
+    // A 0x, 0o or 0b integer constant (PostgreSQL 16+), underscores between its digits:
+    // i128::MAX past every integer type, as for a decimal.
+    {
+        let (negative, unsigned) = match t.strip_prefix('-') {
+            Some(rest) => (true, rest),
+            None => (false, t.strip_prefix('+').unwrap_or(t)),
+        };
+        let radix = match unsigned.get(..2).map(|p| p.to_ascii_lowercase()) {
+            Some(p) if p == "0x" => Some(16),
+            Some(p) if p == "0o" => Some(8),
+            Some(p) if p == "0b" => Some(2),
+            _ => None,
+        };
+        if let Some(radix) = radix {
+            let body = unsigned[2..].trim_start_matches('_');
+            if body.is_empty() || body.ends_with('_') || body.contains("__") || !body.chars().all(|c| c == '_' || c.is_digit(radix)) {
+                return None;
+            }
+            let digits: String = body.chars().filter(|c| *c != '_').collect();
+            let v = match u128::from_str_radix(&digits, radix) {
+                Ok(v) if v <= i128::MAX as u128 => v as i128,
+                _ => return Some(i128::MAX),
+            };
+            return Some(if negative { -v } else { v });
+        }
+    }
+    // Underscores between decimal digits (PostgreSQL 16+) are dropped first.
+    let owned;
+    let t = if t.contains('_') {
+        if t.contains("__") || t.starts_with('_') || t.ends_with('_') {
+            return None;
+        }
+        owned = t.replace('_', "");
+        owned.as_str()
+    } else {
+        t
+    };
     let (negative, t) = match t.strip_prefix('-') {
         Some(rest) => (true, rest),
         None => (false, t.strip_prefix('+').unwrap_or(t)),

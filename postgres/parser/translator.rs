@@ -3783,6 +3783,14 @@ impl PostgreSQLTranslator {
                 }
             }
             Some(pg_query::protobuf::node::Node::AConst(a_const)) => self.translate_const(a_const),
+            // A negated constant cast the caller read as an integer column's assignment reads it
+            // (- 2.5::numeric is -3): its value ([`PostgreSQLTranslator::with_integer_literals`]).
+            Some(pg_query::protobuf::node::Node::AExpr(a_expr))
+                if a_expr.lexpr.is_none() && a_expr.location >= 0 && self.integer_literals.as_ref().is_some_and(|m| m.contains_key(&a_expr.location)) =>
+            {
+                let v = self.integer_literals.as_ref().and_then(|m| m.get(&a_expr.location)).copied().unwrap_or(0);
+                Ok(ast::Expr::Literal(ast::Literal::Numeric(v.to_string())))
+            }
             Some(pg_query::protobuf::node::Node::AExpr(a_expr)) => self.translate_a_expr(a_expr),
             Some(pg_query::protobuf::node::Node::BoolExpr(bool_expr)) => {
                 // AND and OR are simplified as PostgreSQL's simplify_and_arguments (and _or_)
