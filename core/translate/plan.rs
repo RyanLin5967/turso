@@ -2,7 +2,8 @@ use crate::{
     alloc::{self, TursoIteratorExt, TursoVecExt},
     function::{AccumulatorFunc, AggFunc},
     schema::{
-        BTreeTable, ColDef, Column, FromClauseSubquery, Index, PseudoCursorType, RecursiveCteInput,
+        BTreeTable, ColDef, Column, FromClauseSubquery, Index, IndexColumn, PseudoCursorType,
+        RecursiveCteInput,
         Schema, Table, ROWID_SENTINEL,
     },
     translate::{
@@ -18,7 +19,7 @@ use crate::{
     vdbe::{
         affinity::{self, Affinity},
         builder::{CursorKey, CursorType, ProgramBuilder},
-        insn::{HashDistinctData, Insn},
+        insn::{to_u32, HashDistinctData, IdxInsertFlags, Insn},
         BranchOffset, CursorID,
     },
     Result, VirtualTable, MAIN_DB_ID,
@@ -699,18 +700,70 @@ pub struct DistinctCtx {
     pub hash_table_id: usize,
     /// Collations for each distinct key column.
     pub collations: Vec<CollationSeq>,
+    /// The ephemeral index that holds the keys past the hash table's budget, opened when the
+    /// table fills (see `HashTable::insert_distinct`).
+    pub cursor_id: CursorID,
     /// The label for the on conflict branch.
     /// When a duplicate is found, the program will jump to the offset this label points to.
     pub label_on_conflict: BranchOffset,
 }
 
 impl DistinctCtx {
+    /// A context deduplicating keys of `collations.len()` columns, each compared under its
+    /// collation, by the hash table and, past its budget, by the ephemeral index.
+    pub fn new(program: &mut ProgramBuilder, collations: Vec<CollationSeq>) -> Result<Self> {
+        let columns = collations
+            .iter()
+            .enumerate()
+            .map(|(i, collation)| {
+                let mut column = IndexColumn::new(format!("distinct_{i}"), i);
+                column.collation = Some(*collation);
+                column
+            })
+            .collect();
+        let index = Arc::new(Index {
+            name: "distinct_overflow".to_string(),
+            table_name: String::new(),
+            root_page: 0,
+            columns,
+            unique: false,
+            ephemeral: true,
+            has_rowid: false,
+            where_clause: None,
+            index_method: None,
+            on_conflict: None,
+        });
+        Ok(Self {
+            hash_table_id: program.alloc_hash_table_id(),
+            collations,
+            cursor_id: program.alloc_cursor_id(CursorType::BTreeIndex(index)),
+            label_on_conflict: program.allocate_label(),
+        })
+    }
+
+    /// Jump to `label_on_conflict` when the `num_regs` keys at `start_reg` were seen before;
+    /// otherwise record them and fall through. The hash table answers while it is within its
+    /// budget; past it, a key the table does not hold is looked up and recorded in the ephemeral
+    /// index, opened by the key that filled the table:
+    ///
+    /// ```text
+    ///       HashDistinct  keys  dup=L_dup open=L_open tree=L_tree
+    ///       Goto          L_new
+    /// L_open: OpenEphemeral c
+    /// L_tree: Found       c keys -> L_dup
+    ///       MakeRecord    keys -> r
+    ///       IdxInsert     c r
+    /// L_new:
+    /// ```
     pub fn emit_deduplication_insns(
         &self,
         program: &mut ProgramBuilder,
         num_regs: usize,
         start_reg: usize,
     ) {
+        let label_open = program.allocate_label();
+        let label_tree = program.allocate_label();
+        let label_new = program.allocate_label();
         program.emit_insn(Insn::HashDistinct {
             data: Box::new(HashDistinctData {
                 hash_table_id: self.hash_table_id,
@@ -718,8 +771,41 @@ impl DistinctCtx {
                 num_keys: num_regs,
                 collations: self.collations.clone(),
                 target_pc: self.label_on_conflict,
+                open_pc: label_open,
+                tree_pc: label_tree,
             }),
         });
+        program.emit_insn(Insn::Goto {
+            target_pc: label_new,
+        });
+        program.preassign_label_to_next_insn(label_open);
+        program.emit_insn(Insn::OpenEphemeral {
+            cursor_id: self.cursor_id,
+            is_table: false,
+        });
+        program.preassign_label_to_next_insn(label_tree);
+        program.emit_insn(Insn::Found {
+            cursor_id: self.cursor_id,
+            target_pc: self.label_on_conflict,
+            record_reg: start_reg,
+            num_regs,
+        });
+        let record_reg = program.alloc_register();
+        program.emit_insn(Insn::MakeRecord {
+            start_reg: to_u32(start_reg),
+            count: to_u32(num_regs),
+            dest_reg: to_u32(record_reg),
+            index_name: Some("distinct_overflow".to_string()),
+            affinity_str: None,
+        });
+        program.emit_insn(Insn::IdxInsert {
+            cursor_id: self.cursor_id,
+            record_reg,
+            unpacked_start: None,
+            unpacked_count: None,
+            flags: IdxInsertFlags::new(),
+        });
+        program.preassign_label_to_next_insn(label_new);
     }
 }
 

@@ -1821,7 +1821,11 @@ impl ProgramBuilder {
                 Insn::Filter { target_pc, .. } => resolve(target_pc, "Filter")?,
                 Insn::HashProbe { target_pc, .. } => resolve(target_pc, "HashProbe")?,
                 Insn::HashNext { target_pc, .. } => resolve(target_pc, "HashNext")?,
-                Insn::HashDistinct { data } => resolve(&mut data.target_pc, "HashDistinct")?,
+                Insn::HashDistinct { data } => {
+                    resolve(&mut data.target_pc, "HashDistinct")?;
+                    resolve(&mut data.open_pc, "HashDistinct")?;
+                    resolve(&mut data.tree_pc, "HashDistinct")?;
+                }
                 Insn::HashScanUnmatched { target_pc, .. } => {
                     resolve(target_pc, "HashScanUnmatched")?
                 }

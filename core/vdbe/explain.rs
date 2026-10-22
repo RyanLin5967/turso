@@ -2620,7 +2620,12 @@ pub fn insn_to_row(
             data.hash_table_id as i64,
             data.key_start_reg as i64,
             data.num_keys as i64,
-            Value::build_text(format!("jmp={}", data.target_pc.as_debug_int())),
+            Value::build_text(format!(
+                "jmp={} open={} tree={}",
+                data.target_pc.as_debug_int(),
+                data.open_pc.as_debug_int(),
+                data.tree_pc.as_debug_int()
+            )),
             0,
             String::new(),
         ),
