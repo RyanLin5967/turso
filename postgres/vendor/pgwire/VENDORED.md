@@ -97,3 +97,9 @@ Every change from the crate is listed here, newest last; `diff -r` against the c
     size (`type_size`, pg_type.typlen for the fixed-size types, -1 otherwise) and the field's type
     modifier, a new `FieldInfo` field (`type_modifier`, -1 unless `with_type_modifier` sets it), in
     place of 0 and 0 (the crate's TODO); `From<FieldDescription> for FieldInfo` keeps the modifier.
+13. `types/format/float_digits.rs` (numfuzz seeds 343, 1144; the lead's ruling 82dcec6b66 item 5): at
+    extra_float_digits >= 1 a float4 and a float8 are written in the shortest digits strictly inside
+    their rounding interval (`strictly_shortest_f32`, `strictly_shortest_f64` with the exact
+    `on_f64_edge`), as PostgreSQL's f2s.c and d2s.c built without STRICTLY_SHORTEST write them; Rust's
+    `{:e}` may give the interval's edge (-3.37198e+08 for PG's -3.3719802e+08). Recorded:
+    rec30-float4-ties, rec36-float8-ties. The crate's own tests do not build here (see item 5).
