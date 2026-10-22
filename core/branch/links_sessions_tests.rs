@@ -1575,6 +1575,7 @@ fn ls_fill_live_child() {
     older_store(&path, n);
     super::journal::set_compact_threshold(4 << 10);
     let (e0, b0) = (super::store::LINKS_FILL_EMPTY_SPAWNS.load(Ordering::Acquire), super::store::LINKS_FILL_HELD_BATCHES.load(Ordering::Acquire));
+    let fc0 = super::store::FLIGHT_CREATES.load(Ordering::Acquire);
     let db = open(&path);
     db.branch_wait_name_filter();
     let trunk = db.connect().unwrap();
@@ -1597,6 +1598,12 @@ fn ls_fill_live_child() {
     let empty = super::store::LINKS_FILL_EMPTY_SPAWNS.load(Ordering::Acquire) - e0;
     let batches = super::store::LINKS_FILL_HELD_BATCHES.load(Ordering::Acquire) - b0;
     let per_create = grown / grown_creates.max(1);
+    // Observing (the cycle-excess diagnostic): creates logged while a cut's flight was in flight, and the log
+    // bytes grown over the whole run (the per-cycle terms: grown / cuts against 2 x threshold).
+    println!(
+        "LS-LIVE-CYCLE flight_creates={} grown={grown} grown_creates={grown_creates} cuts={cuts} creates={creates}",
+        super::store::FLIGHT_CREATES.load(Ordering::Acquire) - fc0
+    );
     // Completed, the flip and the links: the flip's checkpoint, then the independent oracle (FLAGGED stricter: a
     // fill that completes early must still leave every row's links right).
     db.branch_compact_now().unwrap();
@@ -1627,6 +1634,9 @@ fn under_sustained_creates_the_fill_completes() {
         let r = readings(&text, "LS-LIVE ");
         assert_eq!(r.len(), 1, "premise: the child reported:\n{text}");
         let (creates, cuts, starts, empty, batches, prefilled, per_create) = (r[0][0], r[0][1], r[0][2], r[0][3], r[0][4], r[0][5], r[0][6]);
+        for l in text.lines().filter(|l| l.contains("LS-LIVE-CYCLE ")) {
+            println!("{l}");
+        }
         let k = (2 * (4u64 << 10)) / per_create.max(1);
         println!("LS live: {rows} rows: creates {creates} cuts {cuts} starts {starts} empty spawns {empty} batches {batches} prefilled {prefilled}; {per_create} B per create, K = {k}");
         assert!(cuts >= 1, "{rows} rows: premise: the log was never cut under {creates} creates");

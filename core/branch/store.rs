@@ -4140,6 +4140,9 @@ pub(crate) static LINKS_FILL_PAUSE_MS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static LINKS_FILL_COLUMN_TXNS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 #[cfg(test)]
 pub(crate) static LINKS_FILL_COLUMN_ERROR: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+/// Test builds (the cycle-excess diagnostic, observing): creates logged while a fuzzy checkpoint was in flight.
+#[cfg(test)]
+pub(crate) static FLIGHT_CREATES: AtomicU64 = AtomicU64::new(0);
 /// Test builds (the lead's fill-LIVENESS ruling): fill spawns that ended stopped or superseded having committed
 /// no batch.
 #[cfg(test)]
@@ -7095,6 +7098,11 @@ impl BranchStore {
         }
         let id = BranchId(inner.next_id);
         let (records, lease) = inner.fork_records(id, BranchId::TRUNK, now, name);
+        // Test builds (the cycle-excess diagnostic, observing): creates logged while a fuzzy checkpoint is in flight.
+        #[cfg(test)]
+        if inner.cat.as_ref().is_some_and(|c| c.flight) {
+            FLIGHT_CREATES.fetch_add(1, Ordering::AcqRel);
+        }
         if let Some((_, stamped)) = lease {
             inner.lease.queued(stamped);
         }
@@ -7184,6 +7192,11 @@ impl BranchStore {
         }
         let id = BranchId(inner.next_id);
         let (records, lease) = inner.fork_records(id, parent, now, name);
+        // Test builds (the cycle-excess diagnostic, observing): creates logged while a fuzzy checkpoint is in flight.
+        #[cfg(test)]
+        if inner.cat.as_ref().is_some_and(|c| c.flight) {
+            FLIGHT_CREATES.fetch_add(1, Ordering::AcqRel);
+        }
         if let Some((_, stamped)) = lease {
             inner.lease.queued(stamped);
         }
