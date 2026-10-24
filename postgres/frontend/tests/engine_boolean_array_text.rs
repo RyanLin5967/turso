@@ -1,5 +1,5 @@
 //! fastest-engine red (lead HIGH 2026-10-22T10:31Z, from fastest-wire; SILENT; raws artie
-//! 91d4d2d984, 0a3de27db0). UNRUN when committed: the UW was unavailable.
+//! 91d4d2d984, 0a3de27db0). UNRUN when committed: UW was unavailable.
 //!
 //! A boolean[] reads back as PostgreSQL 18.6 writes it: '{yes,off,NULL}' is '{t,f,NULL}'
 //! (recorded: fastest-wire raw rec46-array-assign, pg18-wirefuzz-an_array_of_non_integer_elements
