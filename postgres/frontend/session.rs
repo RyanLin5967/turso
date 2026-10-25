@@ -4244,11 +4244,18 @@ fn constant_numeric_casts(sql: &str, parse: &turso_pg_parser::pg_query::ParseRes
 /// A translation's refusal as the engine error it is reported with: PostgreSQL's own message, with
 /// no "Parse error: " prefix, for the conditions whose text this frontend writes as PostgreSQL's
 /// (42704 'access method "x" does not exist', 42P16 'column "a" has pseudo-type x'; wire-rev-uw2
-/// LOW), and a parse error as before for every other.
+/// LOW; 42P10 'table "t" has 1 columns available but 2 columns specified', an alias column list
+/// longer than its relation, recorded rec63 and pg18-join1b.out #2), and a parse error as before
+/// for every other.
 fn translation_error(e: turso_pg_parser::ParseError) -> LimboError {
     let message: SqlErrorMessage = e.into();
     match message.kind() {
-        Some(SqlErrorKind::UndefinedObject | SqlErrorKind::InvalidTableDefinition | SqlErrorKind::NumericValueOutOfRange) => {
+        Some(
+            SqlErrorKind::UndefinedObject
+            | SqlErrorKind::InvalidTableDefinition
+            | SqlErrorKind::NumericValueOutOfRange
+            | SqlErrorKind::InvalidColumnReference,
+        ) => {
             LimboError::InvalidArgument(message)
         }
         _ => LimboError::ParseError(message),
