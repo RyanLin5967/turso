@@ -6824,14 +6824,28 @@ fn immutable_constant(node: &turso_pg_parser::pg_query::protobuf::Node) -> bool 
 /// or a SELECT's targets) or UPDATE assigns to a numeric(p, s) column, as
 /// pg_assign_numeric_value(value, p, s), in one SELECT; None when there is none. A bare constant
 /// is judged at prepare (literal_assignments) and left out. Built from a parsed template, never
-/// from nodes made from defaults, whose enum fields libpg_query's deparser asserts on.
+/// from nodes made from defaults, whose enum fields libpg_query's deparser asserts on. Every
+/// INSERT and UPDATE passes here, so the table's lookup, the names and the template's parse wait
+/// until some assigned value is an immutable constant that is not bare (L5's write budget: they
+/// cost `UPDATE t SET v = v + 1 WHERE id = 1` 30 allocations beyond the engine's, the empty
+/// query's being 1, in server_lib's a_write_allocates_no_more_than_an_empty_query_beyond_the_engine
+/// at 483685bec; LEAD-RULINGS 2026-10-25T02:16:40Z (a)).
 fn assignment_probe(pg_conn: &PgConnectionInner, parse: &turso_pg_parser::pg_query::ParseResult) -> Option<String> {
     use turso_pg_parser::pg_query::protobuf::{a_const::Val, node::Node, Node as PgNode};
     let [raw] = parse.protobuf.stmts.as_slice() else { return None };
     let stmt = raw.stmt.as_ref()?.node.as_ref()?;
+    let probed = |v: &PgNode| !matches!(v.node.as_ref(), Some(Node::AConst(_))) && immutable_constant(v);
+    let assigns = |t: &PgNode| matches!(t.node.as_ref(), Some(Node::ResTarget(r)) if r.val.as_deref().is_some_and(probed));
     let relation = match stmt {
-        Node::UpdateStmt(u) => u.relation.as_ref()?,
-        Node::InsertStmt(i) => i.relation.as_ref()?,
+        Node::UpdateStmt(u) if u.target_list.iter().any(assigns) => u.relation.as_ref()?,
+        Node::InsertStmt(i) => {
+            let Some(Node::SelectStmt(select)) = i.select_stmt.as_deref().and_then(|s| s.node.as_ref()) else { return None };
+            let rows = select.values_lists.iter().any(|row| matches!(row.node.as_ref(), Some(Node::List(l)) if l.items.iter().any(probed)));
+            if !rows && !select.target_list.iter().any(assigns) {
+                return None;
+            }
+            i.relation.as_ref()?
+        }
         _ => return None,
     };
     let table = assignment_table(pg_conn, relation)?;
