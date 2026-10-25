@@ -1159,6 +1159,69 @@ fn a_failed_fill_backs_off_as_a_failed_checkpoint_does() {
     assert!(starts <= bound, "a failed fill restarted {starts} times over {grown} B of log; a failed checkpoint would retry at most {bound}");
 }
 
+// ---- review h1-alone LOW 11: a fill that starts on an empty catalog ----
+
+#[test]
+fn ls_empty_fill_child() {
+    if !in_child() {
+        return;
+    }
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("e.db");
+    older_store(&path, 0);
+    super::journal::set_compact_threshold(4 << 10);
+    // The first fill held before its first batch (its horizon already read, on an empty catalog).
+    let h0 = super::store::LINKS_FILL_BEFORE_BATCH_HELD.load(Ordering::Acquire);
+    super::store::LINKS_FILL_HOLD_BEFORE_BATCH.store(true, Ordering::Release);
+    let db = open(&path);
+    db.branch_wait_name_filter();
+    let trunk = db.connect().unwrap();
+    let mut k = 0;
+    while super::store::LINKS_FILL_BEFORE_BATCH_HELD.load(Ordering::Acquire) == h0 && k < 20_000 {
+        let _ = trunk.fork_branch().unwrap().into_id();
+        k += 1;
+    }
+    let held = super::store::LINKS_FILL_BEFORE_BATCH_HELD.load(Ordering::Acquire) - h0;
+    // Past the hard limit, cut (the cut commits the rows made so far); then the hold let go, and sustained creates
+    // until the fill completes or 60,000 creates.
+    let (past, peak) = fork_past_hard_and_cut(&db, &trunk, &path);
+    let cut = log_present(&path) < peak;
+    super::store::LINKS_FILL_HOLD_BEFORE_BATCH.store(false, Ordering::Release);
+    let mut creates = 0u64;
+    while creates < 60_000 && !db.branches.links_fill_state_for_test().1 {
+        let _ = trunk.fork_branch().unwrap().into_id();
+        creates += 1;
+    }
+    let prefilled = db.branches.links_fill_state_for_test().1;
+    db.branch_compact_now().unwrap();
+    db.branch_checkpoint_wait();
+    drop(trunk);
+    drop(db);
+    let (rows, wrong) = ls_wrong_links(&path).unwrap_or((0, 9999));
+    println!("LS-EMPTY held={held} past={} cut={} creates={creates} prefilled={} meta={} rows={rows} wrong={wrong}", u64::from(past), u64::from(cut), u64::from(prefilled), meta_version(&path));
+}
+
+/// Review h1-alone (wf_6f7b5632-a49) LOW 11: a fill that began on an EMPTY 19 catalog completes under sustained
+/// creates (within 60,000) and the store flips with every row's links right. At f1e02c4ca an empty catalog's horizon
+/// read as "no horizon", cached for the process, so every fill after the first cut chased the growing catalog.
+/// Premises: the first fill was held before its first batch, the store passed the hard limit and cut its log.
+#[test]
+fn a_fill_begun_on_an_empty_catalog_completes_under_sustained_creates() {
+    if in_child() {
+        return;
+    }
+    let text = child("ls_empty_fill_child", &[]);
+    let r = readings(&text, "LS-EMPTY ");
+    assert_eq!(r.len(), 1, "premise: the child reported:\n{text}");
+    let (held, past, cut, creates, prefilled, meta, rows, wrong) = (r[0][0], r[0][1], r[0][2], r[0][3], r[0][4], r[0][5], r[0][6], r[0][7]);
+    println!("LS empty catalog: held {held} past {past} cut {cut}; creates {creates} prefilled {prefilled}; meta {meta} rows {rows} wrong {wrong}");
+    assert!(held >= 1, "premise: the first fill was not held before its first batch");
+    assert_eq!((past, cut), (1, 1), "premise: the store did not pass the hard limit and cut its log (past {past}, cut {cut})");
+    assert_eq!(prefilled, 1, "a fill begun on an empty catalog never completed under {creates} sustained creates");
+    assert_eq!(meta, 21, "the store did not upgrade");
+    assert_eq!(wrong, 0, "{wrong} of {rows} rows have wrong links");
+}
+
 // ---- review h1-alone HIGH 1, its fix's versioned cursor ----
 
 /// Review h1-alone (wf_6f7b5632-a49) HIGH 1, its fix's versioned cursor: a fill in rowid order never resumes a
