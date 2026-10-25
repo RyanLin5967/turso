@@ -3397,6 +3397,10 @@ fn checkpoint_write(catalog: &mut Catalog, cap: &Captured, hold: Option<&AtomicU
     }
     // And the commit as durable as any record it replaces (review B-F3).
     catalog.set_commit_sync(cap.arena_sync)?;
+    // Test builds (review h1-alone MED 6): the rows this write's fill batches fill, whatever path wrote it (sharp
+    // or fuzzy), counted in `CKPT_ROWS_FILLED`.
+    #[cfg(test)]
+    let filled0 = catalog.counters.rows_filled;
     catalog.begin()?;
     let written = (|| -> Result<CkptFacts> {
         for (b, what) in &cap.rows {
@@ -3574,6 +3578,8 @@ fn checkpoint_write(catalog: &mut Catalog, cap: &Captured, hold: Option<&AtomicU
         catalog.commit().inspect_err(|_| cap.fail_stop.store(true, Ordering::Release))?;
         Ok(facts)
     });
+    #[cfg(test)]
+    CKPT_ROWS_FILLED.fetch_add(catalog.counters.rows_filled - filled0, Ordering::AcqRel);
     if let Err(e) = written {
         catalog.rollback();
         // An upgrade rolled back takes its columns with it: this handle reads the table again.
@@ -4210,6 +4216,10 @@ pub(crate) static LINKS_FILL_ENTRY_HELD: AtomicU64 = AtomicU64::new(0);
 /// Test builds (h1gap-rev-c HIGH-3): rows (and parents) checkpoints relinked around their own changes.
 #[cfg(test)]
 pub(crate) static CKPT_RELINKED: AtomicU64 = AtomicU64::new(0);
+/// Test builds (review h1-alone MED 6): rows checkpoint writes filled (`Catalog::upgrade_links_batch` inside
+/// `checkpoint_write`, sharp or fuzzy): the fill's work observed in the checkpoint, not the predicate that picks it.
+#[cfg(test)]
+pub(crate) static CKPT_ROWS_FILLED: AtomicU64 = AtomicU64::new(0);
 /// Test builds (h1gap-rev-c MED-1): while set, a fill thread panics at its start.
 #[cfg(test)]
 pub(crate) static LINKS_FILL_PANICS: AtomicBool = AtomicBool::new(false);

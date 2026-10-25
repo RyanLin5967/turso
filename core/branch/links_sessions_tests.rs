@@ -444,6 +444,14 @@ fn ls_hard_whole_child() {
     super::journal::set_compact_threshold(4 << 10);
     // A slow fill (1 s after each batch): the hard limit is passed long before it ends.
     super::store::LINKS_FILL_PAUSE_MS.store(1_000, Ordering::Release);
+    // FE_LS_FORCE_PAST (review h1-alone MED 6): the fill held before its column-only transaction until the log is
+    // past the hard limit, so the gate holds every checkpoint until then (in the sharp mode a cut otherwise runs
+    // inline at the operation that passes the limit once the columns exist: the premise raced the column DDL).
+    let force_past = std::env::var_os("FE_LS_FORCE_PAST").is_some();
+    if force_past {
+        super::store::LINKS_FILL_HOLD_BEFORE_COLUMNS.store(true, Ordering::Release);
+    }
+    let filled0 = super::store::CKPT_ROWS_FILLED.load(Ordering::Acquire);
     let db = open(&path);
     db.branch_wait_name_filter();
     let trunk = db.connect().unwrap();
@@ -455,6 +463,9 @@ fn ls_hard_whole_child() {
         k += 1;
     }
     let past = db.branches.past_hard_limit_for_test();
+    if force_past {
+        super::store::LINKS_FILL_HOLD_BEFORE_COLUMNS.store(false, Ordering::Release);
+    }
     // Operations past the hard limit (each a create; the waits on an install they made, this thread's
     // back-pressure waits), then the checkpoints they started are waited for.
     let (waits0, fill_waits0) = (super::store::thread_waits(), super::store::thread_fill_waits());
@@ -496,7 +507,15 @@ fn ls_hard_whole_child() {
     let starts = db.branches.links_fill_state_for_test().2;
     let superseded = super::store::LINKS_FILL_SUPERSEDED_BATCHES.load(Ordering::Acquire) - sup0;
     super::store::LINKS_FILL_PAUSE_MS.store(0, Ordering::Release);
-    println!("LS-WHOLE rows={n} past={} creates={k} whole_batches={whole} waits={waits} meta={meta} peak={peak} log={log} fill_waits={fill_waits} starts={starts} superseded={superseded}", u64::from(past));
+    // Review h1-alone MED 6 (the last fields, after the ones the earlier parents read): rows checkpoint writes filled
+    // over the run, and the checkpoint mode the store resolved.
+    let filled = super::store::CKPT_ROWS_FILLED.load(Ordering::Acquire) - filled0;
+    let sharp = db.branch_checkpoint_mode() == BranchCheckpoint::Sharp;
+    println!(
+        "LS-WHOLE rows={n} past={} creates={k} whole_batches={whole} waits={waits} meta={meta} peak={peak} log={log} fill_waits={fill_waits} starts={starts} superseded={superseded} filled_in_ckpt={filled} sharp={}",
+        u64::from(past),
+        u64::from(sharp)
+    );
 }
 
 /// h1-rev-72bfb0127 LOW-1: the whole-catalog red in the SHARP checkpoint mode (the capture and the writer are
@@ -516,6 +535,41 @@ fn past_the_hard_log_limit_no_sharp_checkpoint_links_the_whole_catalog() {
     assert_eq!(whole, 0, "sharp: past the hard limit a checkpoint linked the whole catalog ({whole} batches)");
     assert_eq!(meta, 19, "sharp: the store flipped before its fill was complete (meta {meta})");
     assert!(log < peak, "sharp: the log was not cut past the hard limit ({log} B at the end, {peak} B at the limit)");
+}
+
+/// Review h1-alone (wf_6f7b5632-a49) MED 6, in ruling 62c11ec63d (1)'s own words (rows filled while the store mutex
+/// is held): past the hard log limit, with a slow fill, no checkpoint's WRITE fills a row, in the SHARP mode (each
+/// checkpoint written under the store mutex, inside the operation that starts it: an O(N) stall of every create)
+/// and in the fuzzy one. Counted structurally, `CKPT_ROWS_FILLED`: the rows any `checkpoint_write` filled, whatever
+/// path called it (the sharp red above reads only `WHOLE_UPGRADE_BATCHES`, which moves only inside `upgrade_links`,
+/// so mutant `l4_nonflip_fill_untagged`, a non-flip write running the whole fill by direct batches, passed it). The
+/// premise is forced (FE_LS_FORCE_PAST: the fill held before its column-only transaction until the log is past the
+/// hard limit); the child reports the mode it ran in. Mutant `l4_nonflip_fill_untagged` must fail it in both modes.
+/// Mutant `l4_upgrade_unbatched` dies on the sharp arm's premise (it starts no fill to hold, and a sharp store then
+/// upgrades whole at its first threshold and never passes the hard limit): a premise death, not a kill (the fuzzy
+/// whole-catalog red above kills it).
+#[test]
+fn past_the_hard_log_limit_no_checkpoint_write_fills_a_row() {
+    if in_child() {
+        return;
+    }
+    for sharp in [true, false] {
+        let mode = if sharp { "sharp" } else { "fuzzy" };
+        let mut env = vec![("FE_LS_ROWS", "1000"), ("FE_LS_FORCE_PAST", "1")];
+        if sharp {
+            env.push(("FE_LS_SHARP", "1"));
+        }
+        let text = child("ls_hard_whole_child", &env);
+        let r = readings(&text, "LS-WHOLE ");
+        assert_eq!(r.len(), 1, "{mode}: premise: the child reported:\n{text}");
+        let (past, meta, peak, log, filled, ran_sharp) = (r[0][1], r[0][5], r[0][6], r[0][7], r[0][11], r[0][12]);
+        println!("LS checkpoint writes, {mode}: past {past} meta {meta} peak {peak} log {log}, rows filled in checkpoint writes {filled}");
+        assert_eq!(ran_sharp, u64::from(sharp), "{mode}: premise: the store ran in the other checkpoint mode");
+        assert_eq!(past, 1, "{mode}: premise: the log never passed the hard limit");
+        assert_eq!(filled, 0, "{mode}: checkpoint writes filled {filled} rows past the hard limit (in the sharp mode, under the store mutex inside a create)");
+        assert_eq!(meta, 19, "{mode}: the store flipped before its fill was complete (meta {meta})");
+        assert!(log < peak, "{mode}: the log was not cut past the hard limit ({log} B at the end, {peak} B at the limit)");
+    }
 }
 
 /// The LOW-3 schedule, forced: a fill's first committed batch is held before it is recorded
