@@ -1105,6 +1105,85 @@ fn a_failed_fill_backs_off_as_a_failed_checkpoint_does() {
     assert!(starts <= bound, "a failed fill restarted {starts} times over {grown} B of log; a failed checkpoint would retry at most {bound}");
 }
 
+// ---- review h1-alone MED 8: rows a checkpoint wrote before the link columns existed ----
+
+#[test]
+fn ls_columns_failed_child() {
+    if !in_child() {
+        return;
+    }
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("n.db");
+    older_store(&path, 300);
+    super::journal::set_compact_threshold(4 << 10);
+    // No column-only transaction (the columns only in a batch), and every batch fails: no fill makes the columns.
+    super::store::LINKS_FILL_COLUMNS_IN_BATCH.store(true, Ordering::Release);
+    super::store::LINKS_FILL_FAILS.store(true, Ordering::Release);
+    let db = open(&path);
+    db.branch_wait_name_filter();
+    let trunk = db.connect().unwrap();
+    // Until the first fill has started and stopped.
+    let mut k = 0;
+    while !(db.branches.links_fill_state_for_test().2 >= 1 && !db.branches.links_fill_state_for_test().0) && k < 20_000 {
+        let _ = trunk.fork_branch().unwrap().into_id();
+        k += 1;
+    }
+    let (filling, _, first) = db.branches.links_fill_state_for_test();
+    // 50 more trunk forks, then an explicit checkpoint: its fill fails too, and it writes the rows with no columns.
+    for _ in 0..50 {
+        let _ = trunk.fork_branch().unwrap().into_id();
+    }
+    let compacted = db.branch_compact_now().is_ok();
+    let columns = db.branches.catalog_links_for_test();
+    // Both knobs cleared: a later fill makes the columns and completes; then the flip.
+    super::store::LINKS_FILL_FAILS.store(false, Ordering::Release);
+    super::store::LINKS_FILL_COLUMNS_IN_BATCH.store(false, Ordering::Release);
+    let mut k = 0;
+    while !db.branches.links_fill_state_for_test().1 && k < 20_000 {
+        let _ = trunk.fork_branch().unwrap().into_id();
+        k += 1;
+    }
+    let prefilled = db.branches.links_fill_state_for_test().1;
+    db.branch_compact_now().unwrap();
+    db.branch_checkpoint_wait();
+    drop(trunk);
+    drop(db);
+    let (rows, wrong) = ls_wrong_links(&path).unwrap_or((0, 9999));
+    println!(
+        "LS-COLFAIL first={first} stopped={} compacted={} columns={} prefilled={} meta={} rows={rows} wrong={wrong}",
+        u64::from(!filling),
+        u64::from(compacted),
+        u64::from(columns),
+        u64::from(prefilled),
+        meta_version(&path)
+    );
+}
+
+/// Review h1-alone (wf_6f7b5632-a49) MED 8: rows a checkpoint wrote while the catalog had no link columns (the fill's
+/// column step and its batches failed) are linked by the later fill that makes the columns: the flip leaves every
+/// row's links right at 21. At f1e02c4ca the first fill cached its horizon though its columns did not exist, the
+/// explicit checkpoint then committed rows past that horizon with no columns (and so no relink), and the later fill
+/// stopped at the cached horizon: those rows were published at 21 with NULL links. Premises: the first fill started
+/// and stopped; the explicit checkpoint succeeded and left the catalog without columns; a later fill completed; the
+/// rows are there.
+#[test]
+fn rows_written_before_the_link_columns_exist_are_linked_by_the_fill() {
+    if in_child() {
+        return;
+    }
+    let text = child("ls_columns_failed_child", &[]);
+    let r = readings(&text, "LS-COLFAIL ");
+    assert_eq!(r.len(), 1, "premise: the child reported:\n{text}");
+    let (first, stopped, compacted, columns, prefilled, meta, rows, wrong) = (r[0][0], r[0][1], r[0][2], r[0][3], r[0][4], r[0][5], r[0][6], r[0][7]);
+    println!("LS columns failed: first {first} stopped {stopped} compacted {compacted} columns {columns} prefilled {prefilled}; meta {meta} rows {rows} wrong {wrong}");
+    assert!(first >= 1 && stopped == 1, "premise: the first fill did not start and stop (starts {first}, stopped {stopped})");
+    assert_eq!((compacted, columns), (1, 0), "premise: the explicit checkpoint did not write rows with no link columns (ok {compacted}, columns {columns})");
+    assert_eq!(prefilled, 1, "premise: no later fill completed");
+    assert!(rows > 300, "premise: the rows are there ({rows})");
+    assert_eq!(meta, 21, "the store did not upgrade");
+    assert_eq!(wrong, 0, "{wrong} of {rows} rows have wrong links: rows written before the link columns existed were published at 21 unlinked");
+}
+
 // ---- L3: a busy truncation is counted ----
 
 /// L3: when a reader keeps the catalog's WAL from being truncated, the truncation's busy result is
