@@ -13391,9 +13391,7 @@ replays_postgresql!(
 replays_postgresql!(
     pg18_join1b_replays_as_postgresql_answered,
     "pg18-join1b.out",
-    [
-        (2, "PGDIV-PARSE-PREFIX error-text [wire]: 42P10 both; ours prefixes 'Parse error: '"),
-    ]
+    []
 );
 replays_postgresql!(
     pg18_join2_replays_as_postgresql_answered,
