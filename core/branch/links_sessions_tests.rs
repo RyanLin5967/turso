@@ -1159,6 +1159,45 @@ fn a_failed_fill_backs_off_as_a_failed_checkpoint_does() {
     assert!(starts <= bound, "a failed fill restarted {starts} times over {grown} B of log; a failed checkpoint would retry at most {bound}");
 }
 
+// ---- review h1-alone HIGH 1, its fix's versioned cursor ----
+
+/// Review h1-alone (wf_6f7b5632-a49) HIGH 1, its fix's versioned cursor: a fill in rowid order never resumes a
+/// KEY-ORDER cursor (row k = 0 of `link_fill`, as builds up to f1e02c4ca committed it) as its own. A 19 store whose
+/// catalog has the link columns and such a cursor, done at the catalog's generation, is still filled, and flips with
+/// every row's links right. At f1e02c4ca, whose cursor that row is, it is resumed as done and the store flips with its
+/// rows unlinked: the planted row stands for a cursor this build must not read in its own terms. Premise: the planted
+/// cursor reads back done at the catalog's generation. Mutant `l4_fill_cursor_unversioned` (the key-order row read
+/// as the rowid cursor) must fail it.
+#[test]
+fn a_key_order_fill_cursor_is_never_resumed_by_the_rowid_fill() {
+    if in_child() {
+        return;
+    }
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("v.db");
+    older_store(&path, 300);
+    let (generation, planted) = {
+        let mut cat = ls_cat(&path);
+        cat.add_link_columns_for_test().unwrap();
+        let generation = cat.meta().unwrap().unwrap().generation;
+        cat.ints("CREATE TABLE IF NOT EXISTS link_fill(k INTEGER PRIMARY KEY, generation INTEGER NOT NULL, parent INTEGER, fork_epoch INTEGER, done INTEGER NOT NULL)").unwrap();
+        cat.ints(&format!("INSERT INTO link_fill VALUES (0, {generation}, 0, 299, 1)")).unwrap();
+        (generation, (ls_first(&cat, "SELECT generation FROM link_fill WHERE k = 0"), ls_first(&cat, "SELECT done FROM link_fill WHERE k = 0")))
+    };
+    assert_eq!(planted, (generation, 1), "premise: the planted key-order cursor is not done at the catalog's generation {generation}");
+    {
+        let db = open(&path);
+        db.branch_wait_name_filter();
+        db.branch_compact_now().unwrap();
+        db.branch_checkpoint_wait();
+    }
+    let (rows, wrong) = ls_wrong_links(&path).unwrap_or((0, 9999));
+    println!("LS key-order cursor: meta={} rows={rows} wrong={wrong}", meta_version(&path));
+    assert!(rows >= 300, "premise: the rows are there ({rows})");
+    assert_eq!(meta_version(&path), 21, "the store did not upgrade");
+    assert_eq!(wrong, 0, "{wrong} of {rows} rows have wrong links: a key-order fill cursor was resumed as the rowid fill's");
+}
+
 // ---- review h1-alone MED 8: rows a checkpoint wrote before the link columns existed ----
 
 #[test]
