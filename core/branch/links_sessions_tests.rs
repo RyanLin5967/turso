@@ -1829,6 +1829,9 @@ fn ls_fill_live_child() {
     let empty = super::store::LINKS_FILL_EMPTY_SPAWNS.load(Ordering::Acquire) - e0;
     let batches = super::store::LINKS_FILL_HELD_BATCHES.load(Ordering::Acquire) - b0;
     let per_create = grown / grown_creates.max(1);
+    // Review h1-alone MED 5 (observing here; asserted by its own test): the fill thread handles the store keeps,
+    // read before the explicit checkpoint below joins them.
+    let old = db.branches.links_fill_old_len_for_test();
     // The mid-range parent stays a branch of the store (detached, not released).
     if let Some(b) = parent {
         let _ = b.into_id();
@@ -1841,7 +1844,7 @@ fn ls_fill_live_child() {
     drop(db);
     let (rows, wrong) = ls_wrong_links(&path).unwrap_or((0, 9999));
     println!("LS-LIVE-LINKS meta={} rows={rows} wrong={wrong}", meta_version(&path));
-    println!("LS-LIVE creates={creates} cuts={cuts} starts={starts} empty={empty} batches={batches} prefilled={} per_create={per_create}", u64::from(prefilled));
+    println!("LS-LIVE creates={creates} cuts={cuts} starts={starts} empty={empty} batches={batches} prefilled={} per_create={per_create} old={old}", u64::from(prefilled));
 }
 
 /// Lead ruling 2026-10-21T18:01:45Z (fill LIVENESS). A cut stopped the fill at once, so it gained about one
@@ -1923,6 +1926,25 @@ fn under_sustained_creates_the_fill_of_a_nested_store_completes() {
             assert_eq!(wrong, 0, "{rows} rows, nested, creates from {from}: {wrong} of {all} rows have wrong links after a fill completed under sustained creates");
         }
     }
+}
+
+/// Review h1-alone (wf_6f7b5632-a49) MED 5: a store does not keep the handle of every fill thread a later spawn
+/// replaced until an explicit checkpoint or its close (fde784291 kept each one; joinable, an exited thread keeps
+/// its stack mapping until joined, and a fill respawns once per hard-limit cycle, so the handles grew with the
+/// cycles): under sustained creates on a 19 store of 1,000 rows, at most 2 are kept when the fill completes.
+/// Premise: the fill was respawned (3 starts or more).
+#[test]
+fn a_store_keeps_no_handle_of_its_exited_fill_threads() {
+    if in_child() {
+        return;
+    }
+    let text = child("ls_fill_live_child", &[("FE_LS_ROWS", "1000")]);
+    let r = readings(&text, "LS-LIVE ");
+    assert_eq!(r.len(), 1, "premise: the child reported:\n{text}");
+    let (starts, old) = (r[0][2], r[0][7]);
+    println!("LS fill handles: {starts} fill spawns, {old} handles kept");
+    assert!(starts >= 3, "premise: the fill was respawned only {starts} time(s):\n{text}");
+    assert!(old <= 2, "the store kept {old} fill thread handles over {starts} spawns (each spawn keeps the one it replaces until a checkpoint or close)");
 }
 
 /// Lead ruling 2026-10-21 (MED-3 restated; the deferral is removed, so this holds with room): a fill that never

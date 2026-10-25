@@ -9554,6 +9554,12 @@ impl BranchStore {
         (inner.children.moved.len(), inner.children.relinked.len())
     }
 
+    /// Test builds (review h1-alone MED 5): the superseded fill threads' handles kept (`links_fill_old`).
+    #[cfg(test)]
+    pub(crate) fn links_fill_old_len_for_test(&self) -> usize {
+        self.links_fill_old.lock().len()
+    }
+
     /// Test builds (lead ruling LOW 4): stop the link fill as a close does, without closing.
     #[cfg(test)]
     pub(crate) fn stop_links_fill_for_test(&self) {
