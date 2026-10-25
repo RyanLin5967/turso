@@ -1256,7 +1256,13 @@ fn ls_kill_resume_child() {
                 let _ = b.fork().unwrap().into_id();
                 let _ = b.into_id();
             }
-            db.branch_compact_now().unwrap();
+            // Review h1-alone MED 3: FE_LS_OLDER_FUZZY ends the older session with a FUZZY checkpoint (its write on
+            // a thread of its own) instead of the sharp one (on this thread).
+            if std::env::var_os("FE_LS_OLDER_FUZZY").is_some() {
+                assert!(db.branches.checkpoint_fuzzy_now().unwrap(), "premise: the older build's fuzzy checkpoint did not start");
+            } else {
+                db.branch_compact_now().unwrap();
+            }
             db.branch_checkpoint_wait();
         }
         super::journal::CREATE_LEGACY.with(|c| c.set(false));
@@ -1327,6 +1333,37 @@ fn an_older_builds_checkpoint_does_not_carry_the_fill_cursor() {
         assert_eq!(cgen, gen0, "k={k}: premise: the cursor is of the killed store's generation");
         assert!(gen1 > gen0, "k={k}: premise: the older build's checkpoint moved the generation ({gen0} -> {gen1})");
         assert_eq!(cgen1, cgen, "k={k}: the older build's checkpoint carried the fill cursor to its generation ({cgen} -> {cgen1}, catalog {gen1})");
+    }
+}
+
+/// Review h1-alone (wf_6f7b5632-a49) MED 3: the older build's stand-in checkpoints as a real 19 build does in a
+/// FUZZY checkpoint too, whose write runs on a thread of its own: it neither relinks nor carries the fill's cursor,
+/// so the cursor stays of the generation before it, and this build then refills and leaves every row's links right
+/// at 21 (the two claims above on this arm). At f1e02c4ca the writer's identity was read on the writing thread,
+/// through the per-thread `CREATE_LEGACY`, which the flight's thread never has: the stand-in's flight wrote as this
+/// build. Premises as above, and the older session's fuzzy checkpoint started. Mutant `l4_fill_generation_ignored`
+/// must fail it.
+#[test]
+fn an_older_builds_fuzzy_checkpoint_does_not_carry_the_fill_cursor() {
+    if in_child() {
+        return;
+    }
+    let text = child("ls_kill_resume_child", &[("FE_LS_OLDER_FUZZY", "1")]);
+    let r = readings(&text, "LS-KILL ");
+    assert_eq!(r.len(), 3, "premise: three arms ran:\n{text}");
+    for v in &r {
+        let (k, killed, killed_meta, cgen, cdone, gen0, gen1, meta, rows, wrong, cgen1) =
+            (v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], v[9], v[10]);
+        assert_eq!((killed, killed_meta), (1, 19), "k={k}: premise: killed after batch {k}, still 19");
+        assert_eq!(cgen, gen0, "k={k}: premise: the cursor is of the killed store's generation");
+        assert!(gen1 > gen0, "k={k}: premise: the older build's checkpoint moved the generation ({gen0} -> {gen1})");
+        if k == 17 {
+            assert_eq!(cdone, 1, "premise: killed after the last batch, the cursor is done");
+        }
+        assert!(rows > 1_000, "k={k}: premise: the rows are there ({rows})");
+        assert_eq!(cgen1, cgen, "k={k}: the older build's fuzzy checkpoint carried the fill cursor to its generation ({cgen} -> {cgen1}, catalog {gen1})");
+        assert_eq!(meta, 21, "k={k}: the store did not upgrade");
+        assert_eq!(wrong, 0, "k={k}: {wrong} of {rows} rows have wrong links after the resume (a cursor resumed across an older build's fuzzy checkpoint that changed rows behind it)");
     }
 }
 
