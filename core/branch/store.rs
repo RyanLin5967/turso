@@ -4027,6 +4027,16 @@ fn run_links_fill(shared: &StoreMutex, writer: &Mutex<Catalog>, group: &Group, m
         if fe_mutant("l4_fill_starved") {
             std::thread::sleep(Duration::from_millis(50));
         }
+        // Test builds (review h1-alone MED 4): a fill held here, past its loop-head check and before its batch takes
+        // the writer, as a fill preempted there would be; `LINKS_FILL_BEFORE_BATCH_HELD` counts the batches that
+        // reached the hold.
+        #[cfg(test)]
+        if LINKS_FILL_HOLD_BEFORE_BATCH.load(Ordering::Acquire) {
+            LINKS_FILL_BEFORE_BATCH_HELD.fetch_add(1, Ordering::AcqRel);
+            while LINKS_FILL_HOLD_BEFORE_BATCH.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
         // Test builds: the batches started by a superseded fill.
         #[cfg(test)]
         if superseded {
@@ -4162,6 +4172,12 @@ pub(crate) static LINKS_FILL_SUPERSEDED_BATCHES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static LINKS_FILL_HORIZON_FAILS: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
 pub(crate) static LINKS_FILL_HORIZON_FAILED: AtomicU64 = AtomicU64::new(0);
+/// Test builds (review h1-alone MED 4, a knob read by the fill thread): hold the fill before each batch, past its
+/// loop-head check; and the batches that reached the hold.
+#[cfg(test)]
+pub(crate) static LINKS_FILL_HOLD_BEFORE_BATCH: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+pub(crate) static LINKS_FILL_BEFORE_BATCH_HELD: AtomicU64 = AtomicU64::new(0);
 
 /// Test builds: whether this horizon read is one `LINKS_FILL_HORIZON_FAILS` fails (counted in
 /// `LINKS_FILL_HORIZON_FAILED`).

@@ -687,6 +687,21 @@ impl Catalog {
         Self::prepared(db, conn, sync)
     }
 
+    /// Test builds (review h1-alone MED 7): a handle on an EXISTING catalog that writes nothing on open: `open`
+    /// without `SCHEMA`, whose `CREATE ... IF NOT EXISTS` statements turso compiles as write transactions even when
+    /// the objects exist, so a poll made through `open` takes the catalog's write lock and can fail the live store's
+    /// fill batch or checkpoint write with Busy. For a test's reads of a store that is still open.
+    #[cfg(test)]
+    pub(crate) fn open_read(path: &Path) -> Result<Catalog> {
+        let path = path.to_str().ok_or_else(|| {
+            LimboError::InvalidArgument("branch catalog path is not UTF-8".to_string())
+        })?;
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new()?);
+        let db = Database::open_file_with_flags(io, path, OpenFlags::Create, DatabaseOpts::new(), None, Arc::new(SqliteDialect))?;
+        let conn = db.connect()?;
+        Self::prepared(db, conn, SyncClass::Off)
+    }
+
     /// A second handle on the same catalog database, over its own connection: the writer of a
     /// fuzzy checkpoint (F-FZ), which runs without the store mutex while the store's own
     /// connection keeps serving on-demand reads from a pinned snapshot.

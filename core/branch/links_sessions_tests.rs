@@ -226,6 +226,141 @@ fn a_fill_thread_that_panics_does_not_hang_an_explicit_checkpoint() {
     assert_eq!(filling, 0, "the store still reads as filling after its fill thread panicked");
 }
 
+// ---- review h1-alone MED 4: a fill batch held across a past-hard cut ----
+
+/// `r`'s value; `None` for a Busy read (a checkpoint holds the catalog); any other error REFUSES with its text.
+fn busy_ok<T>(r: crate::Result<T>, what: &str) -> Option<T> {
+    match r {
+        Ok(v) => Some(v),
+        Err(crate::LimboError::Busy | crate::LimboError::BusySnapshot) => None,
+        Err(e) => panic!("REFUSED: {what}: {e}"),
+    }
+}
+
+/// The fill cursor as committed, `(its generation, done)`, and the catalog's generation, read by a handle that
+/// writes nothing (`Catalog::open_read`: the store is still open); `None` while a read is Busy. Read in SQL from the
+/// cursor row with the largest key, whatever the cursor's form (`link_fill` holds one row per form).
+fn try_fill_generation(path: &std::path::Path) -> Option<(u64, u64, u64)> {
+    let p = std::path::PathBuf::from(format!("{}-branch-cat", path.display()));
+    let mut cat = busy_ok(super::catalog::Catalog::open_read(&p), "the catalog read handle")?;
+    let g = busy_ok(cat.meta(), "the catalog meta row")?.expect("REFUSED: the catalog has no meta row").generation;
+    let one = |cat: &super::catalog::Catalog, sql: &str| -> Option<u64> {
+        let v = busy_ok(cat.ints(sql), sql)?;
+        Some(*v.first().unwrap_or_else(|| panic!("REFUSED: no fill cursor row ({sql})")))
+    };
+    let cg = one(&cat, "SELECT generation FROM link_fill ORDER BY k DESC LIMIT 1")?;
+    let done = one(&cat, "SELECT done FROM link_fill ORDER BY k DESC LIMIT 1")?;
+    Some((cg, done, g))
+}
+
+/// `try_fill_generation`, polled for up to 30 s (Busy throughout REFUSES).
+fn poll_fill_generation(path: &std::path::Path) -> (u64, u64, u64) {
+    let t = std::time::Instant::now();
+    loop {
+        if let Some(c) = try_fill_generation(path) {
+            return c;
+        }
+        assert!(t.elapsed() < std::time::Duration::from_secs(30), "REFUSED: the fill cursor of {} stayed Busy for 30 s", path.display());
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn ls_batch_across_cut_child() {
+    if !in_child() {
+        return;
+    }
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("x.db");
+    older_store(&path, 1_000);
+    super::journal::set_compact_threshold(4 << 10);
+    // A slow fill (1 s after each batch is recorded): the hold, set in that pause, takes its next batch.
+    super::store::LINKS_FILL_PAUSE_MS.store(1_000, Ordering::Release);
+    let db = open(&path);
+    db.branch_wait_name_filter();
+    let trunk = db.connect().unwrap();
+    // Until a threshold has started the fill, then (with no operation) until its first batch has committed: its
+    // cursor committed at the catalog's generation.
+    let b0 = super::store::LINKS_FILL_HELD_BATCHES.load(Ordering::Acquire);
+    let mut k = 0;
+    while db.branches.links_fill_state_for_test().2 == 0 && k < 20_000 {
+        let _ = trunk.fork_branch().unwrap().into_id();
+        k += 1;
+    }
+    let t = std::time::Instant::now();
+    while super::store::LINKS_FILL_HELD_BATCHES.load(Ordering::Acquire) == b0 && t.elapsed() < std::time::Duration::from_secs(30) {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    // The fill held before its next batch, past its loop-head check.
+    let h0 = super::store::LINKS_FILL_BEFORE_BATCH_HELD.load(Ordering::Acquire);
+    super::store::LINKS_FILL_HOLD_BEFORE_BATCH.store(true, Ordering::Release);
+    let t = std::time::Instant::now();
+    while super::store::LINKS_FILL_BEFORE_BATCH_HELD.load(Ordering::Acquire) == h0 && t.elapsed() < std::time::Duration::from_secs(30) {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let held = super::store::LINKS_FILL_BEFORE_BATCH_HELD.load(Ordering::Acquire) - h0;
+    // Past the hard limit the gate stops the fill (its batch, held past the check, goes on) and a checkpoint cuts
+    // the log, carrying the cursor to its generation. Operations go on, one per 50 ms, until the cut, and stop there
+    // (a later threshold would start another fill).
+    let mut k = 0;
+    while !db.branches.past_hard_limit_for_test() && k < 20_000 {
+        let _ = trunk.fork_branch().unwrap().into_id();
+        k += 1;
+    }
+    let past = db.branches.past_hard_limit_for_test();
+    let peak = log_present(&path);
+    let t = std::time::Instant::now();
+    while log_present(&path) >= peak && t.elapsed() < std::time::Duration::from_secs(30) {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let _ = trunk.fork_branch().unwrap().into_id();
+    }
+    let cut = log_present(&path) < peak;
+    // The carried cursor, read while the batch is still held; then the batch let go, and waited for (30 s at most).
+    let (cg0, cd0, mg0) = poll_fill_generation(&path);
+    let c0 = super::store::LINKS_FILL_HELD_BATCHES.load(Ordering::Acquire);
+    super::store::LINKS_FILL_HOLD_BEFORE_BATCH.store(false, Ordering::Release);
+    let t = std::time::Instant::now();
+    while super::store::LINKS_FILL_HELD_BATCHES.load(Ordering::Acquire) == c0 && t.elapsed() < std::time::Duration::from_secs(30) {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let batch = super::store::LINKS_FILL_HELD_BATCHES.load(Ordering::Acquire) - c0;
+    let (cg1, cd1, mg1) = poll_fill_generation(&path);
+    let starts = db.branches.links_fill_state_for_test().2;
+    println!(
+        "LS-ACROSS past={} cut={} held={held} starts={starts} carried_gen={cg0} carried_done={cd0} meta0={mg0} batch={batch} gen={cg1} done={cd1} meta={mg1}",
+        u64::from(past),
+        u64::from(cut)
+    );
+    super::store::LINKS_FILL_PAUSE_MS.store(0, Ordering::Release);
+    std::process::exit(0);
+}
+
+/// Review h1-alone (wf_6f7b5632-a49) MED 4, the single-fill form of h1-rev-72bfb0127 LOW-3 that its fix (fde784291)
+/// left open: a fill batch that passed its loop-head check before a past-hard cut and commits after it must not
+/// overwrite the cursor the cut carried with the fill's stale generation (the next spawn, and the next open, would
+/// then fill again from the first row). After the batch, the committed cursor is of the catalog's generation.
+/// Premises: the fill was held before a batch; the store passed the hard limit and cut its log while it was held,
+/// carrying an unfinished cursor to the catalog's generation; no later fill started and no later checkpoint
+/// committed; the held batch committed once let go.
+#[test]
+fn a_fill_batch_held_across_a_cut_keeps_the_carried_cursor() {
+    if in_child() {
+        return;
+    }
+    let text = child("ls_batch_across_cut_child", &[]);
+    let r = readings(&text, "LS-ACROSS ");
+    assert_eq!(r.len(), 1, "premise: the child reported:\n{text}");
+    let (past, cut, held, starts, cg0, cd0, mg0, batch, cg1, mg1) = (r[0][0], r[0][1], r[0][2], r[0][3], r[0][4], r[0][5], r[0][6], r[0][7], r[0][8], r[0][10]);
+    println!("LS across a cut: past {past} cut {cut} held {held} starts {starts} carried {cg0}/{mg0} done {cd0}; batch {batch}, then {cg1}/{mg1}");
+    assert!(held >= 1, "premise: the fill was not held before a batch:\n{text}");
+    assert_eq!((past, cut), (1, 1), "premise: the store did not pass the hard limit and cut its log while the batch was held (past {past}, cut {cut})");
+    assert_eq!((cg0, cd0), (mg0, 0), "premise: the cut did not carry an unfinished cursor to the catalog's generation (cursor {cg0}, catalog {mg0}, done {cd0})");
+    assert_eq!(starts, 1, "premise: a later fill started ({starts} spawns)");
+    assert_eq!(mg1, mg0, "premise: a checkpoint committed after the cut (catalog generation {mg0} -> {mg1})");
+    assert_eq!(batch, 1, "premise: the held batch did not commit once let go");
+    assert_eq!(cg1, mg1, "the fill's batch, held across the cut, committed its cursor at a stale generation ({cg1}, the catalog's {mg1}; the cut had carried it to {cg0}): the next spawn fills again from the first row");
+}
+
 // ---- review h1-alone HIGH 2: a fill whose horizon read fails ----
 
 #[test]
