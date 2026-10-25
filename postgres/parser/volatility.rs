@@ -31,8 +31,13 @@ pub fn is_immutable_call(name: &str) -> bool {
     NON_IMMUTABLE.binary_search(&name).is_err()
 }
 
-/// Whether a cast to the type named `name` reads through an immutable input function
-/// ([`STABLE_INPUT`] does not list it).
+/// Whether a cast to the type named `name`, in any case, reads through an immutable input function
+/// ([`STABLE_INPUT`] does not list it). A name with no upper-case letter (libpg_query folds an
+/// unquoted one) is looked up as it is, without a lower-cased copy: the frontend asks this of every
+/// cast an INSERT or UPDATE assigns (L5's write budget).
 pub fn has_immutable_input(name: &str) -> bool {
-    STABLE_INPUT.binary_search(&name.to_ascii_lowercase().as_str()).is_err()
+    if name.bytes().any(|b| b.is_ascii_uppercase()) {
+        return has_immutable_input(&name.to_ascii_lowercase());
+    }
+    STABLE_INPUT.binary_search(&name).is_err()
 }

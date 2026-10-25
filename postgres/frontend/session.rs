@@ -6783,10 +6783,11 @@ fn not_immutable(n: &turso_pg_parser::pg_query::NodeRef) -> bool {
         NodeRef::TypeCast(cast) => cast.type_name.as_ref().is_some_and(|t| {
             t.array_bounds.is_empty()
                 && t.names.iter().rev().find_map(|n| match &n.node {
-                    Some(turso_pg_parser::pg_query::protobuf::node::Node::String(s)) => Some(s.sval.to_ascii_lowercase()),
+                    // As written: has_immutable_input folds the case itself.
+                    Some(turso_pg_parser::pg_query::protobuf::node::Node::String(s)) => Some(s.sval.as_str()),
                     _ => None,
                 })
-                .is_some_and(|name| !has_immutable_input(&name))
+                .is_some_and(|name| !has_immutable_input(name))
         }),
         NodeRef::SqlvalueFunction(_) => true,
         _ => false,
@@ -7044,22 +7045,24 @@ fn fold_probe(parse: &turso_pg_parser::pg_query::ParseResult) -> Option<String> 
 pub(crate) use turso_pg_parser::volatility::{has_immutable_input, is_immutable_call};
 
 /// Whether `call` names a function PostgreSQL 18.6 has only stable or volatile overloads of
-/// ([`is_immutable_call`]), bare or pg_catalog-qualified.
+/// ([`is_immutable_call`]), bare or pg_catalog-qualified. Read without allocating, as every value
+/// an INSERT or UPDATE assigns may be asked ([`immutable_constant`], for assignment_probe; L5's
+/// write budget): libpg_query has folded an unquoted name to lower case, so only a name with an
+/// upper-case letter (a quoted one) is copied to fold it.
 fn calls_non_immutable(call: &turso_pg_parser::pg_query::protobuf::FuncCall) -> bool {
     use turso_pg_parser::pg_query::protobuf::node::Node;
-    let names: Vec<&str> = call
-        .funcname
-        .iter()
-        .filter_map(|n| match &n.node {
-            Some(Node::String(s)) => Some(s.sval.as_str()),
-            _ => None,
-        })
-        .collect();
-    let name = match names.as_slice() {
-        [name] | ["pg_catalog", name] => name.to_ascii_lowercase(),
+    let mut names = call.funcname.iter().filter_map(|n| match &n.node {
+        Some(Node::String(s)) => Some(s.sval.as_str()),
+        _ => None,
+    });
+    let name = match (names.next(), names.next(), names.next()) {
+        (Some(name), None, None) | (Some("pg_catalog"), Some(name), None) => name,
         _ => return false,
     };
-    !is_immutable_call(&name)
+    if name.bytes().any(|b| b.is_ascii_uppercase()) {
+        return !is_immutable_call(&name.to_ascii_lowercase());
+    }
+    !is_immutable_call(name)
 }
 
 pub(crate) fn is_delete_using(sql: &str, parse: &turso_pg_parser::pg_query::ParseResult) -> bool {
