@@ -226,6 +226,62 @@ fn a_fill_thread_that_panics_does_not_hang_an_explicit_checkpoint() {
     assert_eq!(filling, 0, "the store still reads as filling after its fill thread panicked");
 }
 
+// ---- review h1-alone HIGH 2: a fill whose horizon read fails ----
+
+#[test]
+fn ls_horizon_fails_child() {
+    if !in_child() {
+        return;
+    }
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("h.db");
+    older_store(&path, 300);
+    let fired0 = super::store::LINKS_FILL_HORIZON_FAILED.load(Ordering::Acquire);
+    super::store::LINKS_FILL_HORIZON_FAILS.store(1, Ordering::Release);
+    let db = open(&path);
+    db.branch_wait_name_filter();
+    // Below the hard limit (no operation at all): the explicit checkpoint starts the fill itself, and waits for it.
+    let (tx, rx) = std::sync::mpsc::channel();
+    {
+        let db = db.clone();
+        std::thread::spawn(move || {
+            let r = db.branch_compact_now().map_err(|e| e.to_string());
+            let _ = tx.send(r);
+        });
+    }
+    let got = rx.recv_timeout(std::time::Duration::from_secs(20));
+    let (filling, _, starts) = db.branches.links_fill_state_for_test();
+    let fired = super::store::LINKS_FILL_HORIZON_FAILED.load(Ordering::Acquire) - fired0;
+    println!(
+        "LS-HORIZON returned={} ok={} filling={} starts={starts} fired={fired}",
+        u64::from(got.is_ok()),
+        u64::from(matches!(got, Ok(Ok(())))),
+        u64::from(filling)
+    );
+    // The checkpoint thread may still be waiting: end the child here.
+    std::process::exit(0);
+}
+
+/// Review h1-alone (wf_6f7b5632-a49) HIGH 2 (h1gap-rev-c MED-1's class, on an error return): a fill whose horizon
+/// read fails is an exit like any other: an explicit checkpoint on an idle 19 store below the hard limit returns
+/// (within 20 s) and the store no longer reads as filling. At f1e02c4ca that exit returned with `filling` set, so
+/// `finish_links_fill` spun with no bound. Premises: a fill was started, and the hook failed its horizon read.
+#[test]
+fn a_fill_whose_horizon_read_fails_does_not_hang_an_explicit_checkpoint() {
+    if in_child() {
+        return;
+    }
+    let text = child("ls_horizon_fails_child", &[]);
+    let r = readings(&text, "LS-HORIZON ");
+    assert_eq!(r.len(), 1, "premise: the child reported:\n{text}");
+    let (returned, ok, filling, starts, fired) = (r[0][0], r[0][1], r[0][2], r[0][3], r[0][4]);
+    println!("LS horizon fails: returned {returned} ok {ok} filling {filling} starts {starts} fired {fired}");
+    assert!(starts >= 1, "premise: no fill was started:\n{text}");
+    assert!(fired >= 1, "premise: the hook failed no horizon read:\n{text}");
+    assert_eq!(returned, 1, "an explicit checkpoint did not return within 20 s after the fill's horizon read failed (filling {filling})");
+    assert_eq!(filling, 0, "the store still reads as filling after its fill's horizon read failed");
+}
+
 // ---- h1gap-rev-c HIGH-2: past the hard limit, no checkpoint links the whole catalog ----
 
 #[test]

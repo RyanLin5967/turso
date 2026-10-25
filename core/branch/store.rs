@@ -3942,7 +3942,16 @@ fn run_links_fill(shared: &StoreMutex, writer: &Mutex<Catalog>, group: &Group, m
     let horizon = match known {
         Some(h) => h,
         None => {
-            let h = match writer.lock().last_child_key() {
+            // Test builds (review h1-alone HIGH 2): `LINKS_FILL_HORIZON_FAILS` fails this read (that many times).
+            #[cfg(test)]
+            let read = if take_horizon_failure() {
+                Err(LimboError::InternalError("test hook: the link fill's horizon read failed".to_string()))
+            } else {
+                writer.lock().last_child_key()
+            };
+            #[cfg(not(test))]
+            let read = writer.lock().last_child_key();
+            let h = match read {
                 Ok(h) => h,
                 Err(e) => {
                     tracing::warn!("branch catalog link fill horizon not read: {e}");
@@ -4147,6 +4156,23 @@ pub(crate) static LINKS_FILL_EMPTY_SPAWNS: AtomicU64 = AtomicU64::new(0);
 /// Test builds (h1-rev-72bfb0127 LOW-3): fill batches started by a fill a later spawn superseded.
 #[cfg(test)]
 pub(crate) static LINKS_FILL_SUPERSEDED_BATCHES: AtomicU64 = AtomicU64::new(0);
+/// Test builds (review h1-alone HIGH 2, a knob read by the fill thread): the fill's horizon reads still to fail,
+/// and the reads failed so.
+#[cfg(test)]
+pub(crate) static LINKS_FILL_HORIZON_FAILS: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+pub(crate) static LINKS_FILL_HORIZON_FAILED: AtomicU64 = AtomicU64::new(0);
+
+/// Test builds: whether this horizon read is one `LINKS_FILL_HORIZON_FAILS` fails (counted in
+/// `LINKS_FILL_HORIZON_FAILED`).
+#[cfg(test)]
+fn take_horizon_failure() -> bool {
+    let took = LINKS_FILL_HORIZON_FAILS.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1)).is_ok();
+    if took {
+        LINKS_FILL_HORIZON_FAILED.fetch_add(1, Ordering::AcqRel);
+    }
+    took
+}
 #[cfg(test)]
 pub(crate) static LINKS_FILL_FAILS: AtomicBool = AtomicBool::new(false);
 /// Test builds (links H1 reopened): while set, a committed fill batch waits before it takes the store
