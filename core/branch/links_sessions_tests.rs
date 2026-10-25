@@ -1168,7 +1168,24 @@ fn ls_empty_fill_child() {
     }
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().join("e.db");
-    older_store(&path, 0);
+    // An EMPTY 19 store, as an older build leaves one: a branch made and checkpointed, then reaped and checkpointed
+    // again, so the catalog has its 19 meta row and no branch row (`older_store` of 0 branches made no catalog
+    // meta row at all: the first run's premise died there, raw red-l11-empty_68e5d9156).
+    super::journal::CREATE_LEGACY.with(|c| c.set(true));
+    super::journal::LEGACY_FACTS.with(|c| c.set(true));
+    {
+        let db = open(&path);
+        let trunk = db.connect().unwrap();
+        trunk.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)").unwrap();
+        let b = trunk.fork_branch().unwrap();
+        db.branch_compact_now().unwrap();
+        b.reap().unwrap();
+        db.branch_compact_now().unwrap();
+        db.branch_checkpoint_wait();
+    }
+    super::journal::CREATE_LEGACY.with(|c| c.set(false));
+    super::journal::LEGACY_FACTS.with(|c| c.set(false));
+    let (meta0, rows0) = (meta_version(&path), ls_first(&ls_cat(&path), "SELECT count(*) FROM branch"));
     super::journal::set_compact_threshold(4 << 10);
     // The first fill held before its first batch (its horizon already read, on an empty catalog).
     let h0 = super::store::LINKS_FILL_BEFORE_BATCH_HELD.load(Ordering::Acquire);
@@ -1198,13 +1215,14 @@ fn ls_empty_fill_child() {
     drop(trunk);
     drop(db);
     let (rows, wrong) = ls_wrong_links(&path).unwrap_or((0, 9999));
-    println!("LS-EMPTY held={held} past={} cut={} creates={creates} prefilled={} meta={} rows={rows} wrong={wrong}", u64::from(past), u64::from(cut), u64::from(prefilled), meta_version(&path));
+    println!("LS-EMPTY held={held} past={} cut={} creates={creates} prefilled={} meta={} rows={rows} wrong={wrong} meta0={meta0} rows0={rows0}", u64::from(past), u64::from(cut), u64::from(prefilled), meta_version(&path));
 }
 
 /// Review h1-alone (wf_6f7b5632-a49) LOW 11: a fill that began on an EMPTY 19 catalog completes under sustained
 /// creates (within 60,000) and the store flips with every row's links right. At f1e02c4ca an empty catalog's horizon
 /// read as "no horizon", cached for the process, so every fill after the first cut chased the growing catalog.
-/// Premises: the first fill was held before its first batch, the store passed the hard limit and cut its log.
+/// Premises: the store began as a 19 store with no branch row; its first fill was held before its first batch;
+/// the store passed the hard limit and cut its log.
 #[test]
 fn a_fill_begun_on_an_empty_catalog_completes_under_sustained_creates() {
     if in_child() {
@@ -1213,8 +1231,9 @@ fn a_fill_begun_on_an_empty_catalog_completes_under_sustained_creates() {
     let text = child("ls_empty_fill_child", &[]);
     let r = readings(&text, "LS-EMPTY ");
     assert_eq!(r.len(), 1, "premise: the child reported:\n{text}");
-    let (held, past, cut, creates, prefilled, meta, rows, wrong) = (r[0][0], r[0][1], r[0][2], r[0][3], r[0][4], r[0][5], r[0][6], r[0][7]);
-    println!("LS empty catalog: held {held} past {past} cut {cut}; creates {creates} prefilled {prefilled}; meta {meta} rows {rows} wrong {wrong}");
+    let (held, past, cut, creates, prefilled, meta, rows, wrong, meta0, rows0) = (r[0][0], r[0][1], r[0][2], r[0][3], r[0][4], r[0][5], r[0][6], r[0][7], r[0][8], r[0][9]);
+    println!("LS empty catalog: began meta {meta0} rows {rows0}; held {held} past {past} cut {cut}; creates {creates} prefilled {prefilled}; meta {meta} rows {rows} wrong {wrong}");
+    assert_eq!((meta0, rows0), (19, 0), "premise: the store did not begin as a 19 store with no branch row");
     assert!(held >= 1, "premise: the first fill was not held before its first batch");
     assert_eq!((past, cut), (1, 1), "premise: the store did not pass the hard limit and cut its log (past {past}, cut {cut})");
     assert_eq!(prefilled, 1, "a fill begun on an empty catalog never completed under {creates} sustained creates");
