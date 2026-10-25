@@ -1600,17 +1600,30 @@ fn ls_fill_live_child() {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().join("l.db");
     let n: usize = std::env::var("FE_LS_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(1_000);
-    older_store(&path, n);
+    // Review h1-alone HIGH 1 (wf_6f7b5632-a49): FE_LS_NESTED makes the store NESTED (`ls_store_with_ids`: the trunk
+    // forks and a child of each of the first 50), the shape an MCTS tree has; FE_LS_FORK_FROM = i makes the
+    // sustained creates children of that store's ids[i] (a mid-range parent) instead of trunk forks.
+    let ids = if std::env::var_os("FE_LS_NESTED").is_some() {
+        ls_store_with_ids(&path, n)
+    } else {
+        older_store(&path, n);
+        Vec::new()
+    };
+    let from: Option<usize> = std::env::var("FE_LS_FORK_FROM").ok().map(|v| v.parse().unwrap());
     super::journal::set_compact_threshold(4 << 10);
     let (e0, b0) = (super::store::LINKS_FILL_EMPTY_SPAWNS.load(Ordering::Acquire), super::store::LINKS_FILL_HELD_BATCHES.load(Ordering::Acquire));
     let db = open(&path);
     db.branch_wait_name_filter();
     let trunk = db.connect().unwrap();
+    let parent = from.map(|i| db.branch(ids[i]).unwrap());
     let (mut cuts, mut last, mut grown, mut grown_creates) = (0u64, log_present(&path), 0u64, 0u64);
     let mut creates = 0u64;
     // Until the fill completes (cuts after it need no fill) or 60,000 creates.
     while creates < 60_000 && !db.branches.links_fill_state_for_test().1 {
-        let _ = trunk.fork_branch().unwrap().into_id();
+        let _ = match &parent {
+            Some(b) => b.fork().unwrap().into_id(),
+            None => trunk.fork_branch().unwrap().into_id(),
+        };
         creates += 1;
         let now = log_present(&path);
         if now < last {
@@ -1625,6 +1638,10 @@ fn ls_fill_live_child() {
     let empty = super::store::LINKS_FILL_EMPTY_SPAWNS.load(Ordering::Acquire) - e0;
     let batches = super::store::LINKS_FILL_HELD_BATCHES.load(Ordering::Acquire) - b0;
     let per_create = grown / grown_creates.max(1);
+    // The mid-range parent stays a branch of the store (detached, not released).
+    if let Some(b) = parent {
+        let _ = b.into_id();
+    }
     // Completed, the flip and the links: the flip's checkpoint, then the independent oracle (FLAGGED stricter: a
     // fill that completes early must still leave every row's links right).
     db.branch_compact_now().unwrap();
@@ -1672,6 +1689,48 @@ fn under_sustained_creates_the_fill_completes() {
         let (meta, all, wrong) = (l[0][0], l[0][1], l[0][2]);
         assert_eq!(meta, 21, "{rows} rows: the completed store did not flip (meta {meta})");
         assert_eq!(wrong, 0, "{rows} rows: {wrong} of {all} rows have wrong links after a fill completed under sustained creates");
+    }
+}
+
+/// Review h1-alone (wf_6f7b5632-a49) HIGH 1: the liveness claim above on a NESTED store (`ls_store_with_ids`: the
+/// trunk forks and a child of each of the first 50, the shape an MCTS tree has), under sustained trunk creates and
+/// under sustained creates from a mid-range parent (ids[25], whose children sort among the nested ones). At
+/// f1e02c4ca the fill's horizon was the largest children-index key, (50, ..) here, so every new row sorted below it
+/// and ahead of the cursor, and the fill chased them (about 64 rows filled per hard-limit cycle against about 196
+/// created): the trunk-only fixture above is the one shape in which every create sorts past it. The same claims and
+/// the same registered bound: rows + 50 children is this fixture's count. FE_LS_LIVE_ROWS overrides the row counts
+/// and FE_LS_LIVE_FROM the workloads (`trunk`, or an index into the fixture's ids). Premise: the log was cut. Mutant
+/// `l4_fill_horizon_ignored` must fail it.
+#[test]
+fn under_sustained_creates_the_fill_of_a_nested_store_completes() {
+    if in_child() {
+        return;
+    }
+    let list = std::env::var("FE_LS_LIVE_ROWS").unwrap_or_else(|_| "1000,4000".to_string());
+    let froms = std::env::var("FE_LS_LIVE_FROM").unwrap_or_else(|_| "trunk,25".to_string());
+    for from in froms.split(',') {
+        for rows in list.split(',') {
+            let mut env = vec![("FE_LS_ROWS", rows), ("FE_LS_NESTED", "1")];
+            if from != "trunk" {
+                env.push(("FE_LS_FORK_FROM", from));
+            }
+            let text = child("ls_fill_live_child", &env);
+            let r = readings(&text, "LS-LIVE ");
+            assert_eq!(r.len(), 1, "premise: the child reported:\n{text}");
+            let (creates, cuts, starts, empty, batches, prefilled, per_create) = (r[0][0], r[0][1], r[0][2], r[0][3], r[0][4], r[0][5], r[0][6]);
+            let k = (2 * (4u64 << 10)) / per_create.max(1);
+            println!("LS live nested: {rows} rows, creates from {from}: creates {creates} cuts {cuts} starts {starts} empty spawns {empty} batches {batches} prefilled {prefilled}; {per_create} B per create, K = {k}");
+            assert!(cuts >= 1, "{rows} rows, from {from}: premise: the log was never cut under {creates} creates");
+            assert_eq!(prefilled, 1, "{rows} rows, nested, creates from {from}: under {creates} sustained creates the fill never completed ({batches} batches over {cuts} hard-limit cycles, K = {k} creates each)");
+            let n: u64 = rows.parse().unwrap();
+            let cycle = (4 * (4u64 << 10)) / per_create.max(1);
+            let bound = ((n + 50).div_ceil(64) + 1) * cycle;
+            assert!(creates <= bound, "{rows} rows, nested, creates from {from}: the fill took {creates} creates to complete, past its bound {bound} ({cycle} creates per cycle)");
+            let l = readings(&text, "LS-LIVE-LINKS ");
+            let (meta, all, wrong) = (l[0][0], l[0][1], l[0][2]);
+            assert_eq!(meta, 21, "{rows} rows, nested, creates from {from}: the completed store did not flip (meta {meta})");
+            assert_eq!(wrong, 0, "{rows} rows, nested, creates from {from}: {wrong} of {all} rows have wrong links after a fill completed under sustained creates");
+        }
     }
 }
 
