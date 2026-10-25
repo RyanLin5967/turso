@@ -565,8 +565,9 @@ const VARCHAR: u32 = 1043;
 const NAME: u32 = 19;
 
 /// Which result columns of a plain SELECT (lined up as [`aggregate_targets`] lines them up) are
-/// computed from table columns and integer or string literals by arithmetic (+ - * / %) and by the
-/// scalar functions whose result type is fixed ([`scalar_result`]), with nothing else in them: the
+/// computed from table columns and integer or string literals by arithmetic (+ - * / %), by the
+/// scalar functions whose result type is fixed ([`scalar_result`]) and by the numeric functions
+/// typed by their argument ([`argument_typed`]), with nothing else in them: the
 /// walk types them as PostgreSQL does (int8 * int4 is int8, numeric / int4 numeric, length() int4),
 /// where the engine announced int4, float8 and text (wirefuzz vs PG 18.6, wire-fuzz1/2). A decimal
 /// literal anywhere leaves the column the engine's: PostgreSQL types it numeric, and the engine
@@ -611,7 +612,7 @@ pub fn computed_targets(parse: &ParseResult) -> Vec<bool> {
                 call.over.is_none()
                     && call.agg_filter.is_none()
                     && !call.agg_star
-                    && func_name(call).is_some_and(|n| scalar_result(&n).is_some())
+                    && func_name(call).is_some_and(|n| scalar_result(&n).is_some() || argument_typed(&n))
                     && call.args.iter().all(|a| plain(a, false))
             }
             // A CASE is typed by its results, each one the walk types (wire-rev-351702a43 LOW-6: the
@@ -1164,6 +1165,16 @@ fn scalar_result(name: &str) -> Option<u32> {
         "int2send" | "int4send" | "int8send" => 17,
         _ => return None,
     })
+}
+
+/// The numeric functions whose result type the walk reads from their argument (abs keeps an
+/// integer's type; sign, ceil, ceiling, floor, round and trunc of an integer are float8 to
+/// PostgreSQL), so a column computed by one is typed by the walk ([`computed_targets`]). They were
+/// announced with the engine's types: sign(x) as text, abs(5) / 2 as float8 (the engine's RESUME
+/// item 15; recorded, engine raw uw-pg18-int_math_float-rec15-iccad11.txt). A column the walk
+/// cannot type keeps the engine's type.
+fn argument_typed(name: &str) -> bool {
+    matches!(name, "abs" | "sign" | "ceil" | "ceiling" | "floor" | "round" | "trunc")
 }
 
 /// Scalar functions whose arguments are text: an undeclared parameter passed to one is text.
