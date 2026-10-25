@@ -7373,6 +7373,80 @@ mod tests {
         );
     }
 
+    /// The same budget for a write whose value is constant in shape but calls a volatile function
+    /// (LEAD-RULINGS 2026-10-25T02:16:40Z (a): the assignment probe returns before any allocation
+    /// unless some assigned value is an immutable constant that is not bare). Asking whether
+    /// `(random() * 0)::int + 2` is one looks up the called function's name and the cast's type
+    /// name, and each lookup copied its name to fold its case, so the question allocated before the
+    /// probe learned that no value qualifies.
+    #[test]
+    fn a_write_of_a_volatile_value_allocates_no_more_than_an_empty_query_beyond_the_engine() {
+        let n = counters::thread_allocations;
+        let dir = tempfile::TempDir::new().unwrap();
+        let s = session(&dir);
+        ok(&s, "CREATE TABLE t(id INT PRIMARY KEY, v INT)");
+        ok(&s, "INSERT INTO t VALUES (1, 0)");
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let mut c = MemClient::new();
+        c.replies.reserve(64);
+        let wire = |c: &mut MemClient, sql: &str| {
+            let q = pgwire::messages::simplequery::Query::new(sql.to_string());
+            c.replies.clear();
+            c.info.state = PgWireConnectionState::ReadyForQuery;
+            let a0 = n();
+            rt.block_on(s.on_query(c, q)).unwrap();
+            n() - a0
+        };
+        // As in the write budget above: every wire write happened, checked outside the counted
+        // window (its CommandComplete is "UPDATE 1", there is no ErrorResponse, and the row holds 2,
+        // read by a connection of its own).
+        let written = |c: &MemClient| {
+            let mut tags = Vec::new();
+            for m in &c.replies {
+                match m {
+                    PgWireBackendMessage::ErrorResponse(e) => panic!("the write failed: {e:?}"),
+                    PgWireBackendMessage::CommandComplete(cc) => tags.push(cc.tag.clone()),
+                    PgWireBackendMessage::Inline(m) if m.bytes().first() == Some(&b'C') => {
+                        let b = m.bytes();
+                        tags.push(String::from_utf8_lossy(&b[5..b.len() - 1]).into_owned());
+                    }
+                    _ => {}
+                }
+            }
+            assert_eq!(tags, ["UPDATE 1"], "the write's CommandComplete: {:?}", c.replies);
+            let rows = s
+                .shared
+                .db
+                .connect()
+                .unwrap()
+                .prepare("SELECT v FROM t WHERE id = 1")
+                .unwrap()
+                .run_collect_rows()
+                .unwrap();
+            assert_eq!(rows, vec![vec![Value::from_i64(2)]], "the row after the write");
+        };
+        let sql = "UPDATE t SET v = (random() * 0)::int + 2 WHERE id = 1";
+        for _ in 0..3 {
+            wire(&mut c, ";");
+            wire(&mut c, sql);
+            written(&c);
+        }
+        let empty = wire(&mut c, ";");
+        let own = s.current(&mut s.state()).unwrap();
+        let a0 = n();
+        let mut stmt = own.prepare(sql).unwrap();
+        stmt.run_ignore_rows().unwrap();
+        drop(stmt);
+        let engine = n() - a0;
+        let write = wire(&mut c, sql);
+        written(&c);
+        assert!(
+            write.saturating_sub(engine) <= empty,
+            "the volatile write: wire {write}, engine {engine}, excess {} > the empty query's {empty}",
+            write.saturating_sub(engine)
+        );
+    }
+
     fn ok(session: &Session, sql: &str) {
         for r in session.simple(sql) {
             if let Response::Error(e) = r {
